@@ -11,6 +11,20 @@ cd Open-Catalyst-Project-application_prototype
 pip install -r requirements.txt
 ```
 
+### UMA model setup (required for CHE calculation)
+
+The CHE evaluation stage uses Meta's UMA model as the default energy calculator. 
+The model weights are distributed separately and require access approval:
+
+1. Create a HuggingFace account at https://huggingface.co
+2. Request access at https://huggingface.co/facebook/UMA
+3. After approval, log in locally:
+```bash
+pip install huggingface_hub
+huggingface-cli login
+```
+
+The model weights will be downloaded automatically on first use.
 ## Usage
 ```bash
 streamlit run app/Home.py
@@ -80,10 +94,6 @@ If you use OCP App in your research, please cite:
 J. Park, D. Kim, "OCP App: An integrated workflow application for 
 machine-learning-assisted electrocatalyst screening," SoftwareX (submitted).
 ```
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## Acknowledgements
 
