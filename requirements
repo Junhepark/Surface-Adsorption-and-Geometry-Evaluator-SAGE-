@@ -1,0 +1,27 @@
+# Core
+streamlit>=1.28
+numpy>=1.24
+pandas>=1.5
+torch>=2.0
+
+# Atomistic simulation
+ase>=3.22
+pymatgen>=2023.0
+
+# ML potentials
+chgnet>=0.3
+fairchem-core>=2.0
+
+# Structure visualization
+py3Dmol>=2.0
+
+# Materials Project API
+mp-api>=0.33
+
+# Optional: LLM interpretation
+# openai>=1.0
+# pydantic>=2.0
+
+# NOTE: UMA model weights are not installed via pip.
+# You must request access at https://huggingface.co/facebook/UMA
+# and log in with: huggingface-cli login
