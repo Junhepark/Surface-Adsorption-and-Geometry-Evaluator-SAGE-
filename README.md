@@ -37,18 +37,22 @@ The application will open in your default browser.
 ### Quick start
 
 1. Enter a Materials Project ID (e.g., mp-23 for Ni) or upload a .cif file
+<img width="2490" height="883" alt="Image" src="https://github.com/user-attachments/assets/60581ebf-e64c-42fe-baf5-ec308757d9a8" />
 2. Select material type (Metal / Oxide) and reaction mode (HER / CO₂RR / ORR)
+<img width="332" height="517" alt="Image" src="https://github.com/user-attachments/assets/8dfc2184-6581-468f-988c-51e593b0ee21" />
 3. Prepare the surface (supercell expansion, vacuum, composition tuning)
-4. Generate adsorption sites and run CHE calculation
+<img width="3133" height="1104" alt="Image" src="https://github.com/user-attachments/assets/9440ea60-9aca-4412-b9d1-e3199e97a5ee" />
+4. Generate adsorption sites(CHGnet or Geometry) and run CHE calculation
+<img width="3328" height="1651" alt="Image" src="https://github.com/user-attachments/assets/91f704a4-cc05-447a-bb92-5e17836559a1" />
 5. View ranked results and export CSV
-
+<img width="3324" height="1046" alt="Image" src="https://github.com/user-attachments/assets/c32076e5-d336-4072-a008-16bba958f486" />
 ## Supported reactions
 
 | Reaction | Adsorbates | Thermodynamic framework |
 |----------|-----------|------------------------|
 | HER | H* | ΔG_H (CHE) |
 | CO₂RR | COOH*, CO*, HCOO*, OCHO* | ΔG_ads vs CO₂/H₂O/H₂ |
-| ORR | OOH*, O*, OH* | 4e⁻ Nørskov CHE |
+| ORR(On modifying) | OOH*, O*, OH* | 4e⁻ Nørskov CHE | 
 
 ## Key features
 
