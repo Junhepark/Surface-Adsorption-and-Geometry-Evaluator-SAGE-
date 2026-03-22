@@ -91,8 +91,7 @@ Full list in `requirements.txt`.
 
 If you use OCP App in your research, please cite:
 ```
-J. Park, D. Kim, "OCP App: An integrated workflow application for 
-machine-learning-assisted electrocatalyst screening," SoftwareX (submitted).
+J. Park, D. Kim, "An integrated workflow application for machine-learning-assisted catalyst screening," SoftwareX (submitted).
 ```
 
 ## Acknowledgements
