@@ -39,7 +39,6 @@ The application will open in your default browser.
 1. Enter a Materials Project ID (e.g., mp-23 for Ni) or upload a .cif file
 <img width="2490" height="883" alt="Image" src="https://github.com/user-attachments/assets/60581ebf-e64c-42fe-baf5-ec308757d9a8" />
 2. Select material type (Metal / Oxide) and reaction mode (HER / CO₂RR / ORR)
-<img width="332" height="517" alt="Image" src="https://github.com/user-attachments/assets/8dfc2184-6581-468f-988c-51e593b0ee21" />
 3. Prepare the surface (supercell expansion, vacuum, composition tuning)
 <img width="3133" height="1104" alt="Image" src="https://github.com/user-attachments/assets/9440ea60-9aca-4412-b9d1-e3199e97a5ee" />
 4. Generate adsorption sites(CHGnet or Geometry) and run CHE calculation
