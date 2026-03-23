@@ -8,7 +8,7 @@ SAGE App combines structure preparation, structural quality control, adsorption-
 <img width="1559" height="729" alt="Image" src="https://github.com/user-attachments/assets/fdd9ec61-2b5d-4db0-9670-bf6358d07170" />
 ## Installation
 ```bash
-git clone https://github.com/Junhepark/Open-Catalyst-Project-application_prototype.git
+git clone https://github.com/Junhepark/Surface-Adsorption-and-Geometry-Evaluator-SAGE-.git
 cd Open-Catalyst-Project-application_prototype
 pip install -r requirements.txt
 ```
