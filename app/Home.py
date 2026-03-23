@@ -26,7 +26,20 @@ from ocp_app.core.anchors.CHE_mode import (
     run_oxide_che,
     run_metal_co2rr_che,
     run_oxide_co2rr_che,
+    run_metal_orr_che,    # ORR support
+    run_oxide_orr_che,    # ORR support
 )
+try:
+    from ocp_app.core.gas_refs import make_orr_templates as _make_orr_templates
+except Exception:
+    _make_orr_templates = None
+
+# Auto-generate ORR intermediate template CIFs (only if missing)
+if _make_orr_templates is not None:
+    try:
+        _make_orr_templates("ref_gas")
+    except Exception:
+        pass
 from ocp_app.core.cifgen import (
     BulkSource,
     BulkSpec,
@@ -37,6 +50,7 @@ from ocp_app.core.cifgen import (
 from ocp_app.core import run_history as rh
 from ocp_app.core.structure_check import validate_structure
 from ocp_app.core.ads_sites import _oxide_o_based_ads_position
+from ocp_app.core.ads_sites import oxide_surface_seed_position, expand_oxide_channels_for_adsorbate, ANION_SYMBOLS
 from ocp_app.core.ads_sites import (
     detect_metal_111_sites,
     detect_oxide_surface_sites,
@@ -75,7 +89,7 @@ except Exception as e:
 
 # ---------------- App config ----------------
 st.set_page_config(page_title="OCP App (HAPLAB)", layout="wide")
-st.title("Open Catalyst Project App — Metal / Oxide ΔG_H & CO₂RR (HAPLAB v1.2)")
+st.title("Open Catalyst Project App — HER / CO₂RR / ORR (HAPLAB v1.0)")
 
 R_PH = 0.0591  # eV per pH
 GLOBAL_SEED = 42
@@ -112,10 +126,14 @@ def _estimate_cost_usd(model_name: str, input_tokens: int | None, output_tokens:
 
 
 ADS_TEMPLATE_FILES = {
-    "CO": "CO_box.cif",
+    "CO":   "CO_box.cif",
     "COOH": "COOH_box.cif",
     "HCOO": "HCOO_box.cif",
     "OCHO": "OCHO_box.cif",
+    # ORR intermediates
+    "O":    "O_box.cif",
+    "OH":   "OH_box.cif",
+    "OOH":  "OOH_box.cif",
 }
 
 # ---------------- Session State ----------------
@@ -441,7 +459,7 @@ _NON_METALS = {
 }
 
 def normalize_mp_id(raw: str) -> str:
-    """'19009' / 'mp19009' / 'mp-19009' 모두를 'mp-19009'로 정규화."""
+    """Normalize MP-ID variants ('19009'/'mp19009'/'mp-19009') to 'mp-19009'."""
     s = (raw or "").strip()
     if not s:
         return ""
@@ -451,7 +469,7 @@ def normalize_mp_id(raw: str) -> str:
     return s
 
 def infer_default_tune_elements(atoms) -> tuple[str, str]:
-    """Element1=가장 많은 금속 원소, Element2=두번째(없으면 'Cu')."""
+    """Element1 = most abundant metal, Element2 = second most (default 'Cu')"""
     syms = [s for s in atoms.get_chemical_symbols() if s not in ("O", "H")]
     if not syms:
         return ("Ni", "Cu")
@@ -466,13 +484,13 @@ def infer_default_tune_elements(atoms) -> tuple[str, str]:
     return (str(el1), str(el2))
 
 def ensure_tune_defaults_from_structure(atoms):
-    """구조가 바뀔 때만 Element 기본값을 자동 갱신."""
+    """Auto-update default element selections when the structure changes"""
     sig = _atoms_signature(atoms)
     if st.session_state.get("_tune_defaults_sig") != sig:
         el1, el2 = infer_default_tune_elements(atoms)
         st.session_state["_tune_defaults_sig"] = sig
 
-        # basic/expert 동기화
+        # Sync basic/expert defaults
         st.session_state["rt_el1_basic"] = el1
         st.session_state["rt_el2_basic"] = el2
         st.session_state["rt_el1_adv"] = el1
@@ -480,9 +498,8 @@ def ensure_tune_defaults_from_structure(atoms):
 
 def _render_min_dist_panel(rep):
     """
-    validate_structure() 결과 기반:
-    - i/j/i_el/j_el 제거
-    - OK/WARNING/CRITICAL만 표시
+    Based on validate_structure() results.
+     Displays only OK/WARNING/CRITICAL levels (internal indices hidden).
     """
     ng = getattr(rep, "nearest_global", None) or {}
     nbp = getattr(rep, "nearest_by_pair", None) or []
@@ -830,6 +847,8 @@ def build_compact_table(df, mode: str):
             "site_label",
             "site",               # start site
             "relaxed_site",       # reclassified site after relaxation (if available)
+            "oxide_seed_mode",
+            "surface_channel",
             "adsorbate",
             "qa",                 # ok / migrated / desorbed / broken / crashed / unstable
             "migrated",           # boolean (if available)
@@ -861,11 +880,17 @@ def _load_ads_template_preview(ads: str, ref_dir: str | Path = "ref_gas"):
     a = read(cif_path).copy()
     symbols = a.get_chemical_symbols()
 
+    # Anchor priority: C (CO2RR) → O (ORR: OH*, OOH*, O*) → atom 0
     anchor_idx = None
     for i, s in enumerate(symbols):
         if s == "C":
             anchor_idx = i
             break
+    if anchor_idx is None:
+        for i, s in enumerate(symbols):
+            if s == "O":
+                anchor_idx = i
+                break
     if anchor_idx is None:
         anchor_idx = 0
 
@@ -879,13 +904,20 @@ def _load_ads_template_preview(ads: str, ref_dir: str | Path = "ref_gas"):
 def _build_adsorbate_preview_slab(slab_atoms, site, ads: str, dz: float = 1.8, ref_dir: str | Path = "ref_gas"):
     slab = slab_atoms.copy()
     z_top = float(slab.get_positions()[:, 2].max())
+    ads_clean = ads.replace("*", "").upper()
 
     ads_atoms = _load_ads_template_preview(ads, ref_dir=ref_dir)
-    z_min = float(ads_atoms.get_positions()[:, 2].min())
 
-    base_z = z_top + float(dz) - z_min
-    xy = np.asarray(site.position[:2], dtype=float)
-    base = np.array([xy[0], xy[1], base_z], dtype=float)
+    is_oxide_like = any(s in ANION_SYMBOLS for s in slab.get_chemical_symbols()) and any(s not in ANION_SYMBOLS for s in slab.get_chemical_symbols())
+    if is_oxide_like and ads_clean in ("O", "OH", "OOH"):
+        channel = expand_oxide_channels_for_adsorbate(ads_clean)[0]
+        x0, y0, z0, _surface_channel = oxide_surface_seed_position(slab, site, ads_clean, channel=channel)
+        base = np.array([x0, y0, z0], dtype=float)
+    else:
+        z_min = float(ads_atoms.get_positions()[:, 2].min())
+        base_z = z_top + float(dz) - z_min
+        xy = np.asarray(site.position[:2], dtype=float)
+        base = np.array([xy[0], xy[1], base_z], dtype=float)
 
     ads_atoms.set_cell(slab.get_cell())
     ads_atoms.set_pbc(slab.get_pbc())
@@ -960,8 +992,14 @@ with st.sidebar:
     mode = st.radio("Material type", ["Metal (CHE)", "Oxide (CHE)"], horizontal=False)
     mtype = "metal" if "Metal" in mode else "oxide"
 
-    reaction_mode = st.radio("Reaction mode", ["HER (ΔG_H)", "CO₂RR (ΔG_ads)"], horizontal=False)
+    reaction_mode = st.radio(
+        "Reaction mode",
+        ["HER (ΔG_H)", "CO₂RR (ΔG_ads)", "ORR (ΔG_ads)"],
+        horizontal=False,
+        help="HER: H* adsorption free energy | CO₂RR: COOH*/CO*/HCOO*/OCHO* | ORR: OOH*/O*/OH* (Norskov 4e⁻ CHE)",
+    )
     is_her = reaction_mode.startswith("HER")
+    is_orr = reaction_mode.startswith("ORR")
 
     relax_mode = st.selectbox(
         "Relaxation level (OCP)",
@@ -979,14 +1017,30 @@ with st.sidebar:
 
     site_preset = st.multiselect("Sites (Manual mode)", default_sites, default=default_sites)
 
-    if not is_her:
+    if is_her:
+        co2_ads = []
+        orr_ads = []
+    elif is_orr:
+        co2_ads = []
+        orr_ads = st.multiselect(
+            "ORR intermediates",
+            ["OOH*", "O*", "OH*"],
+            default=["OOH*", "O*", "OH*"],
+            help="Norskov 4-electron pathway: OOH* → O* → OH* → H₂O",
+        )
+        orr_U = st.number_input(
+            "Applied potential U (V vs RHE)",
+            min_value=-2.0, max_value=2.0, value=0.0, step=0.05,
+            help="0.0 = equilibrium potential (1.23 V vs SHE). More negative = higher reduction overpotential.",
+            key="orr_U_input",
+        )
+    else:
         co2_ads = st.multiselect(
             "CO₂RR intermediates",
             ["COOH*", "CO*", "HCOO*", "OCHO*"],
             default=["COOH*", "CO*", "HCOO*", "OCHO*"],
         )
-    else:
-        co2_ads = []
+        orr_ads = []
 
 
     surfactant_class = "none"
@@ -1087,7 +1141,7 @@ working = st.session_state.get("atoms_tuned") or loaded_base
 if loaded_base is not None:
     st.markdown("### Optional: Surface composition tuning (ratio)")
 
-    # 구조를 기반으로 Element 기본값 자동 세팅
+    # Auto-set default elements based on structure
     ensure_tune_defaults_from_structure(loaded_base)
 
     # Prevent cumulative growth: always apply tuning on atoms_loaded (not on already tuned)
@@ -1122,7 +1176,7 @@ if loaded_base is not None:
                     "Element 2",
                     st.session_state.get("rt_el2_basic", "Cu"),
                     key="rt_el2_basic",
-                    help="여기에 금속원소(Ni, Cu, Al, Mg 등) 중 대체를 원하는 금속 원소를 넣어주세요.",
+                    help="Enter the metal element for substitution (e.g. Ni, Cu, Al, Mg).",
                 )
                 n2 = int(RATIO_SUM - int(n1))
                 st.write(f"Ratio (Element 2): **{n2}** (auto = {RATIO_SUM} - Ratio(Element 1))")
@@ -1176,7 +1230,7 @@ if loaded_base is not None:
                     "Element 2",
                     st.session_state.get("rt_el2_adv", "Cu"),
                     key="rt_el2_adv",
-                    help="여기에 금속원소(Ni, Cu, Al, Mg 등) 중 대체를 원하는 금속 원소를 넣어주세요.",
+                    help="Enter the metal element for substitution (e.g. Ni, Cu, Al, Mg).",
                 )
                 n2 = int(RATIO_SUM - int(n1))
                 st.write(f"Ratio (Element 2): **{n2}** (auto = {RATIO_SUM} - Ratio(Element 1))")
@@ -1188,7 +1242,7 @@ if loaded_base is not None:
             cand_str = st.text_input(
                 "Candidate elements (comma-separated, optional)",
                 value="",
-                help="비워두면 top layers에서 O/H 제외한 원소 전체를 후보로 사용.",
+                help="Leave empty to use all elements in top layers except O and H.",
                 key="rt_cands_adv",
             )
             cand_list = [c.strip() for c in cand_str.split(",") if c.strip()] or None
@@ -1567,6 +1621,8 @@ else:
                 st.markdown("#### 3D Preview (Geometry seeds)")
                 if is_her:
                     preview_ads_options = ["H*"]
+                elif is_orr:
+                    preview_ads_options = orr_ads if orr_ads else ["OOH*", "O*", "OH*"]
                 else:
                     preview_ads_options = co2_ads if co2_ads else ["COOH*", "CO*"]
                 preview_ads = st.selectbox("Preview adsorbate", preview_ads_options, index=0, key="preview_ads_geom")
@@ -1728,15 +1784,17 @@ else:
                             return_raw=True,
                         )
                     else:
-                        if not co2_ads:
-                            st.error("Select at least one CO2RR intermediate (sidebar).")
+                        _active_ads = orr_ads if is_orr else co2_ads
+                        if not _active_ads:
+                            _ads_label = "ORR" if is_orr else "CO2RR"
+                            st.error(f"Select at least one {_ads_label} intermediate (sidebar).")
                             return False
                         by_ads, raw_by_ads, stats_by_ads = screen_sites_adsorbml_lite(
                             atoms_for_sites_screen,
                             cand_sites,
-                            reaction="CO2RR",
+                            reaction="ORR" if is_orr else "CO2RR",
                             mtype=mtype,
-                            adsorbates=list(co2_ads),
+                            adsorbates=list(_active_ads),
                             top_k=int(top_k),
                             settings=settings,
                             progress_cb=_cb,
@@ -1746,7 +1804,7 @@ else:
 
                     site_map, struct_map, union_items = union_topk_sites(
                         by_ads,
-                        union_max_sites=int(adv_settings["union_max"]) if not is_her else int(top_k),
+                        union_max_sites=int(adv_settings["union_max"]) if (not is_her) else int(top_k),
                         xy_bin=float(adv_settings["xy_bin"]),
                     )
 
@@ -1843,7 +1901,10 @@ else:
                             mode2 = "default" if mtype == "metal" else "oxide_o"
                             atoms_prev = generate_slab_ads_series(atoms_for_sites_eff, [s], symbol="H", mode=mode2)[0]
                         else:
-                            ads0 = (co2_ads[0] if co2_ads else "COOH*")
+                            if is_orr:
+                                ads0 = (orr_ads[0] if orr_ads else "OOH*")
+                            else:
+                                ads0 = (co2_ads[0] if co2_ads else "COOH*")
                             atoms_prev = _build_adsorbate_preview_slab(atoms_for_sites_eff, s, ads0, dz=1.8, ref_dir="ref_gas")
                         show_atoms_3d(atoms_prev, height=420, width=900, tag=f"ml_fallback_{sel}")
 
@@ -1882,7 +1943,7 @@ else:
         )
 
     if (not is_her):
-        st.caption("Note: U/pH correction is applied only for HER. CO₂RR ΔG_ads is reported without U/pH shift.")
+        st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. ORR additionally writes a step-wise summary file (results_orr_summary.csv) using the entered U for one-electron CHE shifts.")
 
     # Defaults (so variables exist regardless of mode)
     co2rr_her_guardrail = False
@@ -2024,7 +2085,30 @@ else:
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         use_che_shift=True,
                     )
+            elif is_orr:
+                # ── ORR branch ─────────────────────────────────────────
+                _orr_adspecies = tuple(orr_ads) if orr_ads else ("OOH*", "O*", "OH*")
+                _orr_U = float(st.session_state.get("orr_U_input", 0.0))
+                if mtype == "metal":
+                    csv_path, meta = run_metal_orr_che(
+                        str(slab_path),
+                        sites=manual_sites,
+                        relax_mode=relax_mode,
+                        user_ads_sites=final_user_sites if final_user_sites else None,
+                        adspecies=_orr_adspecies,
+                        orr_u=_orr_U,
+                    )
+                else:
+                    csv_path, meta = run_oxide_orr_che(
+                        str(slab_path),
+                        sites=manual_sites,
+                        relax_mode=relax_mode,
+                        user_ads_sites=final_user_sites if final_user_sites else None,
+                        adspecies=_orr_adspecies,
+                        orr_u=_orr_U,
+                    )
             else:
+                # ── CO2RR branch ───────────────────────────────────────
                 if not co2_ads:
                     co2_ads = ["COOH*", "CO*"]
                 adspecies = tuple(co2_ads)
@@ -2060,7 +2144,7 @@ else:
             df["surfactant_class"] = str(surfactant_class)
             df["surfactant_chgnet_prerelax_slab"] = bool(surfactant_prerelax_slab)
 
-        mode_label = "HER" if is_her else "CO2RR"
+        mode_label = "HER" if is_her else ("ORR" if is_orr else "CO2RR")
 
         if is_her and "ΔG_H (eV)" in df.columns:
             df["ΔG_H(U,pH) (eV)"] = df["ΔG_H (eV)"] - float(U_input) - R_PH * float(pH_input)
@@ -2073,7 +2157,7 @@ else:
             if df_rel is not None:
                 df.loc[df_rel.index, "reliability"] = "reliable"
         else:
-            # CO2RR: QA-driven policy (migrated is NOT an auto-reject)
+            # CO2RR / ORR: QA-driven policy (migrated is NOT an auto-reject)
             df = co2rr_apply_qa_policy(df)
             df_keep, df_reject = co2rr_split_by_qa(df)
 
@@ -2376,7 +2460,7 @@ def _build_llm_payload(last_run: dict):
         dist_candidates = [
             "ads_z_min(Å)", "ads_z_max(Å)", "ads_z(Å)", "ads_height(Å)",
             "slab_z_max(Å)", "z_top(Å)",
-            "min_surf_dist(Å)", "ads_min_surf_dist(Å)", "ads_surf_min_dist(Å)",
+            "min_surf_dist(Å)", "ads_min_surf_dst(Å)", "ads_surf_min_dist(Å)",
             "ads_z_clearance(Å)",
         ]
         payload["definitions"]["available_distance_fields"] = [c for c in dist_candidates if c in df.columns]
@@ -2499,38 +2583,128 @@ def _call_llm_interpreter(payload: dict):
         )
 
     client = OpenAI(api_key=api_key)
+    
+    developer_instructions = """
+You are a scientific assistant that interprets electrocatalysis screening results (HER or CO2RR).
 
-    developer_instructions = (
-        "You are a scientific assistant interpreting electrocatalysis screening results (HER/CO2RR). "
-        "Use ONLY the provided JSON payload as evidence. "
-        "Your job is to (1) flag QC issues (adsorbate migration/site collapse/duplicates/non-physical artifacts), "
-        "(2) explain likely causes in materials terms (surface termination, limited site diversity, oxide vs metal anchoring), "
-        "(3) recommend paper-reportable representative value(s) with explicit decision rules, and "
-        "(4) propose next actions to validate realism (alternative termination/polymorph, slab thickness, DFT spot-check). "
-        "You MUST populate a two-track recommendation under recommended_for_paper. "
-        "Prefer payload['rules'] for selecting sites/values. If values are missing or a track is not applicable, "
-        "set track.site_label and track.value to null and explain why in evidence_note and uncertainties. "
-        "Always respect payload['definitions'] for energy sign conventions and migration criteria. "
-        ""
-        "Two-track rules by mode: "
-        "For HER: strong_binding_track = most negative ΔG_H among stable sites; balanced_binding_track = closest-to-zero ΔG_H (min |ΔG_H|) among stable sites. "
-        "For CO2RR: if any stable site has ΔE_ads < 0, strong_binding_track = most negative ΔE_ads and balanced_binding_track = min |ΔE_ads| among ΔE_ads < 0. "
-        "If all stable sites have ΔE_ads ≥ 0, report the minimum ΔE_ads as the 'least-unfavorable/least-endothermic' case "
-        "and set the balanced track to null (no exothermic candidates). Do NOT call this 'strong adsorption'. "
-        ""
-        "Language guardrails: "
-        "Do not describe a site as 'reliable' without a concrete diagnostic; prefer 'non-migrating under the migration criterion' and cite the criterion. "
-        "Do not claim a catalyst is 'optimal', 'not optimal', 'high/low efficiency', or has 'potential for CO2RR' based only on ΔE_ads/ΔG_H. "
-        "Limit conclusions to 'under this screening' and 'under this reference definition'. "
-        "Do not use the word 'favorable' unless you explicitly state the sign convention and the comparison set. "
-        "If ΔE_ads is positive (or all stable ΔE_ads ≥ 0), explicitly state that adsorption is endothermic/weak under this reference, "
-        "and discuss only relative ordering (least unfavorable) rather than activity. "
-        "If distance diagnostics are missing, do not infer adsorption vs desorption; instead list it as an uncertainty. "
-        "For 'structure stability/realism', do NOT claim ambient (room-temperature/pressure) phase stability. "
-        "If mp_meta provides energy_above_hull or formation energy, you may describe them only as thermodynamic indicators "
-        "(typically at 0 K and without explicit kinetic/processing context), and you must state this limitation."
-    )
+Use ONLY the provided JSON payload as evidence.
+Do not use outside knowledge, unstated assumptions, or inferred values not supported by the payload.
 
+Your task is to return a JSON object only, following the required schema exactly.
+
+PRIORITY OF EVIDENCE
+1. payload["definitions"] (highest priority)
+2. payload["rules"]
+3. per-site QC / diagnostics / flags
+4. numeric site values
+5. mp_meta thermodynamic indicators
+If any source conflicts with a lower-priority source, follow the higher-priority source and note the conflict in uncertainties.
+
+GENERAL DECISION RULES
+- A site is "stable" only if it is not excluded by payload["definitions"] or payload["rules"].
+- Exclude from recommendation any site flagged as migrated, collapsed, duplicate, or non-physical according to payload definitions/rules.
+- If distance or geometry diagnostics required for a stability decision are missing, do not assume stability; mark the site as uncertain.
+- If no stable sites remain after exclusions, set all recommended track fields to null and explain why.
+- If only one stable site remains, both tracks may point to the same site if it satisfies both selection rules.
+- If multiple sites are tied, break ties deterministically in this order:
+  (1) site with fewer QC concerns,
+  (2) site with more complete diagnostics,
+  (3) lexicographically smaller site_label.
+
+QC INTERPRETATION TASKS
+1. Flag QC issues:
+   - migration
+   - site collapse
+   - duplicates
+   - non-physical artifacts
+   - missing diagnostics that prevent firm interpretation
+2. Explain likely causes using only payload-supported materials interpretations, such as:
+   - surface termination effects
+   - limited site diversity
+   - oxide vs metal anchoring differences
+   - slab/model limitations
+Do not assert causes not grounded in the payload.
+
+RECOMMENDATION RULES
+You MUST populate recommended_for_paper with two tracks.
+
+For HER:
+- strong_binding_track = most negative ΔG_H among stable sites
+- balanced_binding_track = stable site with minimum |ΔG_H|
+
+For CO2RR:
+- If any stable site has ΔE_ads < 0:
+  - strong_binding_track = most negative ΔE_ads among stable sites
+  - balanced_binding_track = stable site with minimum |ΔE_ads| among sites with ΔE_ads < 0
+- If all stable sites have ΔE_ads >= 0:
+  - report the minimum ΔE_ads site as the least-unfavorable / least-endothermic case
+  - set balanced_binding_track.site_label = null
+  - set balanced_binding_track.value = null
+  - explain that no exothermic stable candidate exists under this reference definition
+  - do not describe this as strong adsorption
+
+REPORTING RULES
+- Prefer payload["rules"] when selecting representative values.
+- Use exact sign conventions from payload["definitions"].
+- State explicitly whether a recommended site is non-migrating under the stated migration criterion.
+- Do not use:
+  "reliable", "optimal", "high efficiency", "low efficiency", "potential for CO2RR"
+  unless such claims are explicitly supported by payload fields that justify them.
+- Do not use "favorable" unless the sign convention and comparison set are explicitly stated.
+- If ΔE_ads is positive, state that adsorption is endothermic/weak under this reference and discuss only relative ordering.
+- If mp_meta contains energy_above_hull or formation energy, describe them only as thermodynamic indicators, typically near 0 K and without kinetic/processing context.
+
+OUTPUT SCHEMA
+Return JSON only with exactly these top-level keys:
+{
+  "mode": null,
+  "qc_summary": {
+    "status": null,
+    "issues": [],
+    "uncertainties": []
+  },
+  "site_assessment": [],
+  "recommended_for_paper": {
+    "strong_binding_track": {
+      "site_label": null,
+      "value": null,
+      "evidence_note": "",
+      "uncertainties": []
+    },
+    "balanced_binding_track": {
+      "site_label": null,
+      "value": null,
+      "evidence_note": "",
+      "uncertainties": []
+    }
+  },
+  "materials_interpretation": [],
+  "next_actions": []
+}
+
+SITE_ASSESSMENT ITEM SCHEMA
+Each item in site_assessment must be:
+{
+  "site_label": null,
+  "included_in_selection": null,
+  "exclusion_reason": null,
+  "qc_flags": [],
+  "value": null,
+  "evidence_note": "",
+  "uncertainties": []
+}
+
+NEXT ACTIONS
+Propose only payload-consistent validation actions, such as:
+- alternative termination or polymorph
+- slab thickness / repeat size check
+- additional site diversity
+- DFT spot-check
+- duplicate filtering / geometry verification
+
+Do not output markdown. Do not output prose outside JSON.
+"""
+    
     resp = client.responses.parse(
         model=st.session_state.get("llm_model", "gpt-4o-mini-2024-07-18"),
         input=[
