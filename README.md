@@ -1,8 +1,13 @@
-# Surface Adsorption and Geometry Evaluator(SAGE)
+# SAGE
 
-An integrated workflow application for machine-learning-assisted electrocatalyst screening.
+**Surface Adsorption and Geometry Evaluator**
 
-SAGE App combines structure preparation, structural quality control, adsorption-site generation, ML-assisted pre-screening (CHGNet), CHE-based thermodynamic evaluation (Equiformer), and result management within a single interactive environment. Supports HER, CO₂RR, and ORR on both metallic and oxide surfaces.
+SAGE is an interactive workflow for slab preparation, structure quality control, adsorption-site generation, and machine-learning-assisted electrocatalyst screening.  
+It was developed to reduce the fragmentation of conventional script-based workflows, where structure preparation, site generation, screening, and post-processing are often handled separately and inconsistently.
+
+SAGE integrates structure input, surface preparation, geometric quality control, adsorption-site generation, screening, thermodynamic post-processing, and result export in a single interface.  
+The current workflow is designed primarily for surface-based electrocatalyst screening, with support for metallic and oxide systems in HER and CO₂RR analysis, while ORR support is under development.
+
 
 # [SAGE App interface]
 <img width="1280" height="543" alt="Image" src="https://github.com/user-attachments/assets/1b3de53e-4bc5-4b19-abb9-3ae9f91aff15" />## Installation
