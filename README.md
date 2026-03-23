@@ -72,8 +72,6 @@ The application will open in your default browser.
 - **Result management** — session history, metadata export, CSV download
 - **LLM interpretation** — optional structured result summarization
 
-```
-
 ## Dependencies
 
 - Python >= 3.10
@@ -85,7 +83,7 @@ Full list in `requirements.txt`.
 
 If you use SAGE App in your research, please cite:
 ```
-.
+,
 ```
 
 ## Acknowledgements
