@@ -70,24 +70,6 @@ The application will open in your default browser.
 - **Result management** — session history, metadata export, CSV download
 - **LLM interpretation** — optional structured result summarization
 
-## Project structure
-```
-├── app/
-│   └── Home.py                  # Main Streamlit application
-├── ocp_app/
-│   └── core/
-│       ├── ads_sites.py         # Adsorption site detection
-│       ├── adsorbml_lite_screening.py  # CHGNet ML pre-screening
-│       ├── CHE_mode.py          # CHE thermodynamic evaluation
-│       ├── cifgen.py            # Structure generation and tuning
-│       ├── gas_refs.py          # Gas-phase reference energies
-│       ├── run_history.py       # Session history management
-│       ├── seeds.py             # Reproducibility seed control
-│       └── structure_check.py   # Structural quality control
-├── ref_gas/                     # Gas reference CIF templates
-├── requirements.txt
-├── LICENSE
-└── README.md
 ```
 
 ## Dependencies
