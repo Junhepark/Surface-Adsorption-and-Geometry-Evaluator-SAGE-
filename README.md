@@ -1,4 +1,4 @@
-# SAGE
+# Surface Adsorption and Geometry Evaluator(SAGE)
 
 **Surface Adsorption and Geometry Evaluator**
 
