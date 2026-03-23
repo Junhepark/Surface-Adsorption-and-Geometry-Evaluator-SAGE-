@@ -1,10 +1,10 @@
-# Open-Catalyst-Project-application_prototype
+# Surface Adsorption and Geometry Evaluator(SAGE)
 
 An integrated workflow application for machine-learning-assisted electrocatalyst screening.
 
-OCP App combines structure preparation, structural quality control, adsorption-site generation, ML-assisted pre-screening (CHGNet), CHE-based thermodynamic evaluation (Equiformer), and result management within a single interactive environment. Supports HER, CO₂RR, and ORR on both metallic and oxide surfaces.
+SAGE App combines structure preparation, structural quality control, adsorption-site generation, ML-assisted pre-screening (CHGNet), CHE-based thermodynamic evaluation (Equiformer), and result management within a single interactive environment. Supports HER, CO₂RR, and ORR on both metallic and oxide surfaces.
 
-# [OCP App interface]
+# [SAGE App interface]
 <img width="1559" height="729" alt="Image" src="https://github.com/user-attachments/assets/fdd9ec61-2b5d-4db0-9670-bf6358d07170" />
 ## Installation
 ```bash
@@ -82,9 +82,9 @@ Full list in `requirements.txt`.
 
 ## Citation
 
-If you use OCP App in your research, please cite:
+If you use SAGE App in your research, please cite:
 ```
-J. Park, D. Kim, "An integrated workflow application for machine-learning-assisted catalyst screening," SoftwareX (submitted).
+.
 ```
 
 ## Acknowledgements
