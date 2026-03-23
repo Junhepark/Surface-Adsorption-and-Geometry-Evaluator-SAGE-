@@ -25,6 +25,7 @@ The model weights are distributed separately and require access approval:
 pip install huggingface_hub
 huggingface-cli login
 ```
+Otherwise, The user could use other models(Including OC20, OC22, or etc...) please, modify it in common.py before usage.
 
 The model weights will be downloaded automatically on first use.
 ## Usage
