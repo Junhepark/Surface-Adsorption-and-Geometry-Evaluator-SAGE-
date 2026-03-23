@@ -88,8 +88,8 @@ except Exception as e:
     SLABIFY_IMPORT_ERR = str(e)
 
 # ---------------- App config ----------------
-st.set_page_config(page_title="OCP App (HAPLAB)", layout="wide")
-st.title("Open Catalyst Project App — HER / CO₂RR / ORR (HAPLAB v1.0)")
+st.set_page_config(page_title="SAGE App (HAPLAB)", layout="wide")
+st.title("Surface Adsorption and Geometry Evaluator — HER / CO₂RR / ORR (HAPLAB v1.0)")
 
 R_PH = 0.0591  # eV per pH
 GLOBAL_SEED = 42
