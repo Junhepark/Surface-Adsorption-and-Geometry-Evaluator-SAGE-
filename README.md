@@ -297,7 +297,7 @@ See `requirements.txt` for the full dependency list.
 If you use SAGE in your research, please cite the software repository.
 
 ```text
-Junhe Park. Surface Adsorption and Geometry Evaluator (SAGE). GitHub repository.
+Junhe Park. Surface Adsorption and Geometry Evaluator (SAGE), v1.0.0. GitHub repository.
 ```
 
 A manuscript citation will be added here after publication.
