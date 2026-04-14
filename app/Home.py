@@ -13,6 +13,7 @@ import inspect
 from typing import Optional
 
 import numpy as np
+from ase import Atoms
 from ase.io import read, write
 import py3Dmol
 import streamlit.components.v1 as components
@@ -48,6 +49,110 @@ from ocp_app.core.cifgen import (
     scale_xy_and_tune_ratio,
 )
 from ocp_app.core import run_history as rh
+from ocp_app.core.state import (
+    _init_state,
+    _clear_ml_cache,
+    _atoms_signature,
+    _reset_prepared_from_working,
+    _ensure_prepared_uptodate,
+    _push_prepared_update,
+    _jsonable,
+    normalize_mp_id,
+    infer_default_tune_elements,
+    ensure_tune_defaults_from_structure,
+)
+from ocp_app.core.conditioning import (
+    _cluster_z_layers,
+    _suggest_conditioning_params,
+    _get_conditioned_slab,
+)
+from ocp_app.core.anchors.oxide_her import (
+    _oxide_o_based_ads_position_compat,
+    _pbc_min_image_xy_distance_sq,
+    _top_surface_o_indices,
+    _generate_oxide_her_oanchor_sites,
+    _project_single_oxide_her_site_to_otop,
+    _project_oxide_her_sites_to_otop,
+)
+from ocp_app.core.structure_ops import (
+    atoms_to_cif_string,
+    atoms_to_cif_bytes,
+    atoms_to_xyz_string,
+    _recenter_slab_z_into_cell,
+    add_vacuum_z,
+    set_pbc_z,
+    repeat_xy,
+    _surface_xy_lengths,
+    _suggest_minimal_xy_repeat,
+)
+from ocp_app.ui.viewers import _render_min_dist_panel, show_atoms_3d
+from ocp_app.core.oxide_surface_rules import (
+    infer_oxide_family_from_atoms,
+    _classify_surface_exposure,
+    _flip_slab_z_keep_cell,
+    _normalize_oxide_candidate_top_surface,
+    _top_surface_o_anchor_sites_with_spacing,
+    _build_oxide_oh_terminated_candidate,
+    _expand_oxide_surface_state_candidates,
+    _oxide_candidate_rank_key,
+    _pick_best_oxide_slab_candidate,
+    _oxide_mode_keep_candidate,
+)
+from ocp_app.core.surface_families import (
+    INTERFACE_FACET_PRESETS,
+    THICKNESS_ALLOCATION_OPTIONS,
+    _infer_interface_surface_family,
+    _get_interface_facet_options,
+    _recommended_interface_facet_labels,
+    _facet_labels_for_mode,
+)
+from ocp_app.core.interface_builder import (
+    _allocation_to_thicknesses,
+    _inplane_metrics,
+    _auto_max_xy_repeat,
+    _find_best_xy_repeat_pair,
+    _scale_film_to_substrate_xy,
+    _auto_initial_gap,
+    _stack_interface_pair,
+    _registry_candidates_auto,
+    _geometry_prefilter_interface_work,
+    _select_best_slab_for_facet,
+    _build_interface_candidates_from_bulks,
+)
+from ocp_app.core.slabify import (
+    _DEFAULT_SLAB_MIN_THICKNESS,
+    _DEFAULT_SLAB_MAX_CANDIDATES,
+    _pick_best_slab_candidate_auto,
+    _pick_best_slab_candidate,
+    _miller_sort_key,
+    _format_hkl_label,
+    _reduce_hkl_by_gcd,
+    _enumerate_low_index_millers,
+    _recommended_step2_facets,
+    _facet_choices_for_scope,
+    _vacuum_target_from_ui,
+    slabify_from_bulk,
+)
+from ocp_app.core.postprocess import (
+    split_reliable_unreliable,
+    _normalize_text_series,
+    co2rr_apply_qa_policy,
+    co2rr_split_by_qa,
+    co2rr_dedupe_candidates,
+    build_compact_table,
+    annotate_site_transitions,
+    summarize_site_transitions,
+    _make_ml_screen_key,
+    _build_ml_compact_df,
+)
+from ocp_app.core.preview import (
+    build_adsorbate_preview_slab,
+    export_zip_of_struct_map,
+)
+from ocp_app.core.reporting import (
+    build_llm_payload,
+    call_llm_interpreter,
+)
 from ocp_app.core.structure_check import validate_structure
 from ocp_app.core.ads_sites import _oxide_o_based_ads_position
 from ocp_app.core.ads_sites import oxide_surface_seed_position, expand_oxide_channels_for_adsorbate, ANION_SYMBOLS
@@ -83,13 +188,18 @@ HAS_SLABIFY = True
 SLABIFY_IMPORT_ERR = None
 try:
     from pymatgen.core.surface import SlabGenerator
+    try:
+        from pymatgen.core.surface import get_symmetrically_distinct_miller_indices
+    except Exception:
+        get_symmetrically_distinct_miller_indices = None
 except Exception as e:
     HAS_SLABIFY = False
     SLABIFY_IMPORT_ERR = str(e)
+    get_symmetrically_distinct_miller_indices = None
 
 # ---------------- App config ----------------
-st.set_page_config(page_title="SAGE App (HAPLAB)", layout="wide")
-st.title("Surface Adsorption and Geometry Evaluator — HER / CO₂RR / ORR (HAPLAB v1.0)")
+st.set_page_config(page_title="OCP App (HAPLAB)", layout="wide")
+st.title("Surface Adsorption and Geometry Evaluator(SAGE) — HER / CO₂RR / ORR (HAPLAB v1.0)")
 
 R_PH = 0.0591  # eV per pH
 GLOBAL_SEED = 42
@@ -97,90 +207,8 @@ RATIO_SUM = 10
 
 CO2RR_MIGRATION_DISP_THRESH_A = 0.8  # Å; adsorbate lateral displacement threshold to flag migration
 
-# Approximate API pricing (USD per 1M tokens). Used ONLY for rough in-app cost estimates.
-# Update as needed if OpenAI pricing changes.
-PRICING_USD_PER_1M = {
-    # gpt-4o mini (standard)
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    # gpt-5 / gpt-5.2 (standard)
-    "gpt-5": {"input": 1.25, "output": 10.00},
-    "gpt-5.2": {"input": 1.75, "output": 14.00},
-}
-
-def _estimate_cost_usd(model_name: str, input_tokens: int | None, output_tokens: int | None) -> float | None:
-    """Rough cost estimate for a single call (standard processing)."""
-    if input_tokens is None or output_tokens is None:
-        return None
-    if not model_name:
-        return None
-    m = model_name.lower()
-    rate = None
-    # Match by prefix for dated model names
-    for prefix, r in PRICING_USD_PER_1M.items():
-        if m.startswith(prefix):
-            rate = r
-            break
-    if rate is None:
-        return None
-    return (float(input_tokens) * float(rate["input"]) + float(output_tokens) * float(rate["output"])) / 1_000_000.0
-
-
-ADS_TEMPLATE_FILES = {
-    "CO":   "CO_box.cif",
-    "COOH": "COOH_box.cif",
-    "HCOO": "HCOO_box.cif",
-    "OCHO": "OCHO_box.cif",
-    # ORR intermediates
-    "O":    "O_box.cif",
-    "OH":   "OH_box.cif",
-    "OOH":  "OOH_box.cif",
-}
 
 # ---------------- Session State ----------------
-def _init_state():
-    defaults = {
-        # Pipeline structures
-        "atoms_loaded": None,          # Step 1 output (uploaded or MP bulk)
-        "atoms_tuned": None,           # optional surface composition tuning
-        "ratio_tune_meta": None,
-        "atoms_prepared": None,        # Step 2 output
-        "prepared_source_sig": None,
-        "prepared_history": [],
-
-        # Mode tracking
-        "_slab_source_mode_prev": None,
-        "_upload_sig": None,
-
-        # Credentials / LLM
-        "mp_api_key": os.environ.get("MP_API_KEY", ""),
-        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
-        "llm_model": "gpt-4o-mini",
-        "llm_enabled": True,
-        "llm_last_out": None,
-        "loaded_mp_id": None,
-
-
-        # Slabify candidates (expert)
-        "slabify_candidates_atoms": None,
-        "slabify_candidates_meta": None,
-
-        # ML cache
-        "ml_screen_key": None,
-        "ml_union_site_map": None,
-        "ml_union_struct_map": None,
-        "ml_union_items": None,
-        "ml_compact_df": None,
-        "ml_debug_df": None,
-        "ml_debug_stats": None,
-
-        # Tuning defaults tracking
-        # Last run outputs (for persistent rendering)
-        "last_run": None,
-        "_tune_defaults_sig": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
 
 _init_state()
 
@@ -198,768 +226,8 @@ except Exception:
     pass
 
 
-def _clear_ml_cache():
-    for k in [
-        "ml_screen_key",
-        "ml_union_site_map",
-        "ml_union_struct_map",
-        "ml_union_items",
-        "ml_compact_df",
-        "ml_debug_df",
-        "ml_debug_stats",
-    ]:
-        st.session_state[k] = None
-
-def _atoms_signature(atoms) -> tuple:
-    try:
-        cell = atoms.get_cell()
-        lengths = tuple(np.round(cell.lengths(), 4).tolist())
-        angles = tuple(np.round(cell.angles(), 3).tolist())
-    except Exception:
-        lengths = ("?", "?", "?")
-        angles = ("?", "?", "?")
-    return (len(atoms), atoms.get_chemical_formula(), lengths, angles)
-
-
-def _cluster_z_layers(z_vals: np.ndarray, tol: float = 0.35):
-    """Cluster z-values into layers. Returns list of (z_center, indices_in_original_array)."""
-    if z_vals.size == 0:
-        return []
-    order = np.argsort(z_vals)
-    z_sorted = z_vals[order]
-    clusters = []
-    start = 0
-    for i in range(1, len(z_sorted)):
-        if (z_sorted[i] - z_sorted[i - 1]) > tol:
-            clusters.append(order[start:i])
-            start = i
-    clusters.append(order[start:len(z_sorted)])
-    out = []
-    for idxs in clusters:
-        zc = float(np.mean(z_vals[idxs]))
-        out.append((zc, idxs))
-    out.sort(key=lambda t: t[0], reverse=True)
-    return out
-
-
-def _suggest_conditioning_params(atoms, *, mtype: str, surfactant_class: str, profile: str = "safe"):
-    """Heuristic auto-tuning for CHGNet slab conditioning parameters."""
-    mtype = (mtype or "").lower()
-    cls = (surfactant_class or "none").lower()
-    prof = (profile or "safe").lower()
-
-    pos = atoms.get_positions()
-    z = pos[:, 2]
-    zmax = float(np.max(z))
-    top_region = (z > (zmax - 8.0))
-    z_top = z[top_region]
-    layers = _cluster_z_layers(z_top, tol=0.35)
-
-    dz = 2.0
-    if len(layers) >= 2:
-        dz = max(0.8, float(layers[0][0] - layers[1][0]))
-
-    top_z_tol = float(np.clip(dz + 1.2, 2.0, 4.5))
-
-    def _n_layers_in_window(win):
-        zwin = z_top[z_top > (float(np.max(z_top)) - win)]
-        return len(_cluster_z_layers(zwin, tol=0.35))
-
-    if _n_layers_in_window(top_z_tol) < 2:
-        top_z_tol = float(np.clip(top_z_tol + dz, 2.0, 5.0))
-
-    is_oxide_like = (mtype == "oxide") or ("O" in set(atoms.get_chemical_symbols()) and len(set(atoms.get_chemical_symbols())) >= 2)
-    if is_oxide_like:
-        idx_win = np.where(z > (zmax - top_z_tol))[0]
-        syms = set(atoms.get_chemical_symbols()[i] for i in idx_win)
-        has_o = ("O" in syms)
-        has_non_o = any(s != "O" for s in syms)
-        if not (has_o and has_non_o):
-            top_z_tol = float(np.clip(top_z_tol + dz, 2.0, 5.0))
-
-    if prof.startswith("explore"):
-        base = 0.06 if is_oxide_like else 0.05
-        jiggle_amp = base + 0.02 * max(0.0, (top_z_tol - 2.5))
-        if cls == "nonionic":
-            jiggle_amp += 0.005
-        jiggle_amp = float(np.clip(jiggle_amp, 0.04, 0.12))
-        max_steps = 400
-    else:
-        jiggle_amp = 0.05 if is_oxide_like else 0.04
-        max_steps = 250
-
-    fmax = 0.05
-    rationale = f"auto(profile={prof}, dz≈{dz:.2f} Å, top_window={top_z_tol:.2f} Å, jiggle={jiggle_amp:.2f} Å)"
-    return {"top_z_tol": float(top_z_tol), "jiggle_amp": float(jiggle_amp), "fmax": float(fmax), "max_steps": int(max_steps), "rationale": rationale}
-
-
-def _get_conditioned_slab(atoms, *, is_her: bool, surfactant_class: str, enable: bool, top_z_tol: float = 2.0, jiggle_amp: float = 0.05, fmax: float = 0.05, max_steps: int = 200, seed: Optional[int] = None):
-    """Return a CHGNet-conditioned (slab-only) structure for the given surfactant scenario.
-
-    This is a *scenario proxy* for interfacial conditioning: it does not model explicit surfactant,
-    solvent, EDL, or potential. It is used to perturb/relax the slab into nearby surface states
-    and then evaluate adsorption energetics downstream with the OCP model.
-
-    Caching: keyed by a lightweight structure signature + surfactant_class.
-    """
-    try:
-        cls = str(surfactant_class or "none").lower()
-    except Exception:
-        cls = "none"
-
-    if bool(is_her) or (not bool(enable)) or (cls in ("none", "", "null")):
-        return atoms, None
-
-    if not HAS_ADSORML:
-        return atoms, None
-
-    sig = _atoms_signature(atoms)
-    cache = st.session_state.setdefault("slab_condition_cache", {})
-    key = (sig, cls, float(top_z_tol), float(jiggle_amp), float(fmax), int(max_steps), int(seed) if seed is not None else None)
-
-    hit = cache.get(key)
-    if isinstance(hit, dict) and ("atoms" in hit):
-        return hit["atoms"], hit.get("meta")
-
-    # Compute and cache
-    atoms2, meta = relax_slab_chgnet(atoms, surfactant_class=cls, top_z_tol=float(top_z_tol), jiggle_amp=float(jiggle_amp), seed=seed, fmax=float(fmax), max_steps=int(max_steps), device="auto")
-    atoms2 = _recenter_slab_z_into_cell(atoms2, margin=1.0)
-    cache[key] = {"atoms": atoms2, "meta": meta}
-    return atoms2, meta
-
-
-def _reset_prepared_from_working():
-    working = st.session_state.get("atoms_tuned") or st.session_state.get("atoms_loaded")
-    if working is None:
-        st.session_state["atoms_prepared"] = None
-        st.session_state["prepared_source_sig"] = None
-        st.session_state["prepared_history"] = []
-        _clear_ml_cache()
-        st.session_state["slabify_candidates_atoms"] = None
-        st.session_state["slabify_candidates_meta"] = None
-        return
-
-    sig = _atoms_signature(working)
-    st.session_state["atoms_prepared"] = working.copy()
-    st.session_state["prepared_source_sig"] = sig
-    st.session_state["prepared_history"] = [{"action": "reset_from_working", "sig": sig}]
-    _clear_ml_cache()
-    st.session_state["slabify_candidates_atoms"] = None
-    st.session_state["slabify_candidates_meta"] = None
-
-def _ensure_prepared_uptodate():
-    working = st.session_state.get("atoms_tuned") or st.session_state.get("atoms_loaded")
-    if working is None:
-        return
-    sig = _atoms_signature(working)
-    if st.session_state.get("atoms_prepared") is None or st.session_state.get("prepared_source_sig") != sig:
-        _reset_prepared_from_working()
-
-def _push_prepared_update(atoms_new, action: str, meta: dict | None = None):
-    st.session_state["atoms_prepared"] = atoms_new
-    st.session_state["prepared_history"] = (st.session_state.get("prepared_history") or []) + [{
-        "action": action,
-        **(meta or {}),
-    }]
-    _clear_ml_cache()
-    st.session_state["slabify_candidates_atoms"] = None
-    st.session_state["slabify_candidates_meta"] = None
-
-def _jsonable(x):
-    if isinstance(x, (np.integer, np.int64, np.int32)):
-        return int(x)
-    if isinstance(x, (np.floating, np.float64, np.float32)):
-        return float(x)
-    if isinstance(x, (np.ndarray,)):
-        return x.tolist()
-    if isinstance(x, tuple):
-        return [_jsonable(v) for v in x]
-    if isinstance(x, list):
-        return [_jsonable(v) for v in x]
-    if isinstance(x, dict):
-        return {str(k): _jsonable(v) for k, v in x.items()}
-    return x
-
-
-
-def _oxide_o_based_ads_position_compat(atoms, site, dz: float = 1.0, extra_z: float = 0.0):
-    """Call _oxide_o_based_ads_position with best-effort kwarg compatibility.
-
-    Different ocp_app versions have used different parameter names:
-      - dz_h_oh, dz_h, or dz
-    This helper inspects the callable signature and only passes supported kwargs.
-
-    Returns
-    -------
-    (x, y, z): tuple[float, float, float]
-    """
-    try:
-        params = inspect.signature(_oxide_o_based_ads_position).parameters
-    except Exception:
-        params = {}
-
-    kwargs = {}
-    if "dz_h_oh" in params:
-        kwargs["dz_h_oh"] = float(dz)
-    elif "dz_h" in params:
-        kwargs["dz_h"] = float(dz)
-    elif "dz" in params:
-        kwargs["dz"] = float(dz)
-
-    if "extra_z" in params:
-        kwargs["extra_z"] = float(extra_z)
-
-    out = _oxide_o_based_ads_position(atoms, site, **kwargs) if kwargs else _oxide_o_based_ads_position(atoms, site)
-    # Be tolerant to older return formats
-    try:
-        x, y, z = out
-    except Exception:
-        raise RuntimeError(f"_oxide_o_based_ads_position returned unexpected value: {out!r}")
-    return float(x), float(y), float(z)
-
-def infer_oxide_family_from_atoms(atoms):
-    symbols = [s for s in atoms.get_chemical_symbols() if s != "H"]
-    counts = Counter(symbols)
-    O = counts.pop("O", 0)
-    if O == 0 or len(counts) == 0:
-        return {"family": "unknown", "reduced_formula": None}
-
-    nums = list(counts.values()) + [O]
-    g = reduce(gcd, nums) if nums else 1
-    if g == 0:
-        g = 1
-
-    red_counts = {el: n // g for el, n in counts.items()}
-    O_red = O // g
-    cation_sum = sum(red_counts.values())
-
-    parts = [f"{el}{n if n > 1 else ''}" for el, n in sorted(red_counts.items())]
-    if O_red > 0:
-        parts.append(f"O{O_red if O_red > 1 else ''}")
-    reduced_formula = "".join(parts)
-
-    family = "unknown"
-    if O_red == 1 and cation_sum == 1:
-        family = "rocksalt_AO"
-    elif O_red == 2 and cation_sum == 1:
-        family = "rutile_AO2"
-    elif O_red == 3 and cation_sum == 2:
-        family = "perovskite_ABO3"
-    elif O_red == 4 and cation_sum == 3:
-        family = "spinel_AB2O4"
-
-    return {"family": family, "reduced_formula": reduced_formula}
-
 # ---- Convenience helpers (mp-id normalize, tuning defaults, min-distance panel) ----
-_NON_METALS = {
-    "H", "He",
-    "B", "C", "N", "O", "F", "Ne",
-    "Si", "P", "S", "Cl", "Ar",
-    "Br", "I",
-}
 
-def normalize_mp_id(raw: str) -> str:
-    """Normalize MP-ID variants ('19009'/'mp19009'/'mp-19009') to 'mp-19009'."""
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    m = re.match(r"^(?:mp[-_]?){0,1}(\d+)$", s, flags=re.IGNORECASE)
-    if m:
-        return f"mp-{m.group(1)}"
-    return s
-
-def infer_default_tune_elements(atoms) -> tuple[str, str]:
-    """Element1 = most abundant metal, Element2 = second most (default 'Cu')"""
-    syms = [s for s in atoms.get_chemical_symbols() if s not in ("O", "H")]
-    if not syms:
-        return ("Ni", "Cu")
-
-    counts = Counter(syms)
-    metal_counts = Counter({el: n for el, n in counts.items() if el not in _NON_METALS})
-    if not metal_counts:
-        metal_counts = counts  # fallback
-
-    el1 = metal_counts.most_common(1)[0][0]
-    el2 = next((el for el, _ in metal_counts.most_common() if el != el1), "Cu")
-    return (str(el1), str(el2))
-
-def ensure_tune_defaults_from_structure(atoms):
-    """Auto-update default element selections when the structure changes"""
-    sig = _atoms_signature(atoms)
-    if st.session_state.get("_tune_defaults_sig") != sig:
-        el1, el2 = infer_default_tune_elements(atoms)
-        st.session_state["_tune_defaults_sig"] = sig
-
-        # Sync basic/expert defaults
-        st.session_state["rt_el1_basic"] = el1
-        st.session_state["rt_el2_basic"] = el2
-        st.session_state["rt_el1_adv"] = el1
-        st.session_state["rt_el2_adv"] = el2
-
-def _render_min_dist_panel(rep):
-    """
-    Based on validate_structure() results.
-     Displays only OK/WARNING/CRITICAL levels (internal indices hidden).
-    """
-    ng = getattr(rep, "nearest_global", None) or {}
-    nbp = getattr(rep, "nearest_by_pair", None) or []
-
-    if (not ng) or (not nbp):
-        st.info("Min interatomic distance: not available.")
-        return
-
-    g_pair = str(ng.get("pair", ""))
-    g_dmin = ng.get("d_min", None)
-    if g_dmin is None:
-        st.info("Min interatomic distance: not available.")
-        return
-
-    g_flag = "ok"
-    for p in nbp:
-        if getattr(p, "pair", "") == g_pair:
-            g_flag = str(getattr(p, "flag", "ok"))
-            break
-
-    level = g_flag.upper()
-    line = (
-        f"Min interatomic distance: **{float(g_dmin):.3f} Å** (**{g_pair}**)  \n"
-        f"Level: **{level}** (source: validate_structure)"
-    )
-
-    if g_flag.lower().startswith("crit"):
-        st.error(line)
-    elif g_flag.lower().startswith("warn"):
-        st.warning(line)
-    else:
-        st.success(line)
-
-    rows = []
-    for p in nbp:
-        rows.append({
-            "pair": getattr(p, "pair", ""),
-            "d_min (Å)": float(getattr(p, "d_min", np.nan)),
-            "d_mean (Å)": float(getattr(p, "d_mean", np.nan)),
-            "n_bonds": int(getattr(p, "n_bonds", 0)),
-            "level": str(getattr(p, "flag", "ok")).upper(),
-        })
-    df_pair = pd.DataFrame(rows).sort_values("d_min (Å)")
-
-    with st.expander("Min distances by element pair (OK/WARNING/CRITICAL)", expanded=False):
-        st.dataframe(df_pair, use_container_width=True)
-
-def atoms_to_cif_string(atoms, symprec: float = 0.1) -> str:
-    """Serialize ASE Atoms to CIF.
-
-    Primary path: pymatgen CifWriter (keeps legacy behavior).
-    Fallback path: ASE CIF writer to avoid spglib symmetry failures on slabs/relaxed structures.
-    """
-    try:
-        struct = AseAtomsAdaptor.get_structure(atoms)
-        return str(CifWriter(struct, symprec=symprec))
-    except Exception:
-        # Fallback: write P1 CIF via ASE (no symmetry search); use a temp file since ASE CIF writer expects a real file handle.
-        fd, tmp_path = tempfile.mkstemp(prefix="ocpapp_", suffix=".cif")
-        os.close(fd)
-        try:
-            write(tmp_path, atoms, format="cif")
-            return Path(tmp_path).read_text(encoding="utf-8", errors="replace")
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-def atoms_to_cif_bytes(atoms, symprec: float = 0.1) -> bytes:
-    return atoms_to_cif_string(atoms, symprec=symprec).encode("utf-8")
-
-def atoms_to_xyz_string(atoms) -> str:
-    buf = StringIO()
-    write(buf, atoms, format="xyz")
-    xyz_str = buf.getvalue()
-    buf.close()
-    return xyz_str
-
-
-def _recenter_slab_z_into_cell(atoms, margin: float = 1.0):
-    """Shift atoms along z so the slab sits well inside the unit cell (avoid z-wrapping artifacts).
-
-    Only applies when the cell vector c is (approximately) aligned with z.
-    Does not change the cell size.
-    """
-    a = atoms.copy()
-    try:
-        cell = a.get_cell()
-        # Require c-vector ~ z-axis (orthorhombic/near-orthorhombic slabs)
-        if abs(cell[2, 0]) > 1e-3 or abs(cell[2, 1]) > 1e-3:
-            return a
-        Lz = float(cell[2, 2])
-        if not np.isfinite(Lz) or Lz <= 0:
-            return a
-
-        z = a.get_positions()[:, 2]
-        zmin = float(np.min(z))
-        zmax = float(np.max(z))
-        zc = 0.5 * (zmin + zmax)
-
-        # Center slab around Lz/2
-        shift = (0.5 * Lz) - zc
-        pos = a.get_positions()
-        pos[:, 2] += shift
-        a.set_positions(pos)
-
-        # Enforce a margin to avoid any atoms slightly crossing boundaries after jiggle/relax.
-        z = a.get_positions()[:, 2]
-        if float(np.min(z)) < float(margin):
-            pos = a.get_positions()
-            pos[:, 2] += (float(margin) - float(np.min(z)))
-            a.set_positions(pos)
-        z = a.get_positions()[:, 2]
-        if float(np.max(z)) > (Lz - float(margin)):
-            pos = a.get_positions()
-            pos[:, 2] -= (float(np.max(z)) - (Lz - float(margin)))
-            a.set_positions(pos)
-    except Exception:
-        return a
-    return a
-
-def show_atoms_3d(atoms, height=420, width=700, tag="view"):
-    atoms = atoms.copy()
-    try:
-        atoms.wrap()
-    except Exception:
-        pass
-
-    xyz_str = atoms_to_xyz_string(atoms)
-    view = py3Dmol.view(width=width, height=height)
-    view.addModel(xyz_str, "xyz")
-    view.setStyle({"stick": {}, "sphere": {"radius": 0.3}})
-    view.zoomTo()
-
-    html = view._make_html()
-
-    new_id = f"mol_{tag}_{uuid.uuid4().hex}"
-    m = re.search(r'id="([^"]+)"', html)
-    if m:
-        old_id = m.group(1)
-        html = html.replace(f'id="{old_id}"', f'id="{new_id}"', 1)
-        html = html.replace(old_id, new_id)
-
-    components.html(html, height=height, width=width)
-
-
-def add_vacuum_z(atoms, total_vacuum_z: float = 30.0, keep_pbc_z: bool = True):
-    a = atoms.copy()
-    try:
-        a.wrap()
-    except Exception:
-        pass
-    pbc = list(a.get_pbc())
-    if len(pbc) != 3:
-        pbc = [True, True, True]
-    pbc[2] = bool(keep_pbc_z)
-    a.set_pbc(pbc)
-    a.center(vacuum=float(total_vacuum_z) / 2.0, axis=2)
-    return a
-
-def set_pbc_z(atoms, pbc_z: bool):
-    a = atoms.copy()
-    pbc = list(a.get_pbc())
-    if len(pbc) != 3:
-        pbc = [True, True, True]
-    pbc[2] = bool(pbc_z)
-    a.set_pbc(pbc)
-    return a
-
-def repeat_xy(atoms, nx: int, ny: int):
-    a = atoms.copy()
-    return a.repeat((int(nx), int(ny), 1))
-
-def slabify_from_bulk(atoms, miller=(1, 1, 1), min_slab_size=12.0, min_vacuum_size=30.0, max_candidates=6):
-    if not HAS_SLABIFY:
-        raise RuntimeError(f"pymatgen SlabGenerator not available: {SLABIFY_IMPORT_ERR}")
-
-    struct = AseAtomsAdaptor.get_structure(atoms)
-    gen = SlabGenerator(
-        initial_structure=struct,
-        miller_index=tuple(int(x) for x in miller),
-        min_slab_size=float(min_slab_size),
-        min_vacuum_size=float(min_vacuum_size),
-        center_slab=True,
-        in_unit_planes=True,
-        primitive=True,
-        reorient_lattice=True,
-    )
-    slabs = gen.get_slabs(symmetrize=False)[: int(max_candidates)]
-
-    cand_atoms = []
-    cand_meta = []
-    for i, s in enumerate(slabs):
-        a = AseAtomsAdaptor.get_atoms(s)
-        a = set_pbc_z(a, True)
-        rep = validate_structure(a, target_area=70.0)
-        cand_atoms.append(a)
-        cand_meta.append({
-            "idx": i,
-            "miller": tuple(miller),
-            "n_atoms": len(a),
-            "formula": a.get_chemical_formula(),
-            "vacuum_z": float(getattr(rep, "vacuum_z", np.nan)),
-            "recommend_repeat": getattr(rep, "recommend_repeat", None),
-            "issues": getattr(rep, "issues", []),
-        })
-    return cand_atoms, cand_meta
-
-def split_reliable_unreliable(df, dE_thresh=3.0, disp_thresh=0.8):
-    if df is None or df.empty:
-        return df, df
-
-    mask = pd.Series(False, index=df.index)
-
-    if "ΔE_H_user (eV)" in df.columns:
-        mask |= df["ΔE_H_user (eV)"].abs() > dE_thresh
-    if "ΔE_ads_user (eV)" in df.columns:
-        mask |= df["ΔE_ads_user (eV)"].abs() > dE_thresh
-
-    if "H_lateral_disp(Å)" in df.columns:
-        mask |= df["H_lateral_disp(Å)"] > disp_thresh
-    if "ads_lateral_disp(Å)" in df.columns:
-        mask |= df["ads_lateral_disp(Å)"] > disp_thresh
-
-    return df[~mask].copy(), df[mask].copy()
-
-
-def _normalize_text_series(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip().str.lower()
-
-def co2rr_apply_qa_policy(df: pd.DataFrame, disp_thresh: float = 0.8) -> pd.DataFrame:
-    """Ensure CO2RR QA-related columns exist and are normalized.
-
-    Policy:
-      - 'qa' is the authoritative filter key when present (ok/migrated kept; others rejected).
-      - If 'qa' is missing, infer a conservative 'qa' from displacement and energy blow-ups.
-      - 'migrated' is treated as metadata (NOT an automatic reject) once 'qa' exists.
-    """
-    if df is None or df.empty:
-        return df
-
-    out = df.copy()
-
-    # Normalize / infer qa
-    if "qa" in out.columns:
-        out["qa"] = _normalize_text_series(out["qa"])
-    else:
-        qa = pd.Series("ok", index=out.index, dtype="object")
-
-        # Energy blow-ups -> crashed
-        ecols = [c for c in ["ΔE_ads_user (eV)", "ΔE_ads_user", "ΔG_ads (eV)", "ΔG_ads"] if c in out.columns]
-        if "ΔE_ads_user (eV)" in out.columns:
-            e = pd.to_numeric(out["ΔE_ads_user (eV)"], errors="coerce")
-            qa[(~np.isfinite(e)) | (e.abs() > 50.0)] = "crashed"
-
-        # Large lateral displacement -> migrated (metadata; still keep unless also crashed)
-        if "ads_lateral_disp(Å)" in out.columns:
-            disp = pd.to_numeric(out["ads_lateral_disp(Å)"], errors="coerce").fillna(0.0)
-            qa[(disp > float(disp_thresh)) & (qa == "ok")] = "migrated"
-
-        out["qa"] = qa
-
-    # Infer migrated if missing (for UI display only)
-    if "migrated" not in out.columns:
-        if "ads_lateral_disp(Å)" in out.columns:
-            disp = pd.to_numeric(out["ads_lateral_disp(Å)"], errors="coerce").fillna(0.0)
-            out["migrated"] = disp > float(disp_thresh)
-        else:
-            out["migrated"] = False
-
-    # Ensure relaxed_site exists (fallback to 'site' if absent)
-    if "relaxed_site" not in out.columns:
-        if "site" in out.columns:
-            out["relaxed_site"] = out["site"]
-        else:
-            out["relaxed_site"] = "unknown"
-
-    return out
-
-def co2rr_split_by_qa(df: pd.DataFrame):
-    """Split CO2RR results into candidates vs rejected, using qa as the only reject criterion."""
-    if df is None or df.empty:
-        return df, df
-
-    qa = _normalize_text_series(df["qa"]) if "qa" in df.columns else pd.Series("ok", index=df.index)
-    keep_mask = qa.isin(["ok", "migrated"])
-    return df[keep_mask].copy(), df[~keep_mask].copy()
-
-def co2rr_dedupe_candidates(df_keep: pd.DataFrame) -> pd.DataFrame:
-    """Deduplicate CO2RR candidates by (adsorbate, relaxed_site) keeping the best (lowest) energy row."""
-    if df_keep is None or df_keep.empty:
-        return df_keep
-
-    # Choose ranking column
-    rank_cols = ["ΔG_ads (eV)", "ΔE_ads_user (eV)", "ΔG_ads", "ΔE_ads_user"]
-    rank_col = next((c for c in rank_cols if c in df_keep.columns), None)
-    if rank_col is None:
-        return df_keep
-
-    # Coerce to numeric for ranking
-    tmp = df_keep.copy()
-    tmp[rank_col] = pd.to_numeric(tmp[rank_col], errors="coerce")
-
-    key_cols = []
-    if "adsorbate" in tmp.columns:
-        key_cols.append("adsorbate")
-    if "relaxed_site" in tmp.columns:
-        key_cols.append("relaxed_site")
-    elif "site" in tmp.columns:
-        key_cols.append("site")
-
-    if len(key_cols) < 2:
-        return tmp
-
-    idx = tmp.groupby(key_cols, dropna=False)[rank_col].idxmin()
-    dedup = tmp.loc[idx].copy()
-
-    # Mark duplicates vs representative
-    dedup["is_representative"] = True
-    tmp["is_representative"] = tmp.index.isin(dedup.index)
-
-    # Preserve original ordering roughly by adsorbate then energy
-    dedup = dedup.sort_values(by=key_cols + [rank_col], kind="mergesort").reset_index(drop=True)
-    return dedup
-
-def build_compact_table(df, mode: str):
-    if df is None or df.empty:
-        return df
-
-    if mode == "HER":
-        cols = [
-            "site_label",
-            "site",
-            "ΔG_H(U,pH) (eV)",
-            "ΔG_H (eV)",
-            "ΔE_H_user (eV)",
-            "H_lateral_disp(Å)",
-            "is_duplicate",
-            "reliability",
-        ]
-    else:
-        # CO2RR (and other adsorbate modes)
-        cols = [
-            "site_label",
-            "site",               # start site
-            "relaxed_site",       # reclassified site after relaxation (if available)
-            "oxide_seed_mode",
-            "surface_channel",
-            "adsorbate",
-            "qa",                 # ok / migrated / desorbed / broken / crashed / unstable
-            "migrated",           # boolean (if available)
-            "ΔG_ads (eV)",
-            "ΔE_ads_user (eV)",
-            "ΔE_raw(slab+ads - slab) (eV)",
-            "E_ref_reagents (eV)",
-            "G_correction (eV)",
-            "ref_rxn",
-            "ads_lateral_disp(Å)",
-            "ads_relax_elapsed_s",
-            "ads_relax_n_steps",
-            "ads_relax_converged",
-            "is_duplicate",
-            "reliability",
-        ]
-    existing_cols = [c for c in cols if c in df.columns]
-    return df[existing_cols]
-
-def _load_ads_template_preview(ads: str, ref_dir: str | Path = "ref_gas"):
-    ads_clean = ads.replace("*", "").upper()
-    if ads_clean not in ADS_TEMPLATE_FILES:
-        raise ValueError(f"Unsupported adsorbate '{ads}' for preview")
-
-    cif_path = Path(ref_dir) / ADS_TEMPLATE_FILES[ads_clean]
-    if not cif_path.is_file():
-        raise FileNotFoundError(f"Adsorbate template not found: {cif_path}")
-
-    a = read(cif_path).copy()
-    symbols = a.get_chemical_symbols()
-
-    # Anchor priority: C (CO2RR) → O (ORR: OH*, OOH*, O*) → atom 0
-    anchor_idx = None
-    for i, s in enumerate(symbols):
-        if s == "C":
-            anchor_idx = i
-            break
-    if anchor_idx is None:
-        for i, s in enumerate(symbols):
-            if s == "O":
-                anchor_idx = i
-                break
-    if anchor_idx is None:
-        anchor_idx = 0
-
-    pos = a.get_positions()
-    anchor_pos = pos[anchor_idx].copy()
-    pos -= anchor_pos
-    pos[:, 2] = np.abs(pos[:, 2])
-    a.set_positions(pos)
-    return a
-
-def _build_adsorbate_preview_slab(slab_atoms, site, ads: str, dz: float = 1.8, ref_dir: str | Path = "ref_gas"):
-    slab = slab_atoms.copy()
-    z_top = float(slab.get_positions()[:, 2].max())
-    ads_clean = ads.replace("*", "").upper()
-
-    ads_atoms = _load_ads_template_preview(ads, ref_dir=ref_dir)
-
-    is_oxide_like = any(s in ANION_SYMBOLS for s in slab.get_chemical_symbols()) and any(s not in ANION_SYMBOLS for s in slab.get_chemical_symbols())
-    if is_oxide_like and ads_clean in ("O", "OH", "OOH"):
-        channel = expand_oxide_channels_for_adsorbate(ads_clean)[0]
-        x0, y0, z0, _surface_channel = oxide_surface_seed_position(slab, site, ads_clean, channel=channel)
-        base = np.array([x0, y0, z0], dtype=float)
-    else:
-        z_min = float(ads_atoms.get_positions()[:, 2].min())
-        base_z = z_top + float(dz) - z_min
-        xy = np.asarray(site.position[:2], dtype=float)
-        base = np.array([xy[0], xy[1], base_z], dtype=float)
-
-    ads_atoms.set_cell(slab.get_cell())
-    ads_atoms.set_pbc(slab.get_pbc())
-    ads_atoms.translate(base)
-
-    return slab + ads_atoms
-
-def _make_ml_screen_key(sig, mtype, reaction_mode, co2_ads, preset, top_k, geom_per_kind, probe_level, adv_settings: dict, surfactant_class: str = "none", surfactant_prerelax_slab: bool = False):
-    return (
-        sig,
-        str(mtype),
-        str(reaction_mode),
-        tuple(co2_ads or []),
-        str(preset),
-        int(top_k),
-        int(geom_per_kind),
-        str(probe_level),
-        str(surfactant_class),
-        bool(surfactant_prerelax_slab),
-        tuple(sorted((adv_settings or {}).items())),
-    )
-
-def _build_ml_compact_df(union_items, union_labels):
-    rows = []
-    union_items = union_items or []
-    union_labels = union_labels or [f"ML_{i}" for i in range(len(union_items))]
-    for lbl, r in zip(union_labels, union_items):
-        rows.append({
-            "label": lbl,
-            "adsorbate": getattr(r, "adsorbate", "?"),
-            "kind": getattr(r, "kind", "?"),
-            "status": "selected",
-        })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-def _export_zip_of_struct_map(struct_map: dict, symprec: float = 0.1) -> BytesIO:
-    zip_buf = BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for k, atoms in (struct_map or {}).items():
-            zf.writestr(f"{k}.cif", atoms_to_cif_bytes(atoms, symprec=symprec))
-    zip_buf.seek(0)
-    return zip_buf
 
 # ---------------- Sidebar: global options ----------------
 with st.sidebar:
@@ -987,7 +255,6 @@ with st.sidebar:
 
     st.header("Global settings")
 
-    expert_mode = st.checkbox("I'm an expert (show advanced options)", value=False)
 
     mode = st.radio("Material type", ["Metal (CHE)", "Oxide (CHE)"], horizontal=False)
     mtype = "metal" if "Metal" in mode else "oxide"
@@ -1098,7 +365,7 @@ with colL:
                 _reset_prepared_from_working()
                 st.success(f"Loaded: {atoms_loaded.get_chemical_formula()} | atoms={len(atoms_loaded)}")
 
-    else:
+    elif slab_source_mode == "Generate from MP bulk (cifgen)":
         st.markdown("#### Bulk CIF Generator (Materials Project)")
         mp_id_raw = st.text_input("Bulk mp-id (number only is OK)", "19009", key="mp_id_raw")
         mp_id = normalize_mp_id(mp_id_raw)
@@ -1120,6 +387,7 @@ with colL:
             except Exception as e:
                 st.error(f"CIF generation failed: {e}")
 
+
 with colR:
     working = st.session_state.get("atoms_tuned") or st.session_state.get("atoms_loaded")
     if working is None:
@@ -1135,158 +403,9 @@ with colR:
             key="dl_working_cif",
         )
 
-# Optional: surface composition tuning (MP / expert)
-loaded_base = st.session_state.get("atoms_loaded")
-working = st.session_state.get("atoms_tuned") or loaded_base
-if loaded_base is not None:
-    st.markdown("### Optional: Surface composition tuning (ratio)")
 
-    # Auto-set default elements based on structure
-    ensure_tune_defaults_from_structure(loaded_base)
-
-    # Prevent cumulative growth: always apply tuning on atoms_loaded (not on already tuned)
-    if st.session_state.get("atoms_tuned") is not None:
-        cA, cB = st.columns([1, 1])
-        with cA:
-            st.info("Tuning is already applied. Re-applying will overwrite tuning (base = atoms_loaded).")
-        with cB:
-            if st.button("Clear tuning (revert to loaded)", key="btn_clear_tuning"):
-                st.session_state["atoms_tuned"] = None
-                st.session_state["ratio_tune_meta"] = None
-                _reset_prepared_from_working()
-                st.success("Tuning cleared.")
-                st.rerun()
-
-    if not expert_mode:
-        do_tune = st.checkbox("Apply surface composition tuning (Yes/No)", value=False, key="tune_basic_yesno")
-        if do_tune:
-            colA, colB, colC = st.columns(3)
-            with colA:
-                el1 = st.text_input("Element 1", st.session_state.get("rt_el1_basic", "Ni"), key="rt_el1_basic")
-                n1 = st.number_input(
-                    f"Ratio (Element 1) (sum={RATIO_SUM})",
-                    min_value=0,
-                    max_value=RATIO_SUM,
-                    value=min(6, RATIO_SUM),
-                    step=1,
-                    key="rt_n1_basic",
-                )
-            with colB:
-                el2 = st.text_input(
-                    "Element 2",
-                    st.session_state.get("rt_el2_basic", "Cu"),
-                    key="rt_el2_basic",
-                    help="Enter the metal element for substitution (e.g. Ni, Cu, Al, Mg).",
-                )
-                n2 = int(RATIO_SUM - int(n1))
-                st.write(f"Ratio (Element 2): **{n2}** (auto = {RATIO_SUM} - Ratio(Element 1))")
-            with colC:
-                layers_from_top = st.number_input("Top layers", 1, 4, 1, key="rt_layers_basic")
-
-            if st.button("Apply tuning", type="primary", key="btn_apply_tune_basic"):
-                try:
-                    if not str(el2).strip():
-                        st.error("Element 2 is empty. Please enter a metal symbol (e.g., Cu).")
-                        st.stop()
-
-                    spec = RatioTuneSpec(
-                        target_ratio={str(el1): int(n1), str(el2): int(n2)},
-                        layers_from_top=int(layers_from_top),
-                        layer_tol=0.30,
-                        auto_scale_xy=True,
-                        max_xy=6,
-                        min_sites=20,
-                        exact_divisible=True,
-                        candidate_elements=[str(el1), str(el2)],
-                        rng_seed=GLOBAL_SEED,
-                        max_atoms_after_repeat=200,
-                        prefer_square_xy=True,
-                    )
-                    tuned_atoms, meta_out = scale_xy_and_tune_ratio(loaded_base, spec)
-                    st.session_state["atoms_tuned"] = tuned_atoms
-                    st.session_state["ratio_tune_meta"] = meta_out
-                    _reset_prepared_from_working()
-                    st.success("Tuning applied (basic). Prepared structure reset.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Tuning failed: {e}")
-    else:
-        with st.expander("Advanced ratio tuning (expert)", expanded=False):
-            colA, colB, colC = st.columns(3)
-            with colA:
-                layers_from_top = st.number_input("Layers from top", 1, 6, 1, key="rt_layers_adv")
-                layer_tol = st.number_input("Layer tol (Å)", 0.05, 1.00, 0.30, step=0.05, key="rt_tol_adv")
-            with colB:
-                el1 = st.text_input("Element 1", st.session_state.get("rt_el1_adv", "Ni"), key="rt_el1_adv")
-                n1 = st.number_input(
-                    f"Ratio (Element 1) (sum={RATIO_SUM})",
-                    min_value=0,
-                    max_value=RATIO_SUM,
-                    value=min(6, RATIO_SUM),
-                    step=1,
-                    key="rt_n1_adv",
-                )
-                el2 = st.text_input(
-                    "Element 2",
-                    st.session_state.get("rt_el2_adv", "Cu"),
-                    key="rt_el2_adv",
-                    help="Enter the metal element for substitution (e.g. Ni, Cu, Al, Mg).",
-                )
-                n2 = int(RATIO_SUM - int(n1))
-                st.write(f"Ratio (Element 2): **{n2}** (auto = {RATIO_SUM} - Ratio(Element 1))")
-            with colC:
-                max_xy = st.number_input("Max XY repeat", 1, 12, 6, key="rt_maxxy_adv")
-                min_sites = st.number_input("Min candidate sites", 1, 500, 20, key="rt_minsites_adv")
-                exact_divisible = st.checkbox("Exact divisible (prefer)", value=True, key="rt_exact_adv")
-
-            cand_str = st.text_input(
-                "Candidate elements (comma-separated, optional)",
-                value="",
-                help="Leave empty to use all elements in top layers except O and H.",
-                key="rt_cands_adv",
-            )
-            cand_list = [c.strip() for c in cand_str.split(",") if c.strip()] or None
-
-            max_atoms_cap = st.number_input("Max atoms after repeat", 50, 800, 200, step=10, key="rt_atomcap_adv")
-            prefer_square = st.checkbox("Prefer square XY", value=True, key="rt_square_adv")
-
-            if st.button("Apply tuning (expert)", type="primary", key="btn_apply_tune_adv"):
-                try:
-                    if not str(el2).strip():
-                        st.error("Element 2 is empty. Please enter a metal symbol (e.g., Cu).")
-                        st.stop()
-
-                    spec = RatioTuneSpec(
-                        target_ratio={str(el1): int(n1), str(el2): int(n2)},
-                        layers_from_top=int(layers_from_top),
-                        layer_tol=float(layer_tol),
-                        auto_scale_xy=True,
-                        max_xy=int(max_xy),
-                        min_sites=int(min_sites),
-                        exact_divisible=bool(exact_divisible),
-                        candidate_elements=cand_list,
-                        rng_seed=GLOBAL_SEED,
-                        max_atoms_after_repeat=int(max_atoms_cap),
-                        prefer_square_xy=bool(prefer_square),
-                    )
-                    tuned_atoms, meta_out = scale_xy_and_tune_ratio(loaded_base, spec)
-                    st.session_state["atoms_tuned"] = tuned_atoms
-                    st.session_state["ratio_tune_meta"] = meta_out
-                    _reset_prepared_from_working()
-                    st.success("Tuning applied (expert). Prepared structure reset.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Tuning failed: {e}")
-
-    with st.expander("Tuning meta (optional)", expanded=False):
-        meta = st.session_state.get("ratio_tune_meta", None)
-        if meta is None:
-            st.write("No tuning meta.")
-        else:
-            st.json(_jsonable(meta))
-
-# ---------------- STEP 2: Prepare surface ----------------
-st.markdown("## 2) Prepare surface (vacuum / repeat / slabify)")
+# ---------------- STEP 2: Surface setup ----------------
+st.markdown("## 2) Surface setup")
 
 working = st.session_state.get("atoms_tuned") or st.session_state.get("atoms_loaded")
 if working is None:
@@ -1295,6 +414,212 @@ else:
     _ensure_prepared_uptodate()
     prepared = st.session_state.get("atoms_prepared")
 
+    surface_route = st.radio(
+        "Surface route",
+        ["Use current structure", "Slabify from bulk"],
+        horizontal=True,
+        key="surface_route_mode",
+        help="Choose either the current structure directly or first split the bulk into a slab/facet.",
+    )
+
+    if surface_route == "Slabify from bulk":
+        if mtype == "oxide":
+            st.markdown("### Oxide surface builder")
+            st.caption("For oxides, clean slab candidates are ranked with family-aware validity rules. The app distinguishes conservative reference surfaces from exploratory or advanced clean facets.")
+        else:
+            st.markdown("### Metal slabify")
+            st.caption("Facet splitting is handled here. After selecting a slab candidate, vacuum / supercell / QC are applied in the common panel below.")
+
+        if not HAS_SLABIFY:
+            st.info(f"SlabGenerator not available: {SLABIFY_IMPORT_ERR}")
+        else:
+            if mtype == "oxide":
+                facet_scope = st.selectbox(
+                    "Facet set",
+                    ["Recommended oxide facets", "Low-index facets (up to 1)", "Extended facets (up to 2)"],
+                    index=0,
+                    key="slab_facet_scope",
+                    help="Recommended oxide facets are conservative and bias toward less problematic low-index surfaces.",
+                )
+                facet_scope_for_calc = "Recommended facets" if facet_scope == "Recommended oxide facets" else facet_scope
+                facet_choices = _facet_choices_for_scope(prepared, facet_scope_for_calc)
+                facet_labels = [_format_hkl_label(hkl) for hkl in facet_choices]
+                oxide_surface_mode = st.selectbox(
+                    "Oxide clean-surface selection mode",
+                    ["Reference clean surface", "O-dominant surface preference", "Exploratory any clean termination"],
+                    index=0,
+                    key="oxide_surface_mode",
+                    help="Reference clean surface keeps conservative family-aware candidates. O-dominant preference still favors O-rich or mixed tops. Exploratory any clean termination keeps non-rejected clean candidates.",
+                )
+                st.caption(
+                    "O-dominant preference does not enforce a pure O-top surface. "
+                    "Please check `surface_O_fraction_top` and `facet_warning` before using this slab."
+                )
+                oxide_hydrox_mode = "Clean only"
+                _oxide_info = infer_oxide_family_from_atoms(prepared)
+                _oxide_family = _infer_interface_surface_family(prepared)
+                _cs = _oxide_info.get("crystal_system")
+                _sg = _oxide_info.get("spacegroup_symbol")
+                if _oxide_family == "cubic_AO":
+                    st.caption("Cubic AO guidance: prefer (100) first, keep (110) as secondary, and treat (111) as a polar / advanced clean facet.")
+                elif _oxide_family == "rutile_AO2":
+                    st.caption("Rutile AO2 guidance: use (110) as the primary clean reference facet. Keep (100) and (101) as non-reference exploratory facets.")
+                elif _oxide_family == "anatase_AO2":
+                    st.caption("Anatase AO2 guidance: use (101) as the primary clean reference facet. Keep (001) as secondary / higher-energy and (100) as exploratory.")
+                elif str(_oxide_family).startswith(("monoclinic_", "orthorhombic_", "triclinic_")):
+                    st.caption(f"Low-symmetry oxide guidance: {_oxide_family} ({_cs}, {_sg}) is treated as exploratory in clean-surface mode unless facet-specific validation is available.")
+                elif str(_oxide_family).endswith("_ABO3"):
+                    st.caption("ABO3 oxide guidance: clean surfaces are termination-dependent, so all candidates are exploratory unless termination is resolved separately.")
+                elif str(_oxide_family).endswith("_AB2O4"):
+                    st.caption("AB2O4 oxide guidance: clean surface preference depends on cation distribution, so candidates are treated as exploratory.")
+            else:
+                facet_scope = st.selectbox(
+                    "Facet set",
+                    ["Recommended facets", "Low-index facets (up to 1)", "Extended facets (up to 2)"],
+                    index=0,
+                    key="slab_facet_scope",
+                    help="Recommended = compact preset. Low-index / Extended = broader Miller-index coverage without manual typing.",
+                )
+                facet_choices = _facet_choices_for_scope(prepared, facet_scope)
+                facet_labels = [_format_hkl_label(hkl) for hkl in facet_choices]
+                oxide_surface_mode = None
+
+            if not facet_choices:
+                st.warning("No facet candidates were generated from the current structure.")
+            else:
+                sel_label = st.selectbox(
+                    "Facet",
+                    facet_labels,
+                    index=0,
+                    key="slab_facet_choice",
+                )
+                sel_hkl = facet_choices[facet_labels.index(sel_label)]
+                st.caption(f"Selected Miller index: {sel_hkl}")
+
+                colS1, colS2 = st.columns([1.2, 0.8])
+                with colS1:
+                    slab_vac_choice = st.selectbox(
+                        "Target vacuum for generated slab",
+                        ["20 Å", "30 Å (recommended)", "40 Å", "Custom"],
+                        index=1,
+                        key="slab_gen_vac_choice",
+                    )
+                with colS2:
+                    slab_vac_custom = None
+                    if slab_vac_choice == "Custom":
+                        slab_vac_custom = st.number_input(
+                            "Custom vacuum (Å)",
+                            min_value=8.0,
+                            max_value=80.0,
+                            value=30.0,
+                            step=1.0,
+                            key="slab_gen_vac_custom",
+                        )
+                slab_target_vac = _vacuum_target_from_ui(slab_vac_choice, slab_vac_custom)
+
+                colG1, colG2 = st.columns(2)
+                with colG1:
+                    if st.button("Generate slab candidates", key="btn_slabify_gen"):
+                        try:
+                            cand_atoms, cand_meta = slabify_from_bulk(
+                                prepared,
+                                miller=tuple(int(x) for x in sel_hkl),
+                                min_slab_size=float(_DEFAULT_SLAB_MIN_THICKNESS),
+                                min_vacuum_size=float(slab_target_vac),
+                                max_candidates=int(_DEFAULT_SLAB_MAX_CANDIDATES),
+                            )
+                            if mtype == "oxide":
+                                norm_atoms, norm_meta = [], []
+                                mode_pref = str(oxide_surface_mode or "Reference clean surface")
+                                rejected = 0
+                                for a_i, m_i in zip(cand_atoms, cand_meta):
+                                    a_n, m_n = _normalize_oxide_candidate_top_surface(a_i, m_i, z_window=1.8)
+                                    m_n["oxide_surface_mode"] = mode_pref
+                                    m_n["hydroxylation_mode"] = "Clean only"
+                                    keep = _oxide_mode_keep_candidate(m_n, mode_pref)
+                                    if keep:
+                                        m_n["oxide_rank_key"] = _oxide_candidate_rank_key(m_n)
+                                        norm_atoms.append(a_n)
+                                        norm_meta.append(m_n)
+                                    else:
+                                        rejected += 1
+                                cand_atoms, cand_meta = norm_atoms, norm_meta
+                                if rejected:
+                                    st.info(f"Filtered out {rejected} oxide candidate(s) that failed the current clean-surface selection mode.")
+                                if not cand_atoms:
+                                    raise ValueError("No oxide slab candidates remained after family-aware clean-surface filtering. Try another facet or switch to a less restrictive clean-surface mode.")
+                            st.session_state["slabify_candidates_atoms"] = cand_atoms
+                            st.session_state["slabify_candidates_meta"] = cand_meta
+                            st.success(
+                                f"Generated {len(cand_atoms)} slab candidate(s) for {_format_hkl_label(sel_hkl)} | min slab thickness = {_DEFAULT_SLAB_MIN_THICKNESS:.1f} Å | target vacuum = {slab_target_vac:.1f} Å."
+                            )
+                        except Exception as e:
+                            st.error(f"Slabify failed: {e}")
+                with colG2:
+                    if st.button("Clear slab candidates", key="btn_slabify_clear"):
+                        st.session_state["slabify_candidates_atoms"] = None
+                        st.session_state["slabify_candidates_meta"] = None
+                        st.info("Cleared slab candidates.")
+
+                cand_atoms = st.session_state.get("slabify_candidates_atoms") or []
+                cand_meta = st.session_state.get("slabify_candidates_meta") or []
+                if cand_meta:
+                    df_cands = pd.DataFrame(cand_meta)
+                    if mtype == "oxide":
+                        st.warning(
+                            "Please review `surface_O_fraction_top`, `surface_family`, and `facet_warning` before selecting an oxide slab."
+                        )
+                        pref_cols = [c for c in [
+                            "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
+                            "surface_O_fraction_bottom", "top_bottom_asymmetric", "flipped_for_oxide_top_exposure", "oxide_top_surface_ok", "facet_warning", "n_atoms",
+                            "vacuum_z", "recommend_repeat", "slab_usability_reason", "oxide_rule_notes", "surface_diagnostics_notes", "issues"
+                        ] if c in df_cands.columns]
+                        st.dataframe(df_cands[pref_cols], use_container_width=True)
+                        auto_atoms, auto_meta = _pick_best_oxide_slab_candidate(cand_atoms, cand_meta)
+                        auto_idx = next((i for i, m in enumerate(cand_meta) if m.get("idx") == auto_meta.get("idx")), 0)
+                        st.caption(f"Auto-selected oxide candidate: #{auto_idx} | usability={auto_meta.get('slab_usability')} | rule={auto_meta.get('rule_validity')}/{auto_meta.get('rule_role')} | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}")
+                    else:
+                        st.dataframe(df_cands, use_container_width=True)
+                        auto_idx = 0
+
+                    sel_idx = st.selectbox(
+                        "Select slab candidate",
+                        list(range(len(cand_atoms))),
+                        index=int(auto_idx),
+                        format_func=lambda i: (
+                            f"#{i} | {cand_meta[i].get('slab_usability')} | rule={cand_meta[i].get('rule_validity')}/{cand_meta[i].get('rule_role')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
+                            if mtype == "oxide" else
+                            f"#{i} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
+                        ),
+                        key="slabify_sel_idx",
+                    )
+                    show_atoms_3d(cand_atoms[sel_idx], height=360, width=700, tag=f"slab_cand_{sel_idx}")
+
+                    if st.button("Use selected slab", type="primary", key="btn_slabify_apply"):
+                        _push_prepared_update(
+                            cand_atoms[sel_idx],
+                            "slabify_apply",
+                            {
+                                "candidate_idx": int(sel_idx),
+                                "miller": cand_meta[sel_idx].get("miller"),
+                                "route": "slabify_from_bulk_oxide" if mtype == "oxide" else "slabify_from_bulk",
+                                "top_exposure": cand_meta[sel_idx].get("top_exposure"),
+                                "bottom_exposure": cand_meta[sel_idx].get("bottom_exposure"),
+                                "flipped_for_oxide_top_exposure": cand_meta[sel_idx].get("flipped_for_oxide_top_exposure"),
+                                "oxide_top_surface_ok": cand_meta[sel_idx].get("oxide_top_surface_ok"),
+                                "rule_validity": cand_meta[sel_idx].get("rule_validity"),
+                                "rule_role": cand_meta[sel_idx].get("rule_role"),
+                                "surface_diagnostics_status": cand_meta[sel_idx].get("surface_diagnostics_status"),
+                                "slab_usability": cand_meta[sel_idx].get("slab_usability"),
+                                "oxide_validity": cand_meta[sel_idx].get("oxide_validity"),
+                                "oxide_role": cand_meta[sel_idx].get("oxide_role"),
+                            },
+                        )
+                        st.success("Selected slab applied. Continue with vacuum / supercell / QC below.")
+                        st.rerun()
+
+        prepared = st.session_state.get("atoms_prepared")
+
     colA, colB = st.columns([1.15, 0.85])
 
     with colA:
@@ -1302,24 +627,41 @@ else:
         vac_z = float(getattr(rep, "vacuum_z", 0.0))
         pbc = tuple(bool(x) for x in prepared.get_pbc())
 
-        st.markdown("### Structure check (Prepared)")
+        st.markdown("### Structure check (current active structure)")
         st.write(f"- Atoms: **{getattr(rep, 'n_atoms', len(prepared))}**")
         st.write(f"- Vacuum_z: **{vac_z:.2f} Å**")
         st.write(f"- PBC: **{pbc}**")
 
-        # OK/WARNING/CRITICAL + pair table (no i/j)
         _render_min_dist_panel(rep)
 
         if mtype == "oxide":
             fam = infer_oxide_family_from_atoms(prepared)
             if fam["family"] != "unknown":
-                st.info(f"Detected Oxide: {fam['family']} ({fam['reduced_formula']})")
+                st.info(
+                    f"Detected Oxide: {fam['family']} ({fam['reduced_formula']}) | crystal={fam.get('crystal_system')} | sg={fam.get('spacegroup_symbol')}"
+                )
+            surf_meta = _classify_surface_exposure(prepared, z_window=1.8)
+            st.write(f"- Surface exposure (top/bottom): **{surf_meta['top_exposure']} / {surf_meta['bottom_exposure']}**")
+            st.write(f"- Surface O fraction (top): **{surf_meta['surface_O_fraction_top']:.2f}**")
+            prep_meta = _normalize_oxide_candidate_top_surface(prepared, {"surface_family": _infer_interface_surface_family(prepared), "miller": None}, z_window=1.8)[1]
+            st.write(f"- Rule validity: **{prep_meta.get('rule_validity', 'warn')}** | role: **{prep_meta.get('rule_role', 'exploratory')}**")
+            st.write(f"- Surface diagnostics: **{prep_meta.get('surface_diagnostics_status', 'warn')}** | slab usability: **{prep_meta.get('slab_usability', 'exploratory_only')}**")
+            if prep_meta.get('slab_usability_reason'):
+                st.caption(f"Slab usability: {prep_meta.get('slab_usability_reason')}")
+            if prep_meta.get('oxide_rule_notes'):
+                for _note in prep_meta.get('oxide_rule_notes', [])[:2]:
+                    st.caption(f"Oxide rule: {_note}")
+            if prep_meta.get('surface_diagnostics_notes'):
+                for _note in prep_meta.get('surface_diagnostics_notes', [])[:2]:
+                    st.caption(f"Surface diagnostic: {_note}")
+            if surf_meta['top_bottom_asymmetric']:
+                st.caption("Oxide note: top/bottom terminations are asymmetric. Interpret clean-slab HER outputs cautiously.")
 
         bulk_like = (vac_z < 10.0) and bool(prepared.get_pbc()[2])
         if bulk_like:
             st.warning(
                 "BULK-like detected. Surface sites become ill-defined and many candidates may collapse/collide.\n\n"
-                "Recommended: add sufficient vacuum (e.g., 30 Å) or slabify."
+                "Recommended: add sufficient vacuum (e.g., 30 Å) or use the slabify route."
             )
 
         rec = getattr(rep, "recommend_repeat", None)
@@ -1339,7 +681,7 @@ else:
             st.json(_jsonable(st.session_state.get("prepared_history") or []))
 
     with colB:
-        st.markdown("### Quick fixes (Basic)")
+        st.markdown("### Preview and common tools")
         show_atoms_3d(prepared, height=360, width=520, tag="prepared")
 
         c1, c2 = st.columns(2)
@@ -1359,125 +701,90 @@ else:
             )
 
         st.markdown("---")
-
-        if vac_z < 15.0 and bool(prepared.get_pbc()[2]):
-            st.info("Vacuum looks small. Recommended: **30 Å** total vacuum.")
-            if st.button("Add vacuum (30 Å)", type="primary", key="btn_add_vac_30"):
-                a2 = add_vacuum_z(prepared, total_vacuum_z=30.0, keep_pbc_z=True)
-                _push_prepared_update(a2, "add_vacuum", {"total_vacuum_z": 30.0, "keep_pbc_z": True})
-                st.success("Vacuum added.")
-                st.rerun()
+        st.markdown("#### Vacuum")
+        vac_choice = st.selectbox(
+            "Target vacuum_z",
+            ["20 Å", "30 Å (recommended)", "40 Å", "Custom"],
+            index=1,
+            key="common_vac_choice",
+        )
+        vac_custom = None
+        if vac_choice == "Custom":
+            vac_custom = st.number_input(
+                "Custom total vacuum_z (Å)",
+                min_value=8.0,
+                max_value=80.0,
+                value=30.0,
+                step=1.0,
+                key="common_vac_custom",
+            )
+        keep_pbc_z = st.checkbox("Keep pbc_z=True", value=True, key="vac_keep_pbc_z")
+        target_vac = _vacuum_target_from_ui(vac_choice, vac_custom)
+        if st.button("Apply vacuum", key="btn_apply_vacuum_common"):
+            a2 = add_vacuum_z(prepared, total_vacuum_z=float(target_vac), keep_pbc_z=bool(keep_pbc_z))
+            _push_prepared_update(a2, "add_vacuum", {"total_vacuum_z": float(target_vac), "keep_pbc_z": bool(keep_pbc_z)})
+            st.success(f"Vacuum set to {float(target_vac):.1f} Å.")
+            st.rerun()
 
         st.markdown("#### Supercell (XY only)")
-        colR1, colR2, colR3 = st.columns(3)
-        with colR1:
-            if st.button("2×2×1", key="btn_rep_221"):
-                a2 = repeat_xy(prepared, 2, 2)
-                _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2})
-                st.success("Applied 2×2×1.")
-                st.rerun()
-        with colR2:
-            if st.button("4×4×1", key="btn_rep_441"):
-                a2 = repeat_xy(prepared, 4, 4)
-                _push_prepared_update(a2, "repeat_xy", {"nx": 4, "ny": 4})
-                st.success("Applied 4×4×1.")
-                st.rerun()
-        with colR3:
-            if st.button("Use auto recommendation", key="btn_rep_auto"):
-                rec = getattr(rep, "recommend_repeat", None)
-                if not rec:
-                    st.warning("No repeat recommendation available.")
-                else:
-                    nx, ny, _nz = rec
-                    a2 = repeat_xy(prepared, int(nx), int(ny))
-                    _push_prepared_update(a2, "repeat_xy_auto", {"nx": int(nx), "ny": int(ny), "from": "validate_structure"})
-                    st.success(f"Applied {int(nx)}×{int(ny)}×1.")
-                    st.rerun()
+        if surface_route == "Slabify from bulk":
+            st.caption("For the slabify route, keep 1×1 by default and expand only when the in-plane slab is too small.")
+            a_len, b_len = _surface_xy_lengths(prepared)
+            nx_auto, ny_auto = _suggest_minimal_xy_repeat(prepared, min_length_a=8.0, min_length_b=8.0, max_repeat=3)
+            st.write(f"- In-plane lengths: **a = {a_len:.2f} Å**, **b = {b_len:.2f} Å**")
+            st.write(f"- Minimal suggested repeat: **{nx_auto}×{ny_auto}×1**")
 
-        if bulk_like:
+            colR1, colR2, colR3 = st.columns(3)
+            with colR1:
+                if st.button("Keep 1×1", key="btn_rep_keep_111"):
+                    st.info("Kept current slab at 1×1.")
+            with colR2:
+                if st.button("Apply minimal repeat", key="btn_rep_auto_minimal"):
+                    if int(nx_auto) == 1 and int(ny_auto) == 1:
+                        st.info("Current slab already satisfies the minimal in-plane size target.")
+                    else:
+                        a2 = repeat_xy(prepared, int(nx_auto), int(ny_auto))
+                        _push_prepared_update(a2, "repeat_xy_minimal", {"nx": int(nx_auto), "ny": int(ny_auto), "from": "slabify_minimal_xy"})
+                        st.success(f"Applied minimal repeat: {int(nx_auto)}×{int(ny_auto)}×1.")
+                        st.rerun()
+            with colR3:
+                if st.button("Apply 2×2×1", key="btn_rep_221_slabify"):
+                    a2 = repeat_xy(prepared, 2, 2)
+                    _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2, "from": "slabify_manual"})
+                    st.success("Applied 2×2×1.")
+                    st.rerun()
+        else:
+            colR1, colR2, colR3 = st.columns(3)
+            with colR1:
+                if st.button("2×2×1", key="btn_rep_221"):
+                    a2 = repeat_xy(prepared, 2, 2)
+                    _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2})
+                    st.success("Applied 2×2×1.")
+                    st.rerun()
+            with colR2:
+                if st.button("4×4×1", key="btn_rep_441"):
+                    a2 = repeat_xy(prepared, 4, 4)
+                    _push_prepared_update(a2, "repeat_xy", {"nx": 4, "ny": 4})
+                    st.success("Applied 4×4×1.")
+                    st.rerun()
+            with colR3:
+                if st.button("Use auto recommendation", key="btn_rep_auto"):
+                    rec = getattr(rep, "recommend_repeat", None)
+                    if not rec:
+                        st.warning("No repeat recommendation available.")
+                    else:
+                        nx, ny, _nz = rec
+                        a2 = repeat_xy(prepared, int(nx), int(ny))
+                        _push_prepared_update(a2, "repeat_xy_auto", {"nx": int(nx), "ny": int(ny), "from": "validate_structure"})
+                        st.success(f"Applied {int(nx)}×{int(ny)}×1.")
+                        st.rerun()
+
+        if bulk_like and surface_route == "Use current structure":
             if st.button("Temporary workaround: set pbc_z=False", key="btn_pbc_false_tmp"):
                 a2 = set_pbc_z(prepared, False)
                 _push_prepared_update(a2, "set_pbc_z", {"pbc_z": False})
                 st.success("pbc_z=False applied (temporary).")
                 st.rerun()
-
-    if expert_mode:
-        with st.expander("Advanced surface tools (expert)", expanded=False):
-            st.markdown("#### Vacuum (custom)")
-            colV1, colV2, colV3 = st.columns(3)
-            with colV1:
-                vac_custom = st.number_input("Total vacuum_z (Å)", 8.0, 60.0, 30.0, step=1.0, key="vac_custom")
-            with colV2:
-                keep_pbc_z = st.checkbox("Keep pbc_z=True", value=True, key="vac_keep_pbc_z_adv")
-            with colV3:
-                if st.button("Apply vacuum (custom)", key="btn_apply_vac_custom"):
-                    a2 = add_vacuum_z(prepared, total_vacuum_z=float(vac_custom), keep_pbc_z=bool(keep_pbc_z))
-                    _push_prepared_update(a2, "add_vacuum", {"total_vacuum_z": float(vac_custom), "keep_pbc_z": bool(keep_pbc_z)})
-                    st.success("Custom vacuum applied.")
-                    st.rerun()
-
-            st.markdown("---")
-            st.markdown("#### Bulk → Slabify (pymatgen SlabGenerator)")
-            if not HAS_SLABIFY:
-                st.info(f"SlabGenerator not available: {SLABIFY_IMPORT_ERR}")
-            else:
-                colS1, colS2, colS3, colS4 = st.columns(4)
-                with colS1:
-                    h = st.number_input("h", -5, 5, 1, step=1, key="slab_h")
-                with colS2:
-                    k = st.number_input("k", -5, 5, 1, step=1, key="slab_k")
-                with colS3:
-                    l = st.number_input("l", -5, 5, 1, step=1, key="slab_l")
-                with colS4:
-                    max_cands = st.number_input("Max candidates", 1, 12, 6, step=1, key="slab_max_cands")
-
-                colS5, colS6 = st.columns(2)
-                with colS5:
-                    min_slab = st.number_input("Min slab thickness (Å)", 6.0, 40.0, 12.0, step=1.0, key="slab_min_slab")
-                with colS6:
-                    min_vac = st.number_input("Min vacuum (Å)", 8.0, 80.0, 30.0, step=1.0, key="slab_min_vac")
-
-                colG1, colG2 = st.columns(2)
-                with colG1:
-                    if st.button("Generate slab candidates", key="btn_slabify_gen"):
-                        try:
-                            cand_atoms, cand_meta = slabify_from_bulk(
-                                prepared,
-                                miller=(int(h), int(k), int(l)),
-                                min_slab_size=float(min_slab),
-                                min_vacuum_size=float(min_vac),
-                                max_candidates=int(max_cands),
-                            )
-                            st.session_state["slabify_candidates_atoms"] = cand_atoms
-                            st.session_state["slabify_candidates_meta"] = cand_meta
-                            st.success(f"Generated {len(cand_atoms)} slab candidates.")
-                        except Exception as e:
-                            st.error(f"Slabify failed: {e}")
-
-                with colG2:
-                    if st.button("Clear slab candidates", key="btn_slabify_clear"):
-                        st.session_state["slabify_candidates_atoms"] = None
-                        st.session_state["slabify_candidates_meta"] = None
-                        st.info("Cleared slab candidates.")
-
-                cand_atoms = st.session_state.get("slabify_candidates_atoms") or []
-                cand_meta = st.session_state.get("slabify_candidates_meta") or []
-                if cand_meta:
-                    df_meta = pd.DataFrame(cand_meta)
-                    st.dataframe(df_meta, use_container_width=True)
-                    sel_idx = st.selectbox(
-                        "Select slab candidate",
-                        list(range(len(cand_atoms))),
-                        index=0,
-                        format_func=lambda i: f"#{i} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}",
-                        key="slabify_sel_idx",
-                    )
-                    show_atoms_3d(cand_atoms[sel_idx], height=360, width=700, tag=f"slab_cand_{sel_idx}")
-
-                    if st.button("Use selected slab (replace prepared)", type="primary", key="btn_slabify_apply"):
-                        _push_prepared_update(cand_atoms[sel_idx], "slabify_apply", {"candidate_idx": int(sel_idx), "miller": cand_meta[sel_idx].get("miller")})
-                        st.success("Selected slab applied.")
-                        st.rerun()
 
 # ---------------- STEP 3: Site selection (Geometry / ML) ----------------
 st.markdown("## 3) Site selection")
@@ -1606,10 +913,15 @@ else:
         try:
             if mtype == "metal":
                 auto_sites = detect_metal_111_sites(atoms_for_sites_eff)
+                rep_sites = select_representative_sites(auto_sites, per_kind=int(max_rep))
             else:
-                auto_sites = detect_oxide_surface_sites(atoms_for_sites_eff)
+                if is_her:
+                    rep_sites = _generate_oxide_her_oanchor_sites(atoms_for_sites_eff, max_sites=max(1, int(max_rep) * 2), z_window=2.2, min_xy_sep=1.5)
+                    rep_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_eff, rep_sites, dz=1.0, extra_z=0.0)
+                else:
+                    auto_sites = detect_oxide_surface_sites(atoms_for_sites_eff)
+                    rep_sites = select_representative_sites(auto_sites, per_kind=int(max_rep))
 
-            rep_sites = select_representative_sites(auto_sites, per_kind=int(max_rep))
             rep_site_map = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)}
 
             st.dataframe(
@@ -1629,13 +941,16 @@ else:
 
                 slabs_ads = []
                 if is_her:
-                    mode2 = "default" if mtype == "metal" else "oxide_o"
-                    slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, rep_sites, symbol="H", dz=0.0, mode=mode2)
+                    if mtype == "metal":
+                        slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, rep_sites, symbol="H", dz=0.0, mode="default")
+                    else:
+                        rep_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_eff, rep_sites, dz=1.0, extra_z=0.0)
+                        slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, rep_sites, symbol="H", dz=0.0, mode="default")
                     export_ads_label = "H"
                 else:
                     export_ads_label = preview_ads.replace("*", "")
                     for s in rep_sites:
-                        slabs_ads.append(_build_adsorbate_preview_slab(atoms_for_sites_eff, s, preview_ads, dz=1.8, ref_dir="ref_gas"))
+                        slabs_ads.append(build_adsorbate_preview_slab(atoms_for_sites_eff, s, preview_ads, dz=1.8, ref_dir="ref_gas"))
 
                 idx = st.selectbox("Select site to view", list(range(len(rep_sites))), index=0, key="geom_view_idx")
                 show_atoms_3d(slabs_ads[idx], height=420, width=900, tag=f"geom_seed_{idx}")
@@ -1688,14 +1003,13 @@ else:
                 "xy_bin": 0.25,
             }
 
-            if expert_mode:
-                with st.expander("Advanced ML settings (expert)", expanded=False):
-                    adv_settings["co2rr_clearance"] = float(st.number_input("CO2RR clearance (Å)", 0.8, 6.0, 1.2, step=0.1, key="ml_clr_adv"))
-                    adv_settings["union_max"] = int(st.number_input("Union max sites (CO2RR)", 1, 30, 10, key="ml_union_adv"))
-                    adv_settings["xy_bin"] = float(st.number_input("Union xy_bin (Å)", 0.05, 1.0, 0.25, step=0.05, key="ml_xybin_adv"))
-                    if (mtype == "oxide") and (not is_her):
-                        adv_settings["oxide_anchor_mode"] = st.selectbox("Oxide CO2RR anchor mode", ["cation", "anion_o"], index=0, key="ml_ox_anchor_adv")
-                        adv_settings["oxide_anchor_height"] = float(st.number_input("O-anchor height (Å)", 1.2, 3.5, 1.8, step=0.1, key="ml_ox_anchor_h_adv"))
+            with st.expander("Additional ML settings", expanded=False):
+                adv_settings["co2rr_clearance"] = float(st.number_input("CO2RR clearance (Å)", 0.8, 6.0, 1.2, step=0.1, key="ml_clr_adv"))
+                adv_settings["union_max"] = int(st.number_input("Union max sites (CO2RR)", 1, 30, 10, key="ml_union_adv"))
+                adv_settings["xy_bin"] = float(st.number_input("Union xy_bin (Å)", 0.05, 1.0, 0.25, step=0.05, key="ml_xybin_adv"))
+                if (mtype == "oxide") and (not is_her):
+                    adv_settings["oxide_anchor_mode"] = st.selectbox("Oxide CO2RR anchor mode", ["cation", "anion_o"], index=0, key="ml_ox_anchor_adv")
+                    adv_settings["oxide_anchor_height"] = float(st.number_input("O-anchor height (Å)", 1.2, 3.5, 1.8, step=0.1, key="ml_ox_anchor_h_adv"))
 
             rep_eff = validate_structure(atoms_for_sites, target_area=70.0)
             vac_z = float(getattr(rep_eff, "vacuum_z", 0.0))
@@ -1740,14 +1054,23 @@ else:
                 if st.session_state.get("ml_screen_key") == key and st.session_state.get("ml_union_site_map") is not None:
                     return True
 
-                cand_sites = generate_candidate_sites(
-                    atoms_for_sites_screen,
-                    mtype=mtype,
-                    geom_per_kind=int(geom_per_kind),
-                    n_random=int(n_random),
-                    rng_seed=GLOBAL_SEED,
-                    random_kind="fcc",
-                )
+                if mtype == "oxide" and is_her:
+                    cand_sites = _generate_oxide_her_oanchor_sites(
+                        atoms_for_sites_screen,
+                        max_sites=max(4, int(geom_per_kind) + int(n_random)),
+                        z_window=2.2,
+                        min_xy_sep=1.2,
+                    )
+                    cand_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_screen, cand_sites, dz=1.0, extra_z=0.0)
+                else:
+                    cand_sites = generate_candidate_sites(
+                        atoms_for_sites_screen,
+                        mtype=mtype,
+                        geom_per_kind=int(geom_per_kind),
+                        n_random=int(n_random),
+                        rng_seed=GLOBAL_SEED,
+                        random_kind="fcc",
+                    )
                 if not cand_sites:
                     st.error("No candidate sites generated.")
                     return False
@@ -1807,6 +1130,10 @@ else:
                         union_max_sites=int(adv_settings["union_max"]) if (not is_her) else int(top_k),
                         xy_bin=float(adv_settings["xy_bin"]),
                     )
+
+                    if mtype == "oxide" and is_her and site_map:
+                        site_map = _project_oxide_her_sites_to_otop(atoms_for_sites_screen, site_map, dz=1.0, extra_z=0.0)
+                        struct_map = {}
 
                     union_labels = list(site_map.keys()) if site_map else []
                     compact_df = _build_ml_compact_df(union_items, union_labels)
@@ -1878,7 +1205,7 @@ else:
                 with cX2:
                     struct_map = st.session_state.get("ml_union_struct_map") or {}
                     if struct_map:
-                        zip_buf = _export_zip_of_struct_map(struct_map, symprec=0.1)
+                        zip_buf = export_zip_of_struct_map(struct_map, symprec=0.1)
                         st.download_button(
                             "Download ML top-k seeds (zip)",
                             zip_buf,
@@ -1893,19 +1220,22 @@ else:
 
                 if keys:
                     sel = st.selectbox("Preview ML site", keys, key="ml_preview_key")
-                    if sel in struct_map:
+                    if sel in struct_map and not (mtype == "oxide" and is_her):
                         show_atoms_3d(struct_map[sel], height=420, width=900, tag=f"ml_{sel}")
                     else:
                         s = site_map[sel]
                         if is_her:
-                            mode2 = "default" if mtype == "metal" else "oxide_o"
-                            atoms_prev = generate_slab_ads_series(atoms_for_sites_eff, [s], symbol="H", mode=mode2)[0]
+                            if mtype == "oxide":
+                                s_use = _project_single_oxide_her_site_to_otop(atoms_for_sites_eff, s, dz=1.0, extra_z=0.0)
+                                atoms_prev = generate_slab_ads_series(atoms_for_sites_eff, [s_use], symbol="H", mode="default")[0]
+                            else:
+                                atoms_prev = generate_slab_ads_series(atoms_for_sites_eff, [s], symbol="H", mode="default")[0]
                         else:
                             if is_orr:
                                 ads0 = (orr_ads[0] if orr_ads else "OOH*")
                             else:
                                 ads0 = (co2_ads[0] if co2_ads else "COOH*")
-                            atoms_prev = _build_adsorbate_preview_slab(atoms_for_sites_eff, s, ads0, dz=1.8, ref_dir="ref_gas")
+                            atoms_prev = build_adsorbate_preview_slab(atoms_for_sites_eff, s, ads0, dz=1.8, ref_dir="ref_gas")
                         show_atoms_3d(atoms_prev, height=420, width=900, tag=f"ml_fallback_{sel}")
 
 # ---------------- STEP 4: Run calculation ----------------
@@ -1997,30 +1327,29 @@ else:
                 per_kind = int(st.session_state.get("max_sites_kind", 2))
                 if mtype == "metal":
                     auto_sites = detect_metal_111_sites(atoms_for_calc)
+                    rep_sites = select_representative_sites(auto_sites, per_kind=per_kind)
+                    rep_site_map_for_calc = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)}
+                    final_user_sites = rep_site_map_for_calc
                 else:
-                    auto_sites = detect_oxide_surface_sites(atoms_for_calc)
-
-                rep_sites = select_representative_sites(auto_sites, per_kind=per_kind)
-                rep_site_map_for_calc = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)}
-
-                # For oxide-HER, shift positions to O-top-based adsorption positions (consistent with your oxide logic)
-                if mtype == "oxide" and is_her and rep_site_map_for_calc:
-                    shifted = {}
-                    for label, site in rep_site_map_for_calc.items():
-                        new_x, new_y, new_z = _oxide_o_based_ads_position_compat(
+                    if is_her:
+                        rep_sites = _generate_oxide_her_oanchor_sites(
                             atoms_for_calc,
-                            site,
+                            max_sites=max(1, int(per_kind) * 2),
+                            z_window=2.2,
+                            min_xy_sep=1.5,
+                        )
+                        rep_site_map_for_calc = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)}
+                        final_user_sites = _project_oxide_her_sites_to_otop(
+                            atoms_for_calc,
+                            rep_site_map_for_calc,
                             dz=1.0,
                             extra_z=0.0,
-                        )
-                        shifted[label] = AdsSite(
-                            kind=site.kind,
-                            position=(new_x, new_y, new_z),
-                            surface_indices=site.surface_indices,
-                        )
-                    final_user_sites = shifted
-                else:
-                    final_user_sites = rep_site_map_for_calc
+                        ) if rep_site_map_for_calc else None
+                    else:
+                        auto_sites = detect_oxide_surface_sites(atoms_for_calc)
+                        rep_sites = select_representative_sites(auto_sites, per_kind=per_kind)
+                        rep_site_map_for_calc = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)}
+                        final_user_sites = rep_site_map_for_calc
             except Exception as e:
                 st.error(f"Geometry auto-sites failed: {e}")
                 final_user_sites = None
@@ -2064,6 +1393,17 @@ else:
 
         slab_path = uploads / "slab.cif"
         write(slab_path, atoms_for_calc_run, format="cif")
+
+        if is_her and (mtype == "oxide") and final_user_sites:
+            try:
+                final_user_sites = _project_oxide_her_sites_to_otop(
+                    atoms_for_calc_run,
+                    final_user_sites,
+                    dz=1.0,
+                    extra_z=0.0,
+                )
+            except Exception as _e:
+                st.warning(f"Final oxide HER O-top normalization skipped: {_e}")
 
         manual_sites = tuple(site_preset)
 
@@ -2151,14 +1491,17 @@ else:
 
 
         if is_her:
-            # Legacy HER reliability split (energy/displacement-based)
+            # HER: keep legacy reliability split, but also annotate site transitions for UI/debugging.
+            df = annotate_site_transitions(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
             df_rel, df_unrel = split_reliable_unreliable(df)
             df["reliability"] = "unreliable"
             if df_rel is not None:
                 df.loc[df_rel.index, "reliability"] = "reliable"
+            migration_summary = summarize_site_transitions(df)
         else:
             # CO2RR / ORR: QA-driven policy (migrated is NOT an auto-reject)
-            df = co2rr_apply_qa_policy(df)
+            df = co2rr_apply_qa_policy(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
+            df = annotate_site_transitions(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
             df_keep, df_reject = co2rr_split_by_qa(df)
 
             # Set reliability consistent with QA policy
@@ -2167,12 +1510,15 @@ else:
 
             # Backwards-compatible names for downstream UI blocks
             df_rel, df_unrel = df_keep, df_reject
+            migration_summary = summarize_site_transitions(df)
 
         # Persist results for rendering even after rerun (e.g., toggling UI options)
         if isinstance(meta, dict):
             meta = dict(meta)
             meta["SURFACTANT_CLASS"] = str(surfactant_class)
             meta["SURFACTANT_CHGNET_PRERELAX_SLAB"] = bool(surfactant_prerelax_slab)
+            if migration_summary is not None:
+                meta["MIGRATION_SUMMARY"] = migration_summary
 
         st.session_state["last_run"] = {
             "is_her": bool(is_her),
@@ -2239,513 +1585,6 @@ else:
             pass
             
             
-
-
-
-
-# ---------------- LLM interpretation helpers ----------------
-def _fetch_mp_meta(mp_id: str, api_key: str | None):
-    """Fetch lightweight Materials Project metadata to help interpret structural realism."""
-    if not mp_id:
-        return None
-    api_key = api_key or None
-    # Prefer mp-api, fall back to legacy pymatgen MPRester if available.
-    try:
-        from mp_api.client import MPRester  # type: ignore
-        with MPRester(api_key=api_key) as mpr:
-            docs = mpr.summary.search(material_ids=[mp_id])
-            if not docs:
-                return {"mp_id": mp_id}
-            d = docs[0]
-            get = (lambda k: getattr(d, k, None)) if not isinstance(d, dict) else d.get
-            return {
-                "mp_id": mp_id,
-                "formula_pretty": get("formula_pretty"),
-                "energy_above_hull": get("energy_above_hull"),
-                "formation_energy_per_atom": get("formation_energy_per_atom"),
-                "band_gap": get("band_gap"),
-                "crystal_system": get("crystal_system"),
-                "spacegroup_symbol": (get("symmetry") or {}).get("symbol") if isinstance(get("symmetry"), dict) else None,
-            }
-    except Exception:
-        pass
-    try:
-        from pymatgen.ext.matproj import MPRester  # type: ignore
-        with MPRester(api_key) as mpr:
-            docs = mpr.query(criteria={"material_id": mp_id},
-                             properties=["pretty_formula", "e_above_hull", "formation_energy_per_atom", "band_gap", "spacegroup"])
-            if not docs:
-                return {"mp_id": mp_id}
-            d = docs[0]
-            return {
-                "mp_id": mp_id,
-                "formula_pretty": d.get("pretty_formula"),
-                "energy_above_hull": d.get("e_above_hull"),
-                "formation_energy_per_atom": d.get("formation_energy_per_atom"),
-                "band_gap": d.get("band_gap"),
-                "spacegroup_symbol": (d.get("spacegroup") or {}).get("symbol") if isinstance(d.get("spacegroup"), dict) else None,
-            }
-    except Exception:
-        return {"mp_id": mp_id}
-
-
-def _pick_representative_sites_her(df: pd.DataFrame):
-    # Prefer CHE-shifted column if present
-    col = None
-    for c in ["ΔG_H(U,pH) (eV)", "dG_H(U,pH) (eV)", "ΔG_H (eV)", "dG_H (eV)"]:
-        if c in df.columns:
-            col = c
-            break
-    if col is None:
-        return {}
-
-    g = pd.to_numeric(df[col], errors="coerce")
-    g_valid = g.dropna()
-    if g_valid.empty:
-        return {}
-
-    def _site_label(i):
-        if "site_label" in df.columns:
-            return str(df.loc[i, "site_label"])
-        if "site" in df.columns:
-            return str(df.loc[i, "site"])
-        return str(i)
-
-    i_act = (g_valid.abs()).idxmin()
-    i_min = g_valid.idxmin()
-
-    return {
-        "activity_best": {"site_label": _site_label(i_act), "value": float(g.loc[i_act]), "criterion": "min_abs_dG"},
-        "thermo_best": {"site_label": _site_label(i_min), "value": float(g.loc[i_min]), "criterion": "most_negative_dG"},
-        "column_used": col,
-    }
-
-
-
-def _pick_representative_sites_co2rr(df: pd.DataFrame):
-    # Prefer user-reported adsorption energy column
-    col = None
-    for c in ["ΔE_ads_user (eV)", "dE_ads_user (eV)", "ΔE_ads (eV)", "dE_ads (eV)"]:
-        if c in df.columns:
-            col = c
-            break
-    if col is None:
-        return {}
-
-    e = pd.to_numeric(df[col], errors="coerce")
-
-    # Stable = non-migrating when available (+ exclude obvious failed rows when possible)
-    stable_mask = pd.Series([True] * len(df), index=df.index)
-
-    if "migrated" in df.columns:
-        stable_mask &= (pd.to_numeric(df["migrated"], errors="coerce").fillna(0) == 0)
-
-    if "reliability" in df.columns:
-        stable_mask &= ~df["reliability"].astype(str).str.lower().isin(["failed", "error", "nan"])
-
-    if "qa" in df.columns:
-        stable_mask &= ~df["qa"].astype(str).str.lower().str.contains("fail|invalid|error|nan", regex=True, na=False)
-
-    e_stable = e[stable_mask].dropna()
-    if e_stable.empty:
-        # Fallback: use any non-NaN values if stability filter removed everything
-        e_stable = e.dropna()
-        if e_stable.empty:
-            return {"column_used": col, "stable_filter": "none (no valid values)"}
-        stable_mask = pd.Series([True] * len(df), index=df.index)  # reset to "all"
-
-    def _site_label(i):
-        if "site_label" in df.columns:
-            return str(df.loc[i, "site_label"])
-        if "site" in df.columns:
-            return str(df.loc[i, "site"])
-        return str(i)
-
-    # Regime diagnostics (important for wording)
-    all_positive = bool((e_stable >= 0).all())
-    min_val = float(e_stable.min())
-
-    # Strong track:
-    # - If any exothermic (negative) exists, "strong" = most negative
-    # - If all are >=0, do NOT call it strong adsorption; it's "least endothermic / least unfavorable"
-    i_min = e_stable.idxmin()
-    strong_criterion = "most_negative_dE" if not all_positive else "min_dE_all_positive"
-    strong_note = (
-        "Exothermic adsorption exists (ΔE<0 present); 'strong' wording allowed."
-        if not all_positive
-        else "All stable sites have ΔE>=0; DO NOT call this 'strong adsorption'. Report as least-unfavorable/least-endothermic and discuss only relative ordering."
-    )
-
-    strong = {
-        "site_label": _site_label(i_min),
-        "value": float(e.loc[i_min]),
-        "criterion": strong_criterion,
-        "terminology_note": strong_note,
-    }
-
-    # Balanced track (more conservative for CO2RR):
-    # - Only define balanced among exothermic candidates (ΔE<0). If none, set N/A.
-    e_exo = e_stable[e_stable < 0]
-    if not e_exo.empty:
-        i_bal = (e_exo.abs()).idxmin()
-        balanced = {
-            "site_label": _site_label(i_bal),
-            "value": float(e.loc[i_bal]),
-            "criterion": "min_abs_dE_among_exothermic",
-            "terminology_note": "Balanced binding defined only among ΔE<0 candidates to avoid weak-adsorption misinterpretation.",
-        }
-    else:
-        balanced = {
-            "site_label": None,
-            "value": None,
-            "criterion": "N/A_no_exothermic_adsorption",
-            "terminology_note": "No ΔE<0 candidates among stable sites; balanced track is not defined under this conservative rule.",
-        }
-
-    return {
-        "strong_binding_best": strong,
-        "balanced_binding_best": balanced,
-        "column_used": col,
-        "stable_filter": "non-migrating (migrated==0) + non-failed rows when available",
-        "binding_regime": {
-            "all_positive_stable": all_positive,
-            "min_dE_stable": min_val,
-        },
-    }
-
-
-def _build_llm_payload(last_run: dict):
-    df = last_run.get("df")
-    meta = last_run.get("meta") or {}
-
-    payload = {
-        "run_meta": {
-            "reaction_mode": str(last_run.get("reaction_mode", "")),
-            "material_type": str(last_run.get("mtype", "")),
-            "mode_label": str(last_run.get("mode_label", "")),
-            "model": str(meta.get("MODEL", meta.get("model", ""))),
-            "device": str(meta.get("DEVICE", meta.get("device", ""))),
-            "U": float(last_run.get("U_input", 0.0)),
-            "pH": float(last_run.get("pH_input", 14.0)),
-        },
-        "mp_meta": None,
-        "definitions": {
-            "ΔE_ads_definition": None,
-            "ΔE_ads_sign_convention": None,
-            "ΔG_H_definition": None,
-            "ΔG_H_sign_convention": None,
-            "migration_definition": f"Flag as migrated if ads_lateral_disp(Å) > {CO2RR_MIGRATION_DISP_THRESH_A} Å (lateral displacement of the adsorbate anchor between initial and relaxed positions).",
-            "migration_disp_threshold_A": CO2RR_MIGRATION_DISP_THRESH_A,
-            "available_distance_fields": [],
-            "distance_metrics_note": "If z/min-distance diagnostics are absent, do not infer adsorption/desorption; report as unavailable.",
-        },
-        "qc_flags": {},
-        "rules": {},
-        "table_preview": [],
-    }
-
-    mp_id = st.session_state.get("loaded_mp_id")
-    payload["mp_meta"] = _fetch_mp_meta(mp_id, st.session_state.get("mp_api_key") or None) if mp_id else None
-
-    # --- Definitions / conventions (minimize LLM hallucinations) ---
-    is_her = bool(last_run.get("is_her"))
-    if is_her:
-        payload["definitions"]["ΔG_H_definition"] = "ΔG_H is computed from H* adsorption with CHE; ΔG_H(U,pH) = ΔG_H − U − 0.0591·pH (eV)."
-        payload["definitions"]["ΔG_H_sign_convention"] = "More negative ΔG_H indicates stronger H* binding; activity commonly correlates with |ΔG_H| near 0 eV."
-    else:
-        payload["definitions"]["ΔE_ads_definition"] = "ΔE_ads = E(slab+ads) − E(slab) − E(ref_adsorbate). (eV)"
-        payload["definitions"]["ΔE_ads_sign_convention"] = "More negative ΔE_ads means stronger (more exothermic) binding under this reference; positive implies endothermic adsorption."
-
-    if isinstance(df, pd.DataFrame):
-        dist_candidates = [
-            "ads_z_min(Å)", "ads_z_max(Å)", "ads_z(Å)", "ads_height(Å)",
-            "slab_z_max(Å)", "z_top(Å)",
-            "min_surf_dist(Å)", "ads_min_surf_dst(Å)", "ads_surf_min_dist(Å)",
-            "ads_z_clearance(Å)",
-        ]
-        payload["definitions"]["available_distance_fields"] = [c for c in dist_candidates if c in df.columns]
-        # Optional derived clearance if columns exist
-        if ("ads_z_min(Å)" in df.columns) and (("slab_z_max(Å)" in df.columns) or ("z_top(Å)" in df.columns)) and ("ads_z_clearance(Å)" not in df.columns):
-            try:
-                slab_col = "slab_z_max(Å)" if "slab_z_max(Å)" in df.columns else "z_top(Å)"
-                df["ads_z_clearance(Å)"] = pd.to_numeric(df["ads_z_min(Å)"], errors="coerce") - pd.to_numeric(df[slab_col], errors="coerce")
-            except Exception:
-                pass
-
-    if isinstance(df, pd.DataFrame) and (not df.empty):
-        if bool(last_run.get("is_her")):
-            payload["rules"] = _pick_representative_sites_her(df)
-        else:
-            payload["rules"] = _pick_representative_sites_co2rr(df)
-
-        # QC
-        if "migrated" in df.columns:
-            payload["qc_flags"]["n_migrated"] = int(pd.to_numeric(df["migrated"], errors="coerce").fillna(0).sum())
-        if "is_duplicate" in df.columns:
-            payload["qc_flags"]["n_duplicate"] = int(pd.to_numeric(df["is_duplicate"], errors="coerce").fillna(0).sum())
-
-        # Preview rows (avoid huge payload)
-        cols_priority = [
-            "site_label", "site", "site_kind", "relaxed_site", "reliability", "qa",
-            "migrated", "is_duplicate",
-            # Displacement / migration diagnostics (if present)
-            "ads_lateral_disp(Å)", "H_lateral_disp(Å)",
-            # Key energies
-            "ΔG_H(U,pH) (eV)", "ΔG_H (eV)", "dG_H(U,pH) (eV)", "dG_H (eV)",
-            "ΔE_ads_user (eV)", "E_slab_user (eV)", "E_slab+ads_user (eV)",
-            # Distance / adsorption plausibility diagnostics (if present)
-            "ads_z_min(Å)", "ads_z_clearance(Å)", "min_surf_dist(Å)", "ads_min_surf_dist(Å)",
-        ]
-        cols = [c for c in cols_priority if c in df.columns]
-        preview = (df[cols].head(40) if cols else df.head(40)).copy()
-        payload["table_preview"] = preview.fillna("").to_dict(orient="records")
-
-    return payload
-
-
-def _call_llm_interpreter(payload: dict):
-    """Call OpenAI to produce a structured, paper-oriented interpretation of the last run.
-
-    Notes
-    -----
-    - Uses Structured Outputs via `responses.parse` with a Pydantic schema.
-    - IMPORTANT: Avoid free-form `dict`/`Any` fields in the schema when `strict` is enabled.
-      OpenAI's Structured Outputs requires closed object schemas (no additional properties).
-    """
-    import json
-
-    api_key = (st.session_state.get("openai_api_key") or "").strip()
-    if not api_key:
-        raise RuntimeError("OpenAI API key is empty (set it in 0) Credentials & LLM).")
-
-    try:
-        from openai import OpenAI  # type: ignore
-        from pydantic import BaseModel, Field, ConfigDict
-    except Exception as e:
-        raise RuntimeError("Missing dependency. Install with: pip install openai pydantic") from e
-
-    class PaperTrack(BaseModel):
-        model_config = ConfigDict(extra="forbid")
-
-        track_name: str = Field(..., description="Name of the reporting track (e.g., 'strong_binding', 'balanced_binding').")
-        criterion: str = Field(..., description="Criterion used (e.g., most_negative_dE, min_abs_dE, most_negative_dG, min_abs_dG).")
-        column_used: str = Field(..., description="Which numeric column was used to choose this track.")
-        site_label: str | None = Field(..., description="Site label selected for this track. Use null if unavailable.")
-        value: float | None = Field(..., description="Selected metric value for this track. Use null if unavailable.")
-        selection_rule: str = Field(..., description="Explicit rule describing how this value was chosen.")
-        evidence_note: str = Field(..., description="Short note tying the selection to payload evidence and QC filters (e.g., non-migrating).")
-
-    class RecommendedForPaper(BaseModel):
-        model_config = ConfigDict(extra="forbid")
-
-        strong_binding_track: PaperTrack = Field(..., description="Track emphasizing strongest binding (most negative energy) among stable sites.")
-        balanced_binding_track: PaperTrack = Field(..., description="Track emphasizing balanced binding (closest to 0) among stable sites.")
-        primary_track_to_report: str = Field(
-            ...,
-            description="Which track should be the primary headline in the paper: 'strong_binding' or 'balanced_binding'.",
-        )
-        how_to_report: str = Field(
-            ...,
-            description="Guidance on how to report both tracks without over-claiming activity; include sign-convention caveats.",
-        )
-        suggested_paper_text: str = Field(
-            ...,
-            description="1–4 sentences suitable for Methods/Results that report both tracks and justify the rules.",
-        )
-
-    class Interpretation(BaseModel):
-        model_config = ConfigDict(extra="forbid")
-
-        executive_summary: str = Field(..., description="High-level summary (3–6 sentences).")
-
-        qc_findings: list[str] = Field(
-            ...,
-            description="Quality-control findings (migration, duplicates, site collapse, non-physical artifacts).",
-        )
-        site_interpretation: list[str] = Field(
-            ...,
-            description=(
-                "Interpretation of site behavior: why different sites look similar/different; "
-                "why bridge/fcc can collapse to top; oxide vs metal behavior; surface area/termination effects."
-            ),
-        )
-        recommended_for_paper: RecommendedForPaper = Field(
-            ...,
-            description="Two-track recommendation for representative value(s) and how to report them.",
-        )
-        next_actions: list[str] = Field(
-            ...,
-            description="Concrete next actions (checks, reruns, DFT spot-checks, structure realism checks).",
-        )
-        uncertainties: list[str] = Field(
-            ...,
-            description="What cannot be concluded from the payload; assumptions; missing inputs.",
-        )
-
-    client = OpenAI(api_key=api_key)
-    
-    developer_instructions = """
-You are a scientific assistant that interprets electrocatalysis screening results (HER or CO2RR).
-
-Use ONLY the provided JSON payload as evidence.
-Do not use outside knowledge, unstated assumptions, or inferred values not supported by the payload.
-
-Your task is to return a JSON object only, following the required schema exactly.
-
-PRIORITY OF EVIDENCE
-1. payload["definitions"] (highest priority)
-2. payload["rules"]
-3. per-site QC / diagnostics / flags
-4. numeric site values
-5. mp_meta thermodynamic indicators
-If any source conflicts with a lower-priority source, follow the higher-priority source and note the conflict in uncertainties.
-
-GENERAL DECISION RULES
-- A site is "stable" only if it is not excluded by payload["definitions"] or payload["rules"].
-- Exclude from recommendation any site flagged as migrated, collapsed, duplicate, or non-physical according to payload definitions/rules.
-- If distance or geometry diagnostics required for a stability decision are missing, do not assume stability; mark the site as uncertain.
-- If no stable sites remain after exclusions, set all recommended track fields to null and explain why.
-- If only one stable site remains, both tracks may point to the same site if it satisfies both selection rules.
-- If multiple sites are tied, break ties deterministically in this order:
-  (1) site with fewer QC concerns,
-  (2) site with more complete diagnostics,
-  (3) lexicographically smaller site_label.
-
-QC INTERPRETATION TASKS
-1. Flag QC issues:
-   - migration
-   - site collapse
-   - duplicates
-   - non-physical artifacts
-   - missing diagnostics that prevent firm interpretation
-2. Explain likely causes using only payload-supported materials interpretations, such as:
-   - surface termination effects
-   - limited site diversity
-   - oxide vs metal anchoring differences
-   - slab/model limitations
-Do not assert causes not grounded in the payload.
-
-RECOMMENDATION RULES
-You MUST populate recommended_for_paper with two tracks.
-
-For HER:
-- strong_binding_track = most negative ΔG_H among stable sites
-- balanced_binding_track = stable site with minimum |ΔG_H|
-
-For CO2RR:
-- If any stable site has ΔE_ads < 0:
-  - strong_binding_track = most negative ΔE_ads among stable sites
-  - balanced_binding_track = stable site with minimum |ΔE_ads| among sites with ΔE_ads < 0
-- If all stable sites have ΔE_ads >= 0:
-  - report the minimum ΔE_ads site as the least-unfavorable / least-endothermic case
-  - set balanced_binding_track.site_label = null
-  - set balanced_binding_track.value = null
-  - explain that no exothermic stable candidate exists under this reference definition
-  - do not describe this as strong adsorption
-
-REPORTING RULES
-- Prefer payload["rules"] when selecting representative values.
-- Use exact sign conventions from payload["definitions"].
-- State explicitly whether a recommended site is non-migrating under the stated migration criterion.
-- Do not use:
-  "reliable", "optimal", "high efficiency", "low efficiency", "potential for CO2RR"
-  unless such claims are explicitly supported by payload fields that justify them.
-- Do not use "favorable" unless the sign convention and comparison set are explicitly stated.
-- If ΔE_ads is positive, state that adsorption is endothermic/weak under this reference and discuss only relative ordering.
-- If mp_meta contains energy_above_hull or formation energy, describe them only as thermodynamic indicators, typically near 0 K and without kinetic/processing context.
-
-OUTPUT SCHEMA
-Return JSON only with exactly these top-level keys:
-{
-  "mode": null,
-  "qc_summary": {
-    "status": null,
-    "issues": [],
-    "uncertainties": []
-  },
-  "site_assessment": [],
-  "recommended_for_paper": {
-    "strong_binding_track": {
-      "site_label": null,
-      "value": null,
-      "evidence_note": "",
-      "uncertainties": []
-    },
-    "balanced_binding_track": {
-      "site_label": null,
-      "value": null,
-      "evidence_note": "",
-      "uncertainties": []
-    }
-  },
-  "materials_interpretation": [],
-  "next_actions": []
-}
-
-SITE_ASSESSMENT ITEM SCHEMA
-Each item in site_assessment must be:
-{
-  "site_label": null,
-  "included_in_selection": null,
-  "exclusion_reason": null,
-  "qc_flags": [],
-  "value": null,
-  "evidence_note": "",
-  "uncertainties": []
-}
-
-NEXT ACTIONS
-Propose only payload-consistent validation actions, such as:
-- alternative termination or polymorph
-- slab thickness / repeat size check
-- additional site diversity
-- DFT spot-check
-- duplicate filtering / geometry verification
-
-Do not output markdown. Do not output prose outside JSON.
-"""
-    
-    resp = client.responses.parse(
-        model=st.session_state.get("llm_model", "gpt-4o-mini-2024-07-18"),
-        input=[
-            {"role": "system", "content": developer_instructions},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-        text_format=Interpretation,
-        temperature=0.2,
-        store=False,
-    )
-    out = resp.output_parsed.model_dump()
-
-    # Attach best-effort usage + cost estimate for transparency
-    model_name = str(st.session_state.get("llm_model", "gpt-4o-mini-2024-07-18"))
-    out["_model"] = model_name
-    usage_obj = getattr(resp, "usage", None)
-    usage_dict = None
-    if usage_obj is not None:
-        try:
-            usage_dict = usage_obj.model_dump()  # pydantic
-        except Exception:
-            try:
-                usage_dict = dict(usage_obj)
-            except Exception:
-                usage_dict = {"raw": str(usage_obj)}
-    if usage_dict is not None:
-        out["_usage"] = usage_dict
-        # SDKs may use either input_tokens/output_tokens or prompt_tokens/completion_tokens
-        in_toks = usage_dict.get("input_tokens", usage_dict.get("prompt_tokens"))
-        out_toks = usage_dict.get("output_tokens", usage_dict.get("completion_tokens"))
-        try:
-            in_toks_i = int(in_toks) if in_toks is not None else None
-        except Exception:
-            in_toks_i = None
-        try:
-            out_toks_i = int(out_toks) if out_toks is not None else None
-        except Exception:
-            out_toks_i = None
-        out["_cost_estimate_usd"] = _estimate_cost_usd(model_name, in_toks_i, out_toks_i)
-
-    return out
 
 
 # ---------------- Results (persistent, from last run) ----------------
@@ -2840,6 +1679,16 @@ if last_run is not None:
         if isinstance(df_unrel, pd.DataFrame) and (not df_unrel.empty):
             with st.expander("Show Unreliable / Unstable Sites", expanded=False):
                 st.dataframe(build_compact_table(df_unrel, mode_label), use_container_width=True)
+        if isinstance(meta, dict) and meta.get("MIGRATION_SUMMARY"):
+            mig_summary = meta.get("MIGRATION_SUMMARY") or {}
+            with st.expander("Migration metadata", expanded=False):
+                st.write(f"- migrated rows: **{int(mig_summary.get('n_migrated', 0))}**")
+                mig_paths = mig_summary.get("paths") or []
+                if mig_paths:
+                    st.dataframe(pd.DataFrame(mig_paths), use_container_width=True)
+                elif isinstance(df, pd.DataFrame) and ("migration_path" in df.columns):
+                    cols = [c for c in ["site_label", "requested_site", "initial_geom_site", "relaxed_site", "placement_mismatch", "migrated_actual", "migration_destination", "migration_path", "actual_migration_path", "site_transition_type", "ΔG_H(U,pH) (eV)", "ΔG_H (eV)", "ΔE_H_user (eV)", "H_lateral_disp(Å)", "migrated"] if c in df.columns]
+                    st.dataframe(df[cols], use_container_width=True)
     else:
         df_keep = df_rel if isinstance(df_rel, pd.DataFrame) else pd.DataFrame()
         df_reject = df_unrel if isinstance(df_unrel, pd.DataFrame) else pd.DataFrame()
@@ -2869,6 +1718,17 @@ if last_run is not None:
         if qa_counts is not None and (not qa_counts.empty):
             with st.expander("QA breakdown", expanded=False):
                 st.dataframe(qa_counts.rename_axis("qa").reset_index(name="count"), use_container_width=True)
+
+        if isinstance(meta, dict) and meta.get("MIGRATION_SUMMARY"):
+            mig_summary = meta.get("MIGRATION_SUMMARY") or {}
+            with st.expander("Migration metadata", expanded=False):
+                st.write(f"- migrated rows: **{int(mig_summary.get('n_migrated', 0))}**")
+                mig_paths = mig_summary.get("paths") or []
+                if mig_paths:
+                    st.dataframe(pd.DataFrame(mig_paths), use_container_width=True)
+                elif isinstance(df, pd.DataFrame) and ("migration_path" in df.columns):
+                    cols = [c for c in ["adsorbate", "site_label", "requested_site", "initial_geom_site", "relaxed_site", "placement_mismatch", "migrated_actual", "migration_destination", "migration_path", "actual_migration_path", "site_transition_type", "ΔG_ads (eV)", "ΔE_ads_user (eV)", "ads_lateral_disp(Å)", "qa", "migrated"] if c in df.columns]
+                    st.dataframe(df[cols], use_container_width=True)
 
         cdl1, cdl2 = st.columns(2)
         with cdl1:
@@ -2909,8 +1769,8 @@ if last_run is not None:
             )
             if st.button("Generate interpretation", key="btn_llm_interpret"):
                 try:
-                    payload = _build_llm_payload(last_run)
-                    out = _call_llm_interpreter(payload)
+                    payload = build_llm_payload(last_run, mp_api_key=st.session_state.get("mp_api_key") or None)
+                    out = call_llm_interpreter(payload, api_key=st.session_state.get("openai_api_key") or "", model_name=st.session_state.get("llm_model", "gpt-4o-mini"))
                     # Display token usage / estimated cost (best effort)
                     usage = out.get("_usage") if isinstance(out, dict) else None
                     cost = out.get("_cost_estimate_usd") if isinstance(out, dict) else None
