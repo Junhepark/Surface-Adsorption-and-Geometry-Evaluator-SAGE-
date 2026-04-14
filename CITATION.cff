@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: "Surface Adsorption and Geometry Evaluator (SAGE)"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Park"
+    given-names: "Junhe"
+    email: "p5042939@gmail.com"
+repository-code: "https://github.com/Junhepark/Surface-Adsorption-and-Geometry-Evaluator-SAGE-"
+license: "AGPL-3.0"
+abstract: >
+  SAGE is an interactive workflow for slab preparation, geometric quality control,
+  adsorption-site generation, and ML-assisted electrocatalyst screening.
+keywords:
+  - electrocatalysis
+  - adsorption energy
+  - slab generation
+  - HER
+  - surface screening
+  - workflow
