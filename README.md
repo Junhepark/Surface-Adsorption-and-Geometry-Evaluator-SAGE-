@@ -50,8 +50,7 @@ The current release is designed primarily for **surface-based electrocatalyst sc
 
 ## SAGE App Interface
 
-<img width="1280" height="543" alt="SAGE main interface" src="https://github.com/user-attachments/assets/1b3de53e-4bc5-4b19-abb9-3ae9f91aff15" />
-
+<img width="1191" height="720" alt="Image" src="https://github.com/user-attachments/assets/09a38cb8-541e-4dd3-be29-2a29a4a32b29" />
 ---
 
 ## Installation
@@ -98,25 +97,26 @@ The application will open in your default browser.
 ### 1. Load a structure
 Enter a Materials Project ID (e.g., `mp-23` for Ni) or upload a `.cif` file.
 
-<img width="2490" height="883" alt="Structure input" src="https://github.com/user-attachments/assets/60581ebf-e64c-42fe-baf5-ec308757d9a8" />
+<img width="1852" height="1102" alt="Image" src="https://github.com/user-attachments/assets/4de16c09-e084-4c75-9049-283be93e4533" />
 
 ### 2. Select the system type and reaction mode
 Choose the material type (**Metal / Oxide**) and target reaction (**HER / CO2RR / ORR**).
 
 ### 3. Prepare the slab
-Set slab-related parameters such as supercell expansion, vacuum thickness, and composition-related options.
+Set slab-related parameters such as supercell expansion, vacuum thickness, and composition-related options.(+Miller index for bulk slab)
 
-<img width="3133" height="1104" alt="Slab preparation" src="https://github.com/user-attachments/assets/9440ea60-9aca-4412-b9d1-e3199e97a5ee" />
+<img width="3731" height="1736" alt="Image" src="https://github.com/user-attachments/assets/2565cae8-11b3-42ef-98cd-e7acbc79be63" />
+<img width="3245" height="1395" alt="Image" src="https://github.com/user-attachments/assets/71780715-28d6-4fdf-81d2-91f9cec5bf15" />
 
 ### 4. Generate adsorption sites and evaluate candidates
 Generate candidate sites using geometry-based logic or CHGNet-assisted screening, then run CHE-based evaluation.
 
-<img width="3328" height="1651" alt="Site generation and CHE calculation" src="https://github.com/user-attachments/assets/91f704a4-cc05-447a-bb92-5e17836559a1" />
+<img width="1280" height="634" alt="Image" src="https://github.com/user-attachments/assets/538d0ffa-b14f-47d4-a237-5b21897a14c5" />
 
 ### 5. Review ranked outputs and export results
 Inspect ranked candidates and export metadata-rich CSV files.
 
-<img width="3324" height="1046" alt="Ranked results and export" src="https://github.com/user-attachments/assets/c32076e5-d336-4072-a008-16bba958f486" />
+<img width="1282" height="502" alt="Image" src="https://github.com/user-attachments/assets/af16bec9-b26e-4b09-9001-6e8c4c0c3c4e" />
 
 ---
 
