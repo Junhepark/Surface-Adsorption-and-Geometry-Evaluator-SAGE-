@@ -10,9 +10,17 @@ import pandas as pd
 from ase.io import read, write
 from ase.constraints import FixAtoms
 from ase.optimize import BFGS
+from ase.geometry import find_mic
 
 from ocp_app.core.gas_refs import get_h2_ref
-from ocp_app.core.ads_sites import AdsSite, expand_oxide_channels_for_adsorbate, oxide_surface_seed_position
+from ocp_app.core.ads_sites import (
+    AdsSite,
+    detect_metal_111_sites,
+    detect_oxide_surface_sites,
+    expand_oxide_channels_for_adsorbate,
+    oxide_surface_seed_position,
+    ANION_SYMBOLS,
+)
 from ocp_app.core.anchors.common import (
     calc,
     MODEL_NAME,
@@ -402,17 +410,43 @@ def _choose_steps(heavy: bool, relax_mode: str) -> Tuple[int, int, int, int]:
 
 def _check_duplicate_convergence(
     current_pos: np.ndarray,
-    previous_positions: List[np.ndarray],
+    previous_positions: List[dict[str, object] | np.ndarray],
     tol: float = 0.15,
+    *,
+    cell=None,
+    pbc=None,
+    current_kind: str | None = None,
+    current_surface_indices: tuple[int, ...] | None = None,
 ) -> bool:
+    """Duplicate-site detection.
+
+    Backward compatible with legacy position-only lists, but can also use
+    basin identity (site kind + surface indices) plus MIC-corrected XY distance.
     """
-    Check whether the final H position is essentially identical to any
-    previously converged site (duplicate site detection).
-    """
+    cur_kind = _canonicalize_metal_kind(current_kind) if current_kind is not None else None
+    cur_sidx = tuple(int(i) for i in (current_surface_indices or ())) if current_surface_indices else tuple()
+
     for prev in previous_positions:
-        dist = np.linalg.norm(current_pos - prev)
-        if dist < tol:
-            return True
+        if isinstance(prev, dict):
+            prev_pos = np.asarray(prev.get("pos", [np.nan, np.nan, np.nan]), dtype=float)
+            prev_kind = prev.get("kind")
+            prev_sidx = tuple(int(i) for i in (prev.get("surface_indices") or ())) if prev.get("surface_indices") else tuple()
+            if cur_kind is not None and prev_kind is not None:
+                if _canonicalize_metal_kind(prev_kind) == cur_kind and prev_sidx and cur_sidx and prev_sidx == cur_sidx:
+                    return True
+            if cell is not None and pbc is not None and np.isfinite(prev_pos[:2]).all() and np.isfinite(current_pos[:2]).all():
+                _, dxy = _mic_xy_delta(cell, pbc, np.asarray(prev_pos[:2], dtype=float), np.asarray(current_pos[:2], dtype=float))
+                dz = float(abs(float(prev_pos[2]) - float(current_pos[2]))) if np.isfinite(prev_pos[2]) and np.isfinite(current_pos[2]) else 0.0
+                if dxy < tol and dz < max(0.25, tol):
+                    return True
+            dist = np.linalg.norm(current_pos - prev_pos)
+            if dist < tol:
+                return True
+        else:
+            prev_pos = np.asarray(prev, dtype=float)
+            dist = np.linalg.norm(current_pos - prev_pos)
+            if dist < tol:
+                return True
     return False
 
 
@@ -420,39 +454,41 @@ def _check_duplicate_convergence(
 # Site coordinate helpers
 # ---------------------------------------------------------------------
 def site_xy_by_layers_metal(at) -> Dict[str, np.ndarray]:
+    """Extract representative ontop/bridge/hollow xy coordinates from a metal (111)-like slab.
+
+    Note: for metal surfaces we currently expose a single 3-fold hollow basin
+    rather than distinguishing fcc vs hcp.
     """
-    Extract fcc / bridge / ontop xy coordinates from the top layer of a
-    metal (111)-like slab.
-    """
-    layers = layer_indices(at, n=3)
-    nL = len(layers)
+    try:
+        candidates = detect_metal_111_sites(at, max_sites_per_kind=200)
+    except Exception:
+        candidates = []
+
     pos = at.get_positions()
+    cell = at.get_cell()
+    try:
+        center_xy = np.asarray(pos[:, :2].mean(axis=0), dtype=float)
+    except Exception:
+        center_xy = np.zeros(2, dtype=float)
 
-    if nL < 2:
-        z = pos[:, 2]
-        top_idx = np.where(z > np.max(z) - 2.0)[0]
-    else:
-        top_idx = layers[0]
+    reps: Dict[str, np.ndarray] = {}
+    for want in ("ontop", "bridge", "hollow"):
+        group = [s for s in candidates if _canonicalize_metal_kind(getattr(s, "kind", want)) == want]
+        if not group:
+            continue
+        best = None
+        best_key = None
+        for idx, site in enumerate(group):
+            cand_xy = np.asarray(site.position[:2], dtype=float)
+            _, dist = _mic_xy_delta(cell, at.get_pbc(), center_xy, cand_xy)
+            key = (float(dist), int(idx))
+            if best is None or key < best_key:
+                best = cand_xy
+                best_key = key
+        if best is not None:
+            reps[want] = np.asarray(best, dtype=float)
 
-    top_xy = pos[top_idx][:, :2]
-
-    ref = top_xy[0]
-    d = np.linalg.norm(top_xy - ref, axis=1)
-    order = np.argsort(d)
-    if len(order) < 3:
-        order = np.concatenate([order, np.tile(order[-1], 3 - len(order))])
-
-    i0, i1, i2 = order[0], order[1], order[2]
-    ontop_xy = top_xy[i0]
-    bridge_xy = 0.5 * (top_xy[i0] + top_xy[i1])
-    hollow_xy = (top_xy[i0] + top_xy[i1] + top_xy[i2]) / 3.0
-
-    return {
-        "fcc": hollow_xy,
-        "hcp": hollow_xy,
-        "bridge": bridge_xy,
-        "ontop": ontop_xy,
-    }
+    return reps
 
 
 def site_xy_by_layers_oxide(at) -> Dict[str, np.ndarray]:
@@ -554,32 +590,62 @@ def _build_target_sites(
     slab_u_rel,
     sites: Iterable[str],
     user_ads_sites: Optional[Mapping[str, object]],
-) -> List[Tuple[str, str, np.ndarray]]:
+) -> List[Dict[str, object]]:
     """
-    Build the final list of (label, kind, xy) site coordinates.
+    Build the final list of target-site records.
 
-    If user_ads_sites is provided, those are used directly; otherwise
-    geometry-based defaults are generated from the relaxed slab.
+    Each record preserves the human-facing site label together with the seed
+    metadata needed for post-relaxation tracking.
     """
-    target_sites: List[Tuple[str, str, np.ndarray]] = []
+    target_sites: List[Dict[str, object]] = []
 
     if user_ads_sites:
         for label, site in user_ads_sites.items():
             kind = getattr(site, "kind", "unknown")
             pos = np.asarray(getattr(site, "position", []), dtype=float)
+            surface_indices = tuple(int(i) for i in getattr(site, "surface_indices", ()) or ())
             if pos.shape[0] >= 2:
-                target_sites.append((str(label), str(kind), pos[:2]))
+                xyz = (
+                    np.asarray(pos[:3], dtype=float)
+                    if pos.shape[0] >= 3
+                    else np.asarray([pos[0], pos[1], np.nan], dtype=float)
+                )
+                target_sites.append({
+                    "site_label": str(label),
+                    "site_kind": str(kind),
+                    "xy": np.asarray(pos[:2], dtype=float),
+                    "initial_xyz": xyz,
+                    "surface_indices": surface_indices,
+                    "seed_source": "user_ads_sites",
+                })
     else:
         if mtype == "metal":
             xy_map = site_xy_by_layers_metal(slab_u_rel)
+            sites_iter = []
+            seen_metal = set()
+            for site_name in sites_iter:
+                s_norm = _canonicalize_metal_kind(site_name)
+                if s_norm in seen_metal:
+                    continue
+                seen_metal.add(s_norm)
+                sites_iter.append(s_norm)
         elif mtype == "oxide":
+            sites_iter = list(sites)
             xy_map = site_xy_by_layers_oxide(slab_u_rel)
         else:
             raise ValueError(f"Unknown mtype='{mtype}'.")
 
-        for s in sites:
-            if s in xy_map:
-                target_sites.append((s, s, np.asarray(xy_map[s], dtype=float)))
+        for site_name in sites_iter:
+            if site_name in xy_map:
+                xy = np.asarray(xy_map[site_name], dtype=float)
+                target_sites.append({
+                    "site_label": str(site_name),
+                    "site_kind": str(site_name),
+                    "xy": xy,
+                    "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
+                    "surface_indices": tuple(),
+                    "seed_source": "geometry_default",
+                })
 
     return target_sites
 
@@ -622,7 +688,7 @@ def _run_her_che(
     net_corr = STANDARD_CHE_CORR if use_net_corr else 0.0
 
     rows: List[Dict[str, object]] = []
-    final_h_positions: List[np.ndarray] = []
+    final_h_positions: List[dict[str, object] | np.ndarray] = []
 
     target_sites = _build_target_sites(mtype, slab_u_rel, sites, user_ads_sites)
 
@@ -657,11 +723,14 @@ def _run_her_che(
                     pass
         except Exception as e:
             her_guard = {"mode": "HER_GUARDRAIL", "error": str(e)}
+    for site_seed in target_sites:
+        label = str(site_seed.get("site_label", "unknown"))
+        kind = str(site_seed.get("site_kind", "unknown"))
+        xy = np.asarray(site_seed.get("xy", [np.nan, np.nan]), dtype=float)
 
-    for label, kind, xy in target_sites:
-        Au, E_uH, disp = site_energy_two_stage(
+        Au, E_uH, _disp_raw = site_energy_two_stage(
             slab_u_rel,
-            np.asarray(xy, dtype=float),
+            xy,
             H0S,
             z_steps,
             free_steps,
@@ -671,14 +740,53 @@ def _run_her_che(
         dG_u = dE_u + net_corr
 
         h_pos_final = Au.get_positions()[-1]
-        is_duplicate = _check_duplicate_convergence(h_pos_final, final_h_positions)
+        slab_only = Au[: len(slab_u_rel)]
+        tracking = _resolve_site_tracking(
+            slab_only=slab_only,
+            mtype=mtype,
+            seed_kind=kind,
+            initial_xy=xy,
+            final_anchor_xy=np.asarray(h_pos_final[:2], dtype=float),
+            classification_mode="oxide_anion" if str(mtype).lower() == "oxide" else "auto",
+            disp_threshold=float(MIGRATE_THR),
+        )
+        final_meta = tracking.get("final_site_meta", {}) if isinstance(tracking, dict) else {}
+        is_duplicate = _check_duplicate_convergence(
+            h_pos_final,
+            final_h_positions,
+            cell=slab_only.get_cell(),
+            pbc=slab_only.get_pbc(),
+            current_kind=str(final_meta.get("kind", tracking.get("final_site_kind", kind))),
+            current_surface_indices=tuple(final_meta.get("surface_indices", ()) or ()),
+        )
         if not is_duplicate:
-            final_h_positions.append(h_pos_final)
+            final_h_positions.append({
+                "pos": np.asarray(h_pos_final, dtype=float),
+                "kind": str(final_meta.get("kind", tracking.get("final_site_kind", kind))),
+                "surface_indices": tuple(final_meta.get("surface_indices", ()) or ()),
+            })
+
+        qc_flags = list(tracking["qc_flags"])
+        if is_duplicate:
+            qc_flags.append("duplicate_final_site")
+        tracking["initial_surface_indices"] = _fmt_surface_indices(site_seed.get("surface_indices", ()))
 
         row: Dict[str, object] = {
             "mode": "HER",
             "site": kind,
             "site_label": label,
+            "seed_source": site_seed.get("seed_source"),
+            "seed_site_kind": tracking["seed_site_kind"],
+            "initial_site_kind": tracking["initial_site_kind"],
+            "final_site_kind": tracking["final_site_kind"],
+            "relaxed_site": tracking["final_site_kind"],
+            "site_tracking_mode": tracking["classification_mode"],
+            "site_family": tracking["site_family"],
+            "migration_basis": tracking["migration_basis"],
+            "migration_type": tracking["migration_type"],
+            "initial_surface_indices": tracking["initial_surface_indices"],
+            "final_surface_indices": tracking["final_surface_indices"],
+            "qc_flags": ";".join(qc_flags),
             "MODEL": MODEL_NAME,
             "DEVICE": DEVICE,
             "layers": layers,
@@ -688,8 +796,13 @@ def _run_her_che(
             "ΔE_H_user (eV)": dE_u,
             "E_slab (eV)": E_slab_u,
             "ΔE_H (eV)": dE_u,
-            "H_lateral_disp(Å)": float(disp),
-            "migrated": bool(disp > MIGRATE_THR),
+            "initial_anchor_x(Å)": tracking["initial_anchor_x(Å)"],
+            "initial_anchor_y(Å)": tracking["initial_anchor_y(Å)"],
+            "final_anchor_x(Å)": tracking["final_anchor_x(Å)"],
+            "final_anchor_y(Å)": tracking["final_anchor_y(Å)"],
+            "H_lateral_disp(Å)": float(tracking["lateral_disp_mic(Å)"]),
+            "final_site_match_dist(Å)": float(tracking["final_site_match_dist(Å)"]),
+            "migrated": bool(tracking["migrated"]),
             "is_duplicate": is_duplicate,
             "slab_relax_drop": meta_flags["slab_relax_drop"],
             "vac_warning": meta_flags["vac_warning"],
@@ -1121,8 +1234,94 @@ def _co2rr_min_slab_dist(slab_coords3: np.ndarray, ads_coords3: np.ndarray) -> f
     return float(np.min(d))
 
 
-def _classify_metal_site_xy(slab_only, anchor_xy: np.ndarray) -> str:
-    """Classify relaxed adsorption site on close-packed metal surfaces using xy geometry."""
+def _normalize_site_kind(kind: object) -> str:
+    k = str(kind or "").strip().lower()
+    aliases = {
+        "top": "ontop",
+        "atop": "ontop",
+        "on-top": "ontop",
+        "on_top": "ontop",
+        "3fold": "hollow",
+        "threefold": "hollow",
+        "three-fold": "hollow",
+        "o_top": "anion_ontop",
+        "o-top": "anion_ontop",
+        "anion_o": "anion_ontop",
+    }
+    return aliases.get(k, k if k else "unknown")
+
+
+def _canonicalize_metal_kind(kind: object) -> str:
+    k = _normalize_site_kind(kind)
+    if k in {"fcc", "hcp", "hollow"}:
+        return "hollow"
+    return k
+
+
+def _kind_priority(kind: str) -> int:
+    return {
+        "ontop": 0,
+        "anion_ontop": 0,
+        "bridge": 1,
+        "hollow": 2,
+        "fcc": 2,
+        "hcp": 2,
+        "unknown": 99,
+    }.get(_normalize_site_kind(kind), 50)
+
+
+def _fmt_surface_indices(indices: object) -> str:
+    try:
+        vals = tuple(int(i) for i in (indices or ()))
+    except Exception:
+        vals = tuple()
+    return ",".join(str(i) for i in vals)
+
+
+def _mic_xy_delta(cell, pbc, xy0: np.ndarray, xy1: np.ndarray) -> tuple[np.ndarray, float]:
+    xy0 = np.asarray(xy0, dtype=float).reshape(2)
+    xy1 = np.asarray(xy1, dtype=float).reshape(2)
+    d3 = np.array([float(xy1[0] - xy0[0]), float(xy1[1] - xy0[1]), 0.0], dtype=float)
+    vec, _ = find_mic(d3, cell=cell, pbc=[bool(pbc[0]), bool(pbc[1]), False])
+    vec = np.asarray(vec, dtype=float)
+    return vec[:2], float(np.linalg.norm(vec[:2]))
+
+
+def _classify_site_from_candidates(
+    slab_only,
+    anchor_xy: np.ndarray,
+    candidates: list[AdsSite],
+    *,
+    unknown_tol: float,
+) -> dict[str, object]:
+    anchor_xy = np.asarray(anchor_xy, dtype=float).reshape(2)
+    best: dict[str, object] | None = None
+    best_key = None
+    for idx, site in enumerate(candidates or []):
+        cand_xy = np.asarray(site.position[:2], dtype=float)
+        _, dist = _mic_xy_delta(slab_only.get_cell(), slab_only.get_pbc(), cand_xy, anchor_xy)
+        kind = _normalize_site_kind(getattr(site, "kind", "unknown"))
+        key = (float(dist), _kind_priority(kind), int(idx))
+        if best is None or key < best_key:
+            best = {
+                "kind": kind,
+                "match_dist": float(dist),
+                "surface_indices": tuple(int(i) for i in getattr(site, "surface_indices", ()) or ()),
+            }
+            best_key = key
+    if best is None:
+        return {
+            "kind": "unknown",
+            "match_dist": float("nan"),
+            "surface_indices": tuple(),
+        }
+    if np.isfinite(best["match_dist"]) and float(best["match_dist"]) > float(unknown_tol):
+        best["kind"] = "unknown"
+    return best
+
+
+def _classify_metal_site_xy_legacy(slab_only, anchor_xy: np.ndarray) -> str:
+    """Legacy xy-based metal-site classifier returning ontop/bridge/hollow."""
     try:
         pos = slab_only.get_positions()
         top = layer_indices(slab_only, n=1)[0]
@@ -1152,76 +1351,207 @@ def _classify_metal_site_xy(slab_only, anchor_xy: np.ndarray) -> str:
                     if len(layers2) >= 2:
                         second = layers2[1]
                         sec_xy = pos[np.asarray(second, int), :2]
-                        d2 = float(
-                            np.min(np.linalg.norm(sec_xy - centroid[None, :], axis=1))
-                        )
+                        d2 = float(np.min(np.linalg.norm(sec_xy - centroid[None, :], axis=1)))
                         if d2 < tol_atop:
-                            return "hcp"
+                            return "hollow"
                 except Exception:
                     pass
-                return "fcc"
+                return "hollow"
 
         return "unknown"
     except Exception:
         return "unknown"
 
 
+def _classify_metal_site_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
+    """Robust metal-site classification using ontop/bridge/hollow taxonomy."""
+    try:
+        candidates = detect_metal_111_sites(slab_only, max_sites_per_kind=200)
+    except Exception:
+        candidates = []
+    out = _classify_site_from_candidates(slab_only, anchor_xy, candidates, unknown_tol=0.85)
+    out["kind"] = _canonicalize_metal_kind(out.get("kind", "unknown"))
+    if out.get("kind") == "unknown":
+        legacy = _classify_metal_site_xy_legacy(slab_only, np.asarray(anchor_xy, dtype=float))
+        if legacy != "unknown":
+            out["kind"] = _canonicalize_metal_kind(legacy)
+    out["classification_mode"] = "metal_geom"
+    return out
+
+
+def _classify_oxide_geom_site_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
+    try:
+        candidates = detect_oxide_surface_sites(slab_only, max_sites_per_kind=200, z_tol=1.2)
+    except Exception:
+        candidates = []
+    out = _classify_site_from_candidates(slab_only, anchor_xy, candidates, unknown_tol=1.00)
+    out["classification_mode"] = "oxide_geom"
+    return out
+
+
+def _classify_oxide_anion_site_xy(slab_only, anchor_xy: np.ndarray, tol: float = 0.75) -> dict[str, object]:
+    try:
+        pos = slab_only.get_positions()
+        syms = slab_only.get_chemical_symbols()
+        z = pos[:, 2]
+        anion_idx = np.asarray([i for i, sym in enumerate(syms) if sym in ANION_SYMBOLS], dtype=int)
+        if anion_idx.size == 0:
+            return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple(), "classification_mode": "oxide_anion_top"}
+        z_max = float(np.max(z[anion_idx]))
+        top_idx = anion_idx[(z_max - z[anion_idx]) < 0.8]
+        if top_idx.size == 0:
+            top_idx = anion_idx
+        best = None
+        best_key = None
+        for idx in top_idx.tolist():
+            cand_xy = np.asarray(pos[idx, :2], dtype=float)
+            _, dist = _mic_xy_delta(slab_only.get_cell(), slab_only.get_pbc(), cand_xy, anchor_xy)
+            key = (float(dist), 0, int(idx))
+            if best is None or key < best_key:
+                best = {"kind": "anion_ontop", "match_dist": float(dist), "surface_indices": (int(idx),), "classification_mode": "oxide_anion_top"}
+                best_key = key
+        if best is None:
+            return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple(), "classification_mode": "oxide_anion_top"}
+        if np.isfinite(best["match_dist"]) and float(best["match_dist"]) > float(tol):
+            best["kind"] = "unknown"
+        return best
+    except Exception:
+        return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple(), "classification_mode": "oxide_anion_top"}
+
+
+def _resolve_site_tracking(
+    *,
+    slab_only,
+    mtype: str,
+    seed_kind: object,
+    initial_xy: np.ndarray,
+    final_anchor_xy: np.ndarray,
+    classification_mode: str = "auto",
+    disp_threshold: float = MIGRATE_THR,
+) -> dict[str, object]:
+    initial_xy = np.asarray(initial_xy, dtype=float).reshape(2)
+    final_anchor_xy = np.asarray(final_anchor_xy, dtype=float).reshape(2)
+    seed_kind_norm = _normalize_site_kind(seed_kind)
+
+    if classification_mode == "oxide_anion":
+        initial_kind = "anion_ontop"
+        final_meta = _classify_oxide_anion_site_xy(slab_only, final_anchor_xy)
+        site_family = "oxide_anion_top"
+    elif str(mtype).lower() == "metal":
+        initial_kind = _canonicalize_metal_kind(seed_kind_norm)
+        final_meta = _classify_metal_site_xy(slab_only, final_anchor_xy)
+        site_family = "metal_geom"
+    else:
+        initial_kind = seed_kind_norm
+        final_meta = _classify_oxide_geom_site_xy(slab_only, final_anchor_xy)
+        site_family = "oxide_geom"
+
+    _, disp_mic = _mic_xy_delta(slab_only.get_cell(), slab_only.get_pbc(), initial_xy, final_anchor_xy)
+    final_kind = _normalize_site_kind(final_meta.get("kind", "unknown"))
+    label_changed = bool(initial_kind not in ("", "unknown") and final_kind not in ("", "unknown") and final_kind != initial_kind)
+    displaced = bool(np.isfinite(disp_mic) and float(disp_mic) > float(disp_threshold))
+    migrated = bool(label_changed or displaced)
+
+    if label_changed and displaced:
+        migration_basis = "both"
+    elif label_changed:
+        migration_basis = "reclassified"
+    elif displaced:
+        migration_basis = "displacement"
+    else:
+        migration_basis = "none"
+
+    if not migrated:
+        migration_type = "none"
+    elif migration_basis == "displacement" and final_kind == initial_kind:
+        migration_type = f"{initial_kind}_displaced"
+    else:
+        migration_type = f"{initial_kind}_to_{final_kind}"
+
+    qc_flags: List[str] = []
+    if final_kind == "unknown":
+        qc_flags.append("unclassified_site")
+    if label_changed:
+        qc_flags.append("site_reclassified")
+    if displaced:
+        qc_flags.append("migrated_site")
+
+    return {
+        "seed_site_kind": seed_kind_norm,
+        "initial_site_kind": initial_kind,
+        "final_site_kind": final_kind,
+        "classification_mode": str(final_meta.get("classification_mode", classification_mode)),
+        "site_family": site_family,
+        "final_site_match_dist(Å)": float(final_meta.get("match_dist", float("nan"))),
+        "initial_anchor_x(Å)": float(initial_xy[0]),
+        "initial_anchor_y(Å)": float(initial_xy[1]),
+        "final_anchor_x(Å)": float(final_anchor_xy[0]),
+        "final_anchor_y(Å)": float(final_anchor_xy[1]),
+        "lateral_disp_mic(Å)": float(disp_mic),
+        "migrated": bool(migrated),
+        "migration_basis": migration_basis,
+        "migration_type": migration_type,
+        "qc_flags": list(qc_flags),
+        "initial_surface_indices": "",
+        "final_surface_indices": _fmt_surface_indices(final_meta.get("surface_indices", ())),
+    }
+
 # ---------------------------------------------------------------------
 # Optional HER guardrail for CO2RR (single-site; cheap)
 # ---------------------------------------------------------------------
 def _pick_guardrail_site(
-    target_sites: list[tuple[str, str, np.ndarray]],
+    target_sites: list[dict[str, object]],
     preference: str = "ontop",
-) -> tuple[str, str, np.ndarray] | None:
-    """Pick one (label, kind, xy) from target_sites, preferring `preference` if available."""
+) -> dict[str, object] | None:
+    """Pick one target-site record, preferring `preference` if available."""
     if not target_sites:
         return None
-    pref = (preference or "").strip().lower()
-
-    for (label, kind, xy) in target_sites:
-        if str(kind).lower() == pref or str(label).lower() == pref:
-            return (label, kind, np.asarray(xy, dtype=float))
-
-    alias = {
-        "top": "ontop",
-        "on-top": "ontop",
-        "on_top": "ontop",
-        "atop": "ontop",
-    }
-    pref2 = alias.get(pref, pref)
-    for (label, kind, xy) in target_sites:
-        if str(kind).lower() == pref2 or str(label).lower() == pref2:
-            return (label, kind, np.asarray(xy, dtype=float))
-
-    (label, kind, xy) = target_sites[0]
-    return (label, kind, np.asarray(xy, dtype=float))
+    pref = _normalize_site_kind(preference)
+    for site in target_sites:
+        kind = _normalize_site_kind(site.get("site_kind"))
+        label = _normalize_site_kind(site.get("site_label"))
+        if kind == pref or label == pref:
+            return site
+    return target_sites[0]
 
 
 def _compute_her_guardrail_from_prepared(
     slab_u_rel,
     E_slab_u: float,
     E_H2: float,
-    target_sites: list[tuple[str, str, np.ndarray]],
+    target_sites: list[dict[str, object]],
     z_steps: int,
     free_steps: int,
     site_preference: str = "ontop",
     use_net_corr: bool = True,
     out_cif: Path | None = None,
 ) -> dict[str, object] | None:
-    """
-    Compute a single H* adsorption as a guardrail using the *already prepared* slab and H2 ref.
-    """
+    """Compute a single H* adsorption as a guardrail using the prepared slab and H2 ref."""
     pick = _pick_guardrail_site(target_sites, preference=site_preference)
     if pick is None:
         return None
 
-    label, kind, xy = pick
-    Au, E_uH, disp = site_energy_two_stage(
+    label = str(pick.get("site_label", "unknown"))
+    kind = str(pick.get("site_kind", "unknown"))
+    xy = np.asarray(pick.get("xy", [np.nan, np.nan]), dtype=float)
+    Au, E_uH, _disp_raw = site_energy_two_stage(
         slab_u_rel,
-        np.asarray(xy, dtype=float),
+        xy,
         H0S,
         int(z_steps),
         int(free_steps),
+    )
+
+    slab_only = Au[: len(slab_u_rel)]
+    h_xy = np.asarray(Au.get_positions()[-1, :2], dtype=float)
+    tracking = _resolve_site_tracking(
+        slab_only=slab_only,
+        mtype="oxide" if str(kind).lower().startswith("anion") else "metal",
+        seed_kind=kind,
+        initial_xy=xy,
+        final_anchor_xy=h_xy,
+        classification_mode="oxide_anion" if str(kind).lower().startswith("anion") else "auto",
+        disp_threshold=float(MIGRATE_THR),
     )
 
     dE_u = float(E_uH) - float(E_slab_u) - 0.5 * float(E_H2)
@@ -1239,18 +1569,25 @@ def _compute_her_guardrail_from_prepared(
         "mode": "HER_GUARDRAIL",
         "site": str(kind),
         "site_label": str(label),
+        "seed_site_kind": tracking["seed_site_kind"],
+        "initial_site_kind": tracking["initial_site_kind"],
+        "final_site_kind": tracking["final_site_kind"],
+        "site_tracking_mode": tracking["classification_mode"],
+        "migration_basis": tracking["migration_basis"],
+        "migration_type": tracking["migration_type"],
+        "qc_flags": ";".join(tracking["qc_flags"]),
         "E_slab_user (eV)": float(E_slab_u),
         "E_slab+H_user (eV)": float(E_uH),
         "ΔE_H_user (eV)": float(dE_u),
         "ΔG_H (eV)": float(dG_u),
-        "H_lateral_disp(Å)": float(disp),
-        "migrated": bool(float(disp) > float(MIGRATE_THR)),
+        "H_lateral_disp(Å)": float(tracking["lateral_disp_mic(Å)"]),
+        "final_site_match_dist(Å)": float(tracking["final_site_match_dist(Å)"]),
+        "migrated": bool(tracking["migrated"]),
         "NET_CORR (eV)": float(net_corr),
     }
     if out_cif is not None:
         row["structure_cif"] = str(Path(out_cif).resolve())
     return row
-
 
 # ---------------------------------------------------------------------
 # CO2RR / ORR mode (reaction-descriptor based ΔE/ΔG)
@@ -1392,7 +1729,10 @@ def _run_co2rr_che(
 
     rows: List[Dict[str, object]] = []
 
-    for label, kind, xy in target_sites:
+    for site_seed in target_sites:
+        label = str(site_seed.get("site_label", "unknown"))
+        kind = str(site_seed.get("site_kind", "unknown"))
+        xy = np.asarray(site_seed.get("xy", [np.nan, np.nan]), dtype=float)
         for ads in adspecies:
             ads_clean = ads.replace("*", "").upper()
             if ads_clean not in ADS_TEMPLATE_FILES:
@@ -1405,6 +1745,8 @@ def _run_co2rr_che(
                 "target_anchor_xyz": None,
                 "oxide_seed_mode": None,
                 "surface_channel": None,
+                "seed_source": site_seed.get("seed_source"),
+                "surface_indices": tuple(int(i) for i in site_seed.get("surface_indices", ()) or ()),
             }]
             if _is_orr and mtype == "oxide":
                 seed_variants = []
@@ -1422,6 +1764,8 @@ def _run_co2rr_che(
                         "target_anchor_xyz": np.asarray([x0, y0, z0], float),
                         "oxide_seed_mode": str(ch),
                         "surface_channel": str(surface_channel),
+                        "seed_source": site_seed.get("seed_source"),
+                        "surface_indices": tuple(int(i) for i in site_seed.get("surface_indices", ()) or ()),
                     })
 
             for seed in seed_variants:
@@ -1452,12 +1796,28 @@ def _run_co2rr_che(
                 slab_coords3 = coords[:n_slab, :]
                 ads_coords3 = coords[n_slab:, :]
                 ads_symbols = list(symbols_all[n_slab:])
-    
                 anchor_xy, anchor_z, anchor_mode = _co2rr_anchor_xy(
                     ads_coords3, ads_symbols, ads_clean
                 )
-                disp = float(np.linalg.norm(anchor_xy - np.asarray(seed["xy"], float)))
-    
+                slab_only = slab_ads_rel[:n_slab]
+
+                migrate_thr = (
+                    float(MIGRATE_THR)
+                    if ads_clean == "CO"
+                    else float(max(MIGRATE_THR, 2.5))
+                )
+                tracking = _resolve_site_tracking(
+                    slab_only=slab_only,
+                    mtype=mtype,
+                    seed_kind=seed["site_kind"],
+                    initial_xy=np.asarray(seed["xy"], float),
+                    final_anchor_xy=anchor_xy,
+                    classification_mode="auto",
+                    disp_threshold=float(migrate_thr),
+                )
+                tracking["initial_surface_indices"] = _fmt_surface_indices(seed.get("surface_indices", ()))
+                disp = float(tracking["lateral_disp_mic(Å)"])
+
                 z_top = (
                     float(np.max(slab_coords3[:, 2]))
                     if slab_coords3.shape[0]
@@ -1468,7 +1828,7 @@ def _run_co2rr_che(
                     if np.isfinite(anchor_z) and np.isfinite(z_top)
                     else float("nan")
                 )
-    
+
                 min_slab_dist = _co2rr_min_slab_dist(slab_coords3, ads_coords3)
                 broken = (
                     bool(_co2rr_internal_broken(ads_coords3, ads_symbols, ads_clean))
@@ -1481,16 +1841,9 @@ def _run_co2rr_che(
                     if np.isfinite(min_slab_dist)
                     else False
                 )
-    
-                # Migration threshold: COOH/HCOO/OCHO have larger metric
-                # variation due to rotation/rearrangement, so threshold is relaxed
-                migrate_thr = (
-                    float(MIGRATE_THR)
-                    if ads_clean == "CO"
-                    else float(max(MIGRATE_THR, 2.5))
-                )
-                migrated = bool(disp > migrate_thr)
-    
+
+                migrated = bool(tracking["migrated"])
+
                 qa = "ok"
                 if crashed:
                     qa = "crashed"
@@ -1500,16 +1853,19 @@ def _run_co2rr_che(
                     qa = "broken"
                 elif migrated:
                     qa = "migrated"
-    
-                # relaxed site re-classification (metal only; best-effort)
-                relaxed_site = None
-                if mtype == "metal":
-                    try:
-                        slab_only = slab_ads_rel[:n_slab]
-                        relaxed_site = _classify_metal_site_xy(slab_only, anchor_xy)
-                    except Exception:
-                        relaxed_site = None
-    
+
+                relaxed_site = tracking["final_site_kind"]
+                if relaxed_site == "unknown":
+                    relaxed_site = None
+
+                qc_flags = list(tracking["qc_flags"])
+                if crashed:
+                    qc_flags.append("crashed_adsorbate")
+                if desorbed:
+                    qc_flags.append("desorbed_adsorbate")
+                if broken:
+                    qc_flags.append("broken_adsorbate")
+
                 # --- reaction descriptor ---
                 # CO2(g) + H+ + e- → COOH*
                 # CO2(g) + 2H+ + 2e- → CO* + H2O(l)
@@ -1555,6 +1911,17 @@ def _run_co2rr_che(
                     "adsorbate": ads_clean,
                     "site": seed["site_kind"],
                     "site_label": seed["site_label"],
+                    "seed_source": seed.get("seed_source"),
+                    "seed_site_kind": tracking["seed_site_kind"],
+                    "initial_site_kind": tracking["initial_site_kind"],
+                    "final_site_kind": tracking["final_site_kind"],
+                    "site_tracking_mode": tracking["classification_mode"],
+                    "site_family": tracking["site_family"],
+                    "migration_basis": tracking["migration_basis"],
+                    "migration_type": tracking["migration_type"],
+                    "initial_surface_indices": tracking["initial_surface_indices"],
+                    "final_surface_indices": tracking["final_surface_indices"],
+                    "qc_flags": ";".join(qc_flags),
                     "MODEL": MODEL_NAME,
                     "DEVICE": DEVICE,
                     "layers": layers,
@@ -1571,7 +1938,12 @@ def _run_co2rr_che(
                     "G_correction (eV)": float(g_corr),
                     "ref_rxn": ref_rxn,
                     "ΔG_ads (eV)": float(dG_ads) if export_absolute else None,
+                    "initial_anchor_x(Å)": tracking["initial_anchor_x(Å)"],
+                    "initial_anchor_y(Å)": tracking["initial_anchor_y(Å)"],
+                    "final_anchor_x(Å)": tracking["final_anchor_x(Å)"],
+                    "final_anchor_y(Å)": tracking["final_anchor_y(Å)"],
                     "ads_lateral_disp(Å)": float(disp),
+                    "final_site_match_dist(Å)": float(tracking["final_site_match_dist(Å)"]),
                     "oxide_seed_mode": seed.get("oxide_seed_mode"),
                     "surface_channel": seed.get("surface_channel"),
                     "ads_anchor_mode": anchor_mode,
@@ -1686,7 +2058,7 @@ def _run_co2rr_che(
 def run_metal_che(
     user_slab_cif: str,
     out_root: str | Path = "calc/metal_che",
-    sites: Iterable[str] = ("ontop", "bridge", "fcc", "hcp"),
+    sites: Iterable[str] = ("ontop", "bridge", "hollow"),
     vac_z: float = 20.0,
     layers: int = 7,
     export_absolute: bool = True,
@@ -1719,7 +2091,7 @@ def run_metal_che(
 def run_oxide_che(
     user_slab_cif: str,
     out_root: str | Path = "calc/oxide_che",
-    sites: Iterable[str] = ("fcc", "bridge", "ontop"),
+    sites: Iterable[str] = ("hollow", "bridge", "ontop"),
     vac_z: float = 30.0,
     layers: int = 7,
     export_absolute: bool = True,
@@ -1752,7 +2124,7 @@ def run_oxide_che(
 def run_metal_co2rr_che(
     user_slab_cif: str,
     out_root: str | Path = "calc/metal_co2rr",
-    sites: Iterable[str] = ("ontop", "bridge", "fcc"),
+    sites: Iterable[str] = ("ontop", "bridge", "hollow"),
     vac_z: float = 20.0,
     layers: int = 7,
     export_absolute: bool = True,
@@ -1783,7 +2155,7 @@ def run_metal_co2rr_che(
 def run_oxide_co2rr_che(
     user_slab_cif: str,
     out_root: str | Path = "calc/oxide_co2rr",
-    sites: Iterable[str] = ("fcc", "bridge", "ontop"),
+    sites: Iterable[str] = ("hollow", "bridge", "ontop"),
     vac_z: float = 30.0,
     layers: int = 7,
     export_absolute: bool = True,
@@ -1820,7 +2192,7 @@ def run_oxide_co2rr_che(
 def run_metal_orr_che(
     user_slab_cif: str,
     out_root: str | Path = "calc/metal_orr",
-    sites: Iterable[str] = ("ontop", "bridge", "fcc"),
+    sites: Iterable[str] = ("ontop", "bridge", "hollow"),
     vac_z: float = 20.0,
     layers: int = 7,
     export_absolute: bool = True,
@@ -1859,7 +2231,7 @@ def run_metal_orr_che(
 def run_oxide_orr_che(
     user_slab_cif: str,
     out_root: str | Path = "calc/oxide_orr",
-    sites: Iterable[str] = ("fcc", "bridge", "ontop"),
+    sites: Iterable[str] = ("hollow", "bridge", "ontop"),
     vac_z: float = 30.0,
     layers: int = 7,
     export_absolute: bool = True,
