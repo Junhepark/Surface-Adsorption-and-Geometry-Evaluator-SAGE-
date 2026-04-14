@@ -20,6 +20,8 @@ from .ads_sites import (
     _oxide_o_based_ads_position,
     oxide_surface_seed_position,
     expand_oxide_channels_for_adsorbate,
+    detect_metal_111_sites,
+    detect_oxide_surface_sites,
     ANION_SYMBOLS,
 )
 
@@ -80,6 +82,211 @@ class ScreenResult:
     converged: bool = True
     n_atoms: int = 0
     anchor_mode: str = ""
+
+    # site-tracking metadata
+    seed_kind: str = "unknown"
+    initial_site_kind: str = "unknown"
+    final_site_kind: str = "unknown"
+    migration_basis: str = "none"
+    migration_type: str = "none"
+    migrated: bool = False
+    final_site_match_dist: float = float("nan")
+    initial_anchor_xy: Optional[Tuple[float, float]] = None
+    final_anchor_xy: Optional[Tuple[float, float]] = None
+    seed_surface_indices: str = ""
+    final_surface_indices: str = ""
+    qc_flags: str = ""
+    classification_mode: str = "auto"
+    site_family: str = "unknown"
+
+
+def _normalize_site_kind(kind: object) -> str:
+    k = str(kind or "").strip().lower()
+    aliases = {
+        "top": "ontop",
+        "atop": "ontop",
+        "on-top": "ontop",
+        "on_top": "ontop",
+        "o_top": "anion_ontop",
+        "o-top": "anion_ontop",
+        "anion_o": "anion_ontop",
+    }
+    return aliases.get(k, k if k else "unknown")
+
+
+def _kind_priority(kind: str) -> int:
+    return {
+        "ontop": 0,
+        "anion_ontop": 0,
+        "bridge": 1,
+        "hollow": 2,
+        "fcc": 2,
+        "hcp": 3,
+        "unknown": 99,
+    }.get(_normalize_site_kind(kind), 50)
+
+
+def _fmt_surface_indices(indices: object) -> str:
+    try:
+        vals = tuple(int(i) for i in (indices or ()))
+    except Exception:
+        vals = tuple()
+    return ",".join(str(i) for i in vals)
+
+
+def _mic_xy_delta(cell, pbc, xy0: np.ndarray, xy1: np.ndarray) -> tuple[np.ndarray, float]:
+    xy0 = np.asarray(xy0, dtype=float).reshape(2)
+    xy1 = np.asarray(xy1, dtype=float).reshape(2)
+    d3 = np.array([float(xy1[0] - xy0[0]), float(xy1[1] - xy0[1]), 0.0], dtype=float)
+    vec, _ = find_mic(d3, cell=cell, pbc=[bool(pbc[0]), bool(pbc[1]), False])
+    vec = np.asarray(vec, dtype=float)
+    return vec[:2], float(np.linalg.norm(vec[:2]))
+
+
+def _classify_site_from_candidates(slab_only, anchor_xy: np.ndarray, candidates: list[AdsSite], *, unknown_tol: float = 0.9) -> dict[str, object]:
+    anchor_xy = np.asarray(anchor_xy, dtype=float).reshape(2)
+    best = None
+    best_key = None
+    for idx, site in enumerate(candidates or []):
+        cand_xy = np.asarray(site.position[:2], dtype=float)
+        _, dist = _mic_xy_delta(slab_only.get_cell(), slab_only.get_pbc(), cand_xy, anchor_xy)
+        kind = _normalize_site_kind(getattr(site, "kind", "unknown"))
+        key = (float(dist), _kind_priority(kind), int(idx))
+        if best is None or key < best_key:
+            best = {
+                "kind": kind,
+                "match_dist": float(dist),
+                "surface_indices": tuple(int(i) for i in getattr(site, "surface_indices", ()) or ()),
+            }
+            best_key = key
+    if best is None:
+        return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple()}
+    if np.isfinite(best["match_dist"]) and float(best["match_dist"]) > float(unknown_tol):
+        best["kind"] = "unknown"
+    return best
+
+
+def _classify_metal_site_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
+    try:
+        cands = detect_metal_111_sites(slab_only)
+    except Exception:
+        cands = []
+    out = _classify_site_from_candidates(slab_only, anchor_xy, cands, unknown_tol=0.9)
+    if out.get("kind") in ("fcc", "hollow"):
+        # legacy best-effort hcp split by 2nd layer proximity (only when candidates expose hcp/fcc).
+        try:
+            pos = slab_only.get_positions()
+            top = pos[np.asarray([i for i in range(len(slab_only)) if slab_only[i].symbol != "H"], int), :2]
+        except Exception:
+            top = None
+    return out
+
+
+def _classify_oxide_site_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
+    try:
+        cands = detect_oxide_surface_sites(slab_only)
+    except Exception:
+        cands = []
+    return _classify_site_from_candidates(slab_only, anchor_xy, cands, unknown_tol=1.1)
+
+
+def _classify_oxide_anion_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
+    try:
+        pos = slab_only.get_positions()
+        sym = slab_only.get_chemical_symbols()
+        top_idx = [i for i, s in enumerate(sym) if (s in ANION_SYMBOLS)]
+        if not top_idx:
+            return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple()}
+        z = pos[top_idx, 2]
+        zmax = float(np.max(z))
+        cand = [i for i in top_idx if (zmax - float(pos[i,2])) < 0.8]
+        cand = cand or top_idx
+        best = None
+        best_key = None
+        for i in cand:
+            xy = np.asarray(pos[i, :2], dtype=float)
+            _, dist = _mic_xy_delta(slab_only.get_cell(), slab_only.get_pbc(), xy, anchor_xy)
+            key = (float(dist), int(i))
+            if best is None or key < best_key:
+                best = {"kind": "anion_ontop", "match_dist": float(dist), "surface_indices": (int(i),)}
+                best_key = key
+        if best is None:
+            return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple()}
+        if np.isfinite(best["match_dist"]) and float(best["match_dist"]) > 1.0:
+            best["kind"] = "unknown"
+        return best
+    except Exception:
+        return {"kind": "unknown", "match_dist": float("nan"), "surface_indices": tuple()}
+
+
+def _resolve_site_tracking(
+    *,
+    slab_only,
+    mtype: str,
+    seed_kind: object,
+    initial_xy: np.ndarray,
+    final_anchor_xy: np.ndarray,
+    classification_mode: str = "auto",
+    disp_threshold: float = 2.5,
+) -> dict[str, object]:
+    seed_kind_n = _normalize_site_kind(seed_kind)
+    initial_kind = seed_kind_n
+    mode = str(classification_mode or "auto")
+    if mode == "oxide_anion":
+        final = _classify_oxide_anion_xy(slab_only, final_anchor_xy)
+        site_family = "oxide_anion"
+    elif str(mtype).lower() == "metal":
+        final = _classify_metal_site_xy(slab_only, final_anchor_xy)
+        site_family = "metal"
+    else:
+        final = _classify_oxide_site_xy(slab_only, final_anchor_xy)
+        site_family = "oxide_cation"
+    final_kind = _normalize_site_kind(final.get("kind", "unknown"))
+    _, disp_mic = _mic_xy_delta(slab_only.get_cell(), slab_only.get_pbc(), initial_xy, final_anchor_xy)
+
+    migration_basis = "none"
+    migrated = False
+    if final_kind == "unknown":
+        migration_basis = "unclassified_final_site"
+        migrated = True
+    elif final_kind != initial_kind:
+        migration_basis = "site_kind_changed"
+        migrated = True
+    elif float(disp_mic) > float(disp_threshold):
+        migration_basis = "lateral_disp"
+        migrated = True
+
+    if migrated and (initial_kind not in ("unknown", "") and final_kind not in ("unknown", "")):
+        migration_type = f"{initial_kind}_to_{final_kind}" if final_kind != initial_kind else "same_kind_displaced"
+    elif migrated:
+        migration_type = migration_basis
+    else:
+        migration_type = "none"
+
+    qc_flags = []
+    if migrated:
+        qc_flags.append("migrated_site")
+    if final_kind == "unknown":
+        qc_flags.append("unclassified_site")
+
+    return {
+        "seed_site_kind": seed_kind_n,
+        "initial_site_kind": initial_kind,
+        "final_site_kind": final_kind,
+        "classification_mode": mode,
+        "site_family": site_family,
+        "migration_basis": migration_basis,
+        "migration_type": migration_type,
+        "migrated": bool(migrated),
+        "lateral_disp_mic(Å)": float(disp_mic),
+        "final_site_match_dist(Å)": float(final.get("match_dist", float("nan"))),
+        "final_surface_indices": _fmt_surface_indices(final.get("surface_indices", ())),
+        "qc_flags": list(qc_flags),
+        "initial_anchor_x(Å)": float(np.asarray(initial_xy, dtype=float).reshape(2)[0]),
+        "initial_anchor_y(Å)": float(np.asarray(initial_xy, dtype=float).reshape(2)[1]),
+        "final_anchor_x(Å)": float(np.asarray(final_anchor_xy, dtype=float).reshape(2)[0]),
+        "final_anchor_y(Å)": float(np.asarray(final_anchor_xy, dtype=float).reshape(2)[1]),
+    }
 
 
 # ------------------------ CHGNet loader (Cached) ------------------------
@@ -364,9 +571,11 @@ def summarize_outcomes(outs: List[ScreenResult]) -> Dict[str, object]:
     keys = [_reason_key(o.reason) for o in outs]
     uniq, cnt = np.unique(np.array(keys, dtype=object), return_counts=True)
     by_reason = {str(k): int(v) for k, v in zip(uniq.tolist(), cnt.tolist())}
+    n_migrated = sum(1 for o in outs if bool(getattr(o, "migrated", False)) or (_reason_key(getattr(o, "reason", "")) == "migrated"))
     return {
         "n_total": int(total),
         "n_valid": int(n_valid),
+        "n_migrated": int(n_migrated),
         "by_reason": by_reason,
     }
 
@@ -479,10 +688,21 @@ def screen_sites_adsorbml_lite(
                     n_atoms = int(len(atoms))
                     e_pa = float(e_total / max(n_atoms, 1))
 
-                    # Adsorbate lateral displacement (xy)
+                    # Adsorbate lateral displacement (xy) + site tracking
                     pos = atoms.get_positions()
                     anchor_xy1 = pos[anchor_global][:2].copy()
                     disp = _lateral_disp(anchor_xy0, anchor_xy1, atoms.get_cell(), atoms.get_pbc())
+                    tracking = _resolve_site_tracking(
+                        slab_only=atoms[:n_slab],
+                        mtype=mtype,
+                        seed_kind=("anion_ontop" if ((reaction == "HER") and (mtype == "oxide")) else site.kind),
+                        initial_xy=anchor_xy0,
+                        final_anchor_xy=anchor_xy1,
+                        classification_mode=("oxide_anion" if ((reaction == "HER") and (mtype == "oxide")) else "auto"),
+                        disp_threshold=float(settings.max_lateral_disp),
+                    )
+                    migrated_flag = bool(tracking["migrated"])
+                    qc_flags = list(tracking["qc_flags"])
 
                     # Minimum distance between adsorbate atoms and surface atoms
                     try:
@@ -490,57 +710,58 @@ def screen_sites_adsorbml_lite(
                     except Exception:
                         dmin = float("nan")
 
+                    base_kwargs = dict(
+                        atoms_relaxed=atoms if return_raw else None,
+                        anchor_pos=tuple(pos[anchor_global]),
+                        dmin=dmin,
+                        e_per_atom=e_pa,
+                        converged=converged,
+                        n_atoms=n_atoms,
+                        anchor_mode=str(anchor_mode_used),
+                        seed_kind=tracking["seed_site_kind"],
+                        initial_site_kind=tracking["initial_site_kind"],
+                        final_site_kind=tracking["final_site_kind"],
+                        migration_basis=tracking["migration_basis"],
+                        migration_type=tracking["migration_type"],
+                        migrated=bool(migrated_flag),
+                        final_site_match_dist=float(tracking["final_site_match_dist(Å)"]),
+                        initial_anchor_xy=(float(tracking["initial_anchor_x(Å)"]), float(tracking["initial_anchor_y(Å)"])),
+                        final_anchor_xy=(float(tracking["final_anchor_x(Å)"]), float(tracking["final_anchor_y(Å)"])),
+                        seed_surface_indices=_fmt_surface_indices(getattr(site, "surface_indices", ())),
+                        final_surface_indices=tracking["final_surface_indices"],
+                        classification_mode=tracking["classification_mode"],
+                        site_family=tracking["site_family"],
+                    )
+
                     if (np.isfinite(dmin)) and (dmin < float(settings.min_ads_surf_dist)):
-                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "too_close", site,
-                                                atoms_relaxed=atoms if return_raw else None,
-                                                anchor_pos=tuple(pos[anchor_global]),
-                                                dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                                anchor_mode=str(anchor_mode_used)))
+                        qc_flags2 = qc_flags + ["too_close"]
+                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "too_close", site, qc_flags=";".join(qc_flags2), **base_kwargs))
                         continue
 
-                    if disp > float(settings.max_lateral_disp):
-                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "migrated", site,
-                                                atoms_relaxed=atoms if return_raw else None,
-                                                anchor_pos=tuple(pos[anchor_global]),
-                                                dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                                anchor_mode=str(anchor_mode_used)))
+                    if migrated_flag:
+                        qc_flags2 = qc_flags + ["migrated_pre_screen"]
+                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "migrated", site, qc_flags=";".join(qc_flags2), **base_kwargs))
                         continue
 
                     # Energy blow-up checks (robust against slab size)
                     if (not np.isfinite(e_total)) or (not np.isfinite(e_pa)):
-                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_nan", site,
-                                                atoms_relaxed=atoms if return_raw else None,
-                                                anchor_pos=tuple(pos[anchor_global]),
-                                                dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                                anchor_mode=str(anchor_mode_used)))
+                        qc_flags2 = qc_flags + ["energy_nan"]
+                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_nan", site, qc_flags=";".join(qc_flags2), **base_kwargs))
                         continue
                     if abs(e_total) > float(settings.max_energy_abs_total):
-                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_blowup_total", site,
-                                                atoms_relaxed=atoms if return_raw else None,
-                                                anchor_pos=tuple(pos[anchor_global]),
-                                                dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                                anchor_mode=str(anchor_mode_used)))
+                        qc_flags2 = qc_flags + ["energy_blowup_total"]
+                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_blowup_total", site, qc_flags=";".join(qc_flags2), **base_kwargs))
                         continue
                     if abs(e_pa) > float(settings.max_energy_abs_per_atom):
-                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_blowup_per_atom", site,
-                                                atoms_relaxed=atoms if return_raw else None,
-                                                anchor_pos=tuple(pos[anchor_global]),
-                                                dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                                anchor_mode=str(anchor_mode_used)))
+                        qc_flags2 = qc_flags + ["energy_blowup_per_atom"]
+                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_blowup_per_atom", site, qc_flags=";".join(qc_flags2), **base_kwargs))
                         continue
                     if e_pa > float(settings.max_energy_pos_per_atom):
-                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_pos_per_atom", site,
-                                                atoms_relaxed=atoms if return_raw else None,
-                                                anchor_pos=tuple(pos[anchor_global]),
-                                                dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                                anchor_mode=str(anchor_mode_used)))
+                        qc_flags2 = qc_flags + ["energy_pos_per_atom"]
+                        outs.append(ScreenResult(label, site.kind, ads, e_total, disp, False, "energy_pos_per_atom", site, qc_flags=";".join(qc_flags2), **base_kwargs))
                         continue
 
-                    outs.append(ScreenResult(label, site.kind, ads, e_total, disp, True, "ok", site,
-                                            atoms_relaxed=atoms if return_raw else None,
-                                            anchor_pos=tuple(pos[anchor_global]),
-                                            dmin=dmin, e_per_atom=e_pa, converged=converged, n_atoms=n_atoms,
-                                            anchor_mode=str(anchor_mode_used)))
+                    outs.append(ScreenResult(label, site.kind, ads, e_total, disp, True, "ok", site, qc_flags=";".join(qc_flags), **base_kwargs))
 
                 except Exception as e:
                     outs.append(
@@ -554,6 +775,14 @@ def screen_sites_adsorbml_lite(
                             reason=f"exception:{str(e)}",
                             site=site,
                             anchor_mode=str(am) if am is not None else "",
+                            seed_kind=_normalize_site_kind(site.kind),
+                            initial_site_kind=_normalize_site_kind(site.kind),
+                            final_site_kind="unknown",
+                            migration_basis="exception",
+                            migration_type="exception",
+                            migrated=False,
+                            seed_surface_indices=_fmt_surface_indices(getattr(site, "surface_indices", ())),
+                            qc_flags="exception",
                         )
                     )
 
@@ -608,7 +837,8 @@ def union_topk_sites(
     site_map: Dict[str, AdsSite] = {}
     struct_map: Dict[str, Atoms] = {}
     for j, it in enumerate(union_items):
-        label = f"ML_{j}_{it.adsorbate.replace('*','')}_{it.kind}"
+        kind_label = str(getattr(it, "final_site_kind", getattr(it, "kind", "unknown")) or getattr(it, "kind", "unknown"))
+        label = f"ML_{j}_{it.adsorbate.replace('*','')}_{kind_label}"
         site_map[label] = it.site
         if it.atoms_relaxed is not None:
             struct_map[label] = it.atoms_relaxed

@@ -7,8 +7,8 @@ from typing import List, Literal, Tuple, Dict
 import numpy as np
 from ase import Atoms, Atom
 
-# Site types: ontop / bridge / fcc
-AdsKind = Literal["ontop", "bridge", "fcc"]
+# Site types: ontop / bridge / hollow (legacy aliases fcc / hcp kept for compatibility)
+AdsKind = Literal["ontop", "bridge", "hollow", "fcc", "hcp"]
 
 
 @dataclass
@@ -108,14 +108,46 @@ def _oxide_o_based_ads_position(
     return float(o_pos[0]), float(o_pos[1]), h_pos_z
 
 
+def _z_layer_groups(pos: np.ndarray, z_tol: float = 0.6) -> List[np.ndarray]:
+    """Cluster atoms into z-layers ordered from top to bottom."""
+    if pos.size == 0:
+        return []
+    z = np.asarray(pos[:, 2], dtype=float)
+    order = np.argsort(z)[::-1]
+    groups: List[List[int]] = []
+    z_refs: List[float] = []
+    for idx in order.tolist():
+        zi = float(z[idx])
+        if (not groups) or abs(zi - z_refs[-1]) > float(z_tol):
+            groups.append([int(idx)])
+            z_refs.append(zi)
+        else:
+            groups[-1].append(int(idx))
+    return [np.asarray(g, dtype=int) for g in groups]
+
+
 def _build_sites_from_top_indices(
     pos: np.ndarray,
     top_idx: np.ndarray,
     h_ontop: float = 1.0,
     h_bridge: float = 1.1,
     h_hollow: float = 1.2,
+    second_idx: np.ndarray | None = None,
+    hcp_match_frac: float = 0.35,
+    *,
+    hollow_kind: str = "fcc",
+    split_hollow: bool = False,
 ) -> List[AdsSite]:
-    """Generate ontop/bridge/fcc AdsSite objects from a set of top-layer indices."""
+    """Generate ontop/bridge/hollow-type AdsSite objects from a set of top-layer indices.
+
+    Parameters
+    ----------
+    hollow_kind
+        Label to assign to 3-fold hollow sites when split_hollow=False.
+    split_hollow
+        If True, try to split hollow sites into fcc/hcp using second-layer registry.
+        If False, all hollow sites are labeled with hollow_kind.
+    """
     if len(top_idx) == 0:
         raise ValueError("Top-layer index set is empty in _build_sites_from_top_indices.")
 
@@ -125,16 +157,15 @@ def _build_sites_from_top_indices(
     n_top = len(top_idx)
 
     # --- 1) Pairwise distances → edge / triangle candidates ---
-    diff = xy[:, None, :] - xy[None, :, :]   # (n_top, n_top, 2)
-    dmat = np.sqrt((diff ** 2).sum(axis=-1)) # (n_top, n_top)
-    dmat += np.eye(n_top) * 1e6              # Mask self-distances with large value
+    diff = xy[:, None, :] - xy[None, :, :]
+    dmat = np.sqrt((diff ** 2).sum(axis=-1))
+    dmat += np.eye(n_top) * 1e6
 
     d_min = float(dmat.min())
     if not np.isfinite(d_min) or d_min <= 0.0:
         raise ValueError("Failed to determine nearest-neighbor distance on top layer.")
 
-    # Set edge cutoff with some margin above nearest-neighbor distance
-    cut_edge = 1.6 * d_min
+    cut_edge = 1.25 * d_min
 
     edges = set()
     for i in range(n_top):
@@ -142,7 +173,6 @@ def _build_sites_from_top_indices(
             if dmat[i, j] < cut_edge:
                 edges.add((i, j))
 
-    # Basic triangle detection: all three edges must be present
     triangles: List[Tuple[int, int, int]] = []
     for i in range(n_top):
         for j in range(i + 1, n_top):
@@ -150,9 +180,8 @@ def _build_sites_from_top_indices(
                 if (i, j) in edges and (i, k) in edges and (j, k) in edges:
                     triangles.append((i, j, k))
 
-    # Fallback: if no triangles found, relax to "similar-length triangles"
     if not triangles:
-        cut_tri = 1.8 * d_min
+        cut_tri = 1.35 * d_min
         for i in range(n_top):
             for j in range(i + 1, n_top):
                 for k in range(j + 1, n_top):
@@ -161,15 +190,14 @@ def _build_sites_from_top_indices(
                     djk = dmat[j, k]
                     dmax = max(dij, dik, djk)
                     dmin_loc = min(dij, dik, djk)
-                    if dmax < cut_tri and dmax / max(dmin_loc, 1e-8) < 1.4:
+                    if dmax < cut_tri and dmax / max(dmin_loc, 1e-8) < 1.15:
                         triangles.append((i, j, k))
 
-    # --- 2) Build AdsSite list ---
     ads_sites: List[AdsSite] = []
 
-    # 2-1) ontop: directly above each top-layer atom
+    # ontop
     for idx in top_idx:
-        x, y, z = pos[idx]
+        x, y, _ = pos[idx]
         ads_sites.append(
             AdsSite(
                 kind="ontop",
@@ -178,13 +206,11 @@ def _build_sites_from_top_indices(
             )
         )
 
-    # 2-2) bridge: midpoint of each edge
-    for i_local, j_local in edges:
+    # bridge
+    for i_local, j_local in sorted(edges):
         ia = top_idx[i_local]
         ib = top_idx[j_local]
-        pa = pos[ia]
-        pb = pos[ib]
-        center = 0.5 * (pa + pb)
+        center = 0.5 * (pos[ia] + pos[ib])
         x, y = center[:2]
         ads_sites.append(
             AdsSite(
@@ -193,17 +219,31 @@ def _build_sites_from_top_indices(
                 surface_indices=(int(ia), int(ib)),
             )
         )
+    second_xy = None
+    if second_idx is not None and len(second_idx) > 0:
+        second_xy = pos[np.asarray(second_idx, dtype=int), :2]
 
-    # 2-3) fcc: triangle barycenter
+    hcp_tol = float(max(0.15, hcp_match_frac * d_min))
+
+    # hollow (single "hollow" label by default; optional fcc/hcp split kept for compatibility)
     for i_local, j_local, k_local in triangles:
         ia = top_idx[i_local]
         ib = top_idx[j_local]
         ic = top_idx[k_local]
-        p = (pos[ia] + pos[ib] + pos[ic]) / 3.0
-        x, y = p[:2]
+        centroid = (pos[ia] + pos[ib] + pos[ic]) / 3.0
+        x, y = centroid[:2]
+
+        kind = str(hollow_kind)
+        if split_hollow and second_xy is not None and len(second_xy) > 0:
+            d2 = np.linalg.norm(second_xy - np.asarray([x, y])[None, :], axis=1)
+            if np.isfinite(d2).any() and float(np.min(d2)) <= hcp_tol:
+                kind = "hcp"
+            else:
+                kind = "fcc"
+
         ads_sites.append(
             AdsSite(
-                kind="fcc",
+                kind=kind,
                 position=(float(x), float(y), float(z_surf + h_hollow)),
                 surface_indices=(int(ia), int(ib), int(ic)),
             )
@@ -278,7 +318,7 @@ def _dedupe_sites(
 
     # 3) Enforce maximum count per kind
     out: List[AdsSite] = []
-    count: Dict[str, int] = {"ontop": 0, "bridge": 0, "fcc": 0}
+    count: Dict[str, int] = {"ontop": 0, "bridge": 0, "hollow": 0, "fcc": 0, "hcp": 0}
     for site in deduped:
         c = count.get(site.kind, 0)
         if c >= max_sites_per_kind:
@@ -289,6 +329,31 @@ def _dedupe_sites(
     return out
 
 
+
+def _fallback_center_hollow_site(pos: np.ndarray, top_idx: np.ndarray, h_hollow: float = 1.2) -> AdsSite | None:
+    """Best-effort fallback hollow seed from the 3 top-layer atoms nearest the in-plane center.
+
+    Used only when no triangle-based hollow site is detected. This is a conservative rescue path
+    for close-packed metal slabs where z-layer grouping / edge pruning missed a 3-fold hollow.
+    """
+    if top_idx is None or len(top_idx) < 3:
+        return None
+    top_idx = np.asarray(top_idx, dtype=int)
+    top_xy = pos[top_idx][:, :2]
+    center_xy = np.mean(top_xy, axis=0)
+    d = np.linalg.norm(top_xy - center_xy[None, :], axis=1)
+    order = np.argsort(d)
+    pick = top_idx[order[:3]]
+    if len(pick) < 3:
+        return None
+    centroid = np.mean(pos[pick], axis=0)
+    z_surf = float(np.mean(pos[top_idx][:, 2]))
+    return AdsSite(
+        kind="hollow",
+        position=(float(centroid[0]), float(centroid[1]), float(z_surf + h_hollow)),
+        surface_indices=tuple(int(i) for i in pick.tolist()),
+    )
+
 # ----------------  Metal (111) slab  ----------------
 
 def detect_metal_111_sites(
@@ -298,19 +363,30 @@ def detect_metal_111_sites(
     h_hollow: float = 1.2,
     max_sites_per_kind: int = 50,
 ) -> List[AdsSite]:
-    """Detect ontop/bridge/fcc adsorption sites on a metal (111)-like slab."""
-    top_idx = _top_layer_indices_z(atoms, z_tol=0.8)
-    if len(top_idx) == 0:
+    """Detect ontop/bridge/hollow adsorption sites on a metal (111)-like slab."""
+    pos = atoms.positions
+    layers = _z_layer_groups(pos, z_tol=0.6)
+    if not layers:
         raise ValueError("Could not identify top surface layer for metal slab.")
 
-    pos = atoms.positions
+    top_idx = layers[0]
     raw_sites = _build_sites_from_top_indices(
         pos,
         top_idx,
         h_ontop=h_ontop,
         h_bridge=h_bridge,
         h_hollow=h_hollow,
+        hollow_kind="hollow",
+        split_hollow=False,
     )
+
+    # Rescue path: if no hollow was detected at all, synthesize one from the 3 top-layer atoms
+    # nearest the in-plane center. This keeps the metal branch from collapsing to ontop/bridge only.
+    if not any(str(getattr(s, "kind", "")) == "hollow" for s in raw_sites):
+        fb = _fallback_center_hollow_site(pos, top_idx, h_hollow=h_hollow)
+        if fb is not None:
+            raw_sites.append(fb)
+
     cell = atoms.get_cell()
     return _dedupe_sites(
         raw_sites,
@@ -377,13 +453,13 @@ def select_representative_sites(
     per_kind: int = 2,
 ) -> List[AdsSite]:
     """
-    Select 1..per_kind representative sites per kind (ontop/bridge/fcc)
+    Select 1..per_kind representative sites per kind (ontop/bridge/hollow; legacy fcc/hcp aliases allowed)
     using greedy farthest-point sampling to maximize spatial diversity.
     """
     if not sites or per_kind <= 0:
         return []
 
-    by_kind: Dict[str, List[AdsSite]] = {"ontop": [], "bridge": [], "fcc": []}
+    by_kind: Dict[str, List[AdsSite]] = {"ontop": [], "bridge": [], "hollow": [], "fcc": [], "hcp": []}
     for s in sites:
         by_kind.setdefault(s.kind, []).append(s)
 
@@ -556,12 +632,12 @@ def generate_candidate_sites(
     geom_per_kind: int = 2,
     n_random: int = 12,
     rng_seed: int = 0,
-    random_kind: str = "fcc",
+    random_kind: str = "hollow",
 ) -> list[AdsSite]:
     """
     Generate a richer candidate site list for screening:
       (1) geometry-based seeds (representative sites) per kind
-      (2) random (x,y) probes on the surface plane (kind = random_kind)
+      (2) random (x,y) probes on the surface plane (kind = random_kind (for metal, legacy fcc/hcp are remapped to hollow))
 
     Parameters
     ----------
@@ -574,7 +650,7 @@ def generate_candidate_sites(
     rng_seed : int
         RNG seed.
     random_kind : str
-        Kind label for random probe sites (e.g., "fcc", "bridge", "ontop").
+        Kind label for random probe sites (e.g., "hollow", "bridge", "ontop"). Legacy metal labels fcc/hcp are remapped to hollow.
 
     Returns
     -------
@@ -597,6 +673,9 @@ def generate_candidate_sites(
     n_random = int(max(0, n_random))
     if n_random > 0:
         rng = np.random.default_rng(int(rng_seed))
+        random_kind_eff = str(random_kind)
+        if mtype == "metal" and random_kind_eff in {"fcc", "hcp"}:
+            random_kind_eff = "hollow"
         cell = np.asarray(slab_atoms.get_cell(), dtype=float)
         a = cell[0, :2]
         b = cell[1, :2]
@@ -611,7 +690,7 @@ def generate_candidate_sites(
             xy = u * a + v * b
             cand.append(
                 AdsSite(
-                    kind=str(random_kind),
+                    kind=str(random_kind_eff),
                     position=(float(xy[0]), float(xy[1]), float(z_probe)),
                     surface_indices=(),
                 )

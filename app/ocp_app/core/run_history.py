@@ -144,6 +144,15 @@ def _build_warnings_from_df(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
     if "qa" in df.columns:
         qa = df["qa"].astype(str).str.lower().value_counts(dropna=False).to_dict()
         out["qa_counts"] = qa
+    if "qc_flags" in df.columns:
+        flags = df["qc_flags"].astype(str).fillna("")
+        out["n_qc_flagged"] = int((flags.str.strip() != "").sum())
+    if "migration_type" in df.columns:
+        mt = df["migration_type"].astype(str).str.lower()
+        out["migration_type_counts"] = mt.value_counts(dropna=False).to_dict()
+    if "final_site_kind" in df.columns:
+        fk = df["final_site_kind"].astype(str).str.lower()
+        out["final_site_kind_counts"] = fk.value_counts(dropna=False).to_dict()
     return out
 
 
@@ -286,7 +295,7 @@ def make_history_record_from_last_run(
     - You can optionally attach csv_bytes and prepared_cif_bytes (session-only)
     """
     is_her = bool(last_run.get("is_her", False))
-    mode_label = "HER" if is_her else "CO2RR"
+    mode_label = _safe_str(last_run.get("mode_label"), "HER" if is_her else "CO2RR")
     mtype = _safe_str(last_run.get("mtype", ""))
 
     metric_name, metric_val, site_lbl = _pick_best_metric_from_df(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), is_her=is_her)
@@ -300,6 +309,8 @@ def make_history_record_from_last_run(
         badges.append(f"dup={_coerce_int(warn['n_duplicate'])}")
     if "n_unreliable" in warn and _coerce_int(warn["n_unreliable"]) > 0:
         badges.append(f"unrel={_coerce_int(warn['n_unreliable'])}")
+    if "n_qc_flagged" in warn and _coerce_int(warn["n_qc_flagged"]) > 0:
+        badges.append(f"qc={_coerce_int(warn['n_qc_flagged'])}")
     badge_str = (", ".join(badges)) if badges else "ok"
 
     val_str = "n/a" if metric_val is None else f"{metric_val:.3f}"
