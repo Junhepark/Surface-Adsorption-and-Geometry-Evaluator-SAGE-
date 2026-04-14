@@ -189,15 +189,15 @@ In this sense, SAGE should be viewed as a **workflow-level application for surfa
 
 To test whether the workflow yields physically reasonable adsorption trends on well-known metal surfaces, SAGE-calculated ΔG_H values were compared against representative literature values from the Norskov framework.
 
-| Metal surface | Calculated ΔG_H (eV) | Norskov θ = 0.25 (eV) | Difference (eV) |
-|---------------|----------------------|------------------------|-----------------|
-| Ni(111) | -0.255 | -0.27 | +0.015 |
-| Co(111) | -0.271 | -0.27 | -0.001 |
-| Pt(111) | -0.100 | -0.09 | -0.010 |
-| Pd(111) | -0.168 | -0.14 | -0.028 |
-| Rh(111) | -0.117 | -0.10 | -0.017 |
-| Cu(111) | +0.178 | +0.19 | -0.012 |
-| Ag(111) | +0.555 | +0.51 | +0.045 |
+| Metal surface | Calculated ΔG_H (eV) | Norskov θ = 0.25 (eV) | Difference (eV) | mp-number |
+|---------------|----------------------|------------------------|-----------------|-----------------|
+| Ni(111) | -0.255 | -0.27 | +0.015 | mp-23 | 
+| Co(111) | -0.271 | -0.27 | -0.001 | mp-102 | 
+| Pt(111) | -0.100 | -0.09 | -0.010 | mp-126 | 
+| Pd(111) | -0.168 | -0.14 | -0.028 | mp-2 | 
+| Rh(111) | -0.117 | -0.10 | -0.017 | mp-74 | 
+| Cu(111) | +0.178 | +0.19 | -0.012 | mp-30 | 
+| Ag(111) | +0.555 | +0.51 | +0.045 | mp-124 | 
 
 Across these benchmark surfaces, the mean absolute deviation is approximately **0.018 eV**.  
 This level of agreement suggests that the SAGE workflow can recover the expected relative adsorption trends for common metallic HER benchmarks while keeping the entire structure-to-ranking pipeline within one interface.
