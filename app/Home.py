@@ -84,6 +84,9 @@ from ocp_app.core.structure_ops import (
     repeat_xy,
     _surface_xy_lengths,
     _suggest_minimal_xy_repeat,
+    slab_thickness_z,
+    suggest_active_region_crop,
+    crop_top_slab_window,
 )
 from ocp_app.ui.viewers import _render_min_dist_panel, show_atoms_3d
 from ocp_app.core.oxide_surface_rules import (
@@ -227,6 +230,71 @@ except Exception:
 
 
 # ---- Convenience helpers (mp-id normalize, tuning defaults, min-distance panel) ----
+
+def _safe_float(val, default=np.nan):
+    try:
+        return float(val)
+    except Exception:
+        return float(default)
+
+
+def _resolve_relaxed_structure_path(row: pd.Series | dict, csv_path: str | Path | None = None):
+    """Best-effort resolver for post-run relaxed structure CIF paths.
+
+    Priority:
+      1) explicit row['structure_cif'] when present
+      2) infer from csv output root: <root>/sample/sites/user_<site_label>_H.cif
+      3) infer adsorbate-specific path: <root>/sample/sites/user_<site_label>_<ADS>.cif
+    """
+    row = row if isinstance(row, dict) else dict(row)
+    explicit = row.get("structure_cif", None)
+    if explicit:
+        p = Path(str(explicit)).expanduser()
+        if p.is_file():
+            return p
+
+    root = None
+    if csv_path:
+        try:
+            root = Path(str(csv_path)).expanduser().resolve().parent
+        except Exception:
+            try:
+                root = Path(str(csv_path)).expanduser().parent
+            except Exception:
+                root = None
+
+    site_label = str(row.get("site_label", "")).strip()
+    site_label_file = site_label.replace(":", "__") if site_label else ""
+    ads = str(row.get("adsorbate", "")).replace("*", "").strip().upper()
+
+    candidates = []
+    if root is not None and site_label_file:
+        if ads:
+            candidates.append(root / "sample" / "sites" / f"user_{site_label_file}_{ads}.cif")
+        candidates.append(root / "sample" / "sites" / f"user_{site_label_file}_H.cif")
+
+    for p in candidates:
+        try:
+            if Path(p).is_file():
+                return Path(p)
+        except Exception:
+            pass
+
+    return None
+
+
+def _format_relaxed_view_option(row: pd.Series | dict, is_her: bool = True) -> str:
+    row = row if isinstance(row, dict) else dict(row)
+    site_label = str(row.get("site_label", "?"))
+    relaxed_site = str(row.get("relaxed_site", row.get("final_site_kind", "?")))
+    reliability = str(row.get("reliability", ""))
+    if is_her:
+        dg = _safe_float(row.get("ΔG_H(U,pH) (eV)", row.get("ΔG_H (eV)", np.nan)))
+        return f"{site_label} | final={relaxed_site} | ΔG_H(U,pH)={dg:.3f} eV | {reliability}"
+    ads = str(row.get("adsorbate", "?"))
+    qa = str(row.get("qa", reliability or ""))
+    dg = _safe_float(row.get("ΔG_ads (eV)", np.nan))
+    return f"{ads} | {site_label} | final={relaxed_site} | ΔG_ads={dg:.3f} eV | {qa}"
 
 
 # ---------------- Sidebar: global options ----------------
@@ -796,6 +864,100 @@ else:
     _ensure_prepared_uptodate()
     atoms_for_sites = st.session_state.get("atoms_prepared")
 
+    st.markdown("### Structure preview and optional active-region z crop")
+    prev3_col, crop3_col = st.columns([1.45, 0.85])
+    with prev3_col:
+        show_atoms_3d(atoms_for_sites, height=420, width=900, tag="step3_prepared_preview")
+    with crop3_col:
+        rep_step3 = validate_structure(atoms_for_sites, target_area=70.0)
+        vac_z_step3 = float(getattr(rep_step3, "vacuum_z", 0.0))
+        crop_diag_step3 = suggest_active_region_crop(
+            atoms_for_sites,
+            thickness_threshold_A=12.0,
+            atoms_threshold=160,
+            default_window_A=10.0,
+        )
+        slab_thk_step3 = float(crop_diag_step3.get("slab_thickness_A", float("nan")))
+        st.write(f"- Atoms: **{len(atoms_for_sites)}**")
+        st.write(f"- Vacuum_z: **{vac_z_step3:.2f} Å**")
+        st.write(
+            f"- Slab thickness: **{slab_thk_step3:.2f} Å**"
+            if np.isfinite(slab_thk_step3)
+            else "- Slab thickness: **n/a**"
+        )
+
+        if (vac_z_step3 < 10.0) and bool(atoms_for_sites.get_pbc()[2]):
+            st.warning(
+                f"Prepared structure is BULK-like (vacuum_z={vac_z_step3:.2f} Å, pbc_z=True). "
+                "Adsorption sites may collapse and results may be unreliable."
+            )
+
+        auto_crop_default_step3 = bool(crop_diag_step3.get("recommend_crop", False))
+        if auto_crop_default_step3:
+            st.warning(
+                "The current slab is deep along z and may destabilize adsorption relaxation. "
+                "Crop the upper active region before site generation / screening?"
+            )
+        else:
+            st.caption(
+                "You can still crop manually if you only need surface ΔG_H/ΔG_ads rather than deep subsurface effects."
+            )
+
+        use_step3_crop = st.checkbox(
+            "Use active-region z crop",
+            value=auto_crop_default_step3,
+            key="use_step3_active_crop",
+        )
+
+        if use_step3_crop:
+            crop_keep_top_window_step3 = st.number_input(
+                "Keep top active window (Å)",
+                min_value=6.0,
+                max_value=20.0,
+                value=float(crop_diag_step3.get("suggested_window_A", 10.0)),
+                step=0.5,
+                key="crop_keep_top_window_step3_A",
+            )
+            crop_target_vac_step3 = st.number_input(
+                "Target vacuum after crop (Å)",
+                min_value=12.0,
+                max_value=60.0,
+                value=max(20.0, float(vac_z_step3) if np.isfinite(vac_z_step3) else 30.0),
+                step=1.0,
+                key="crop_target_vacuum_step3_A",
+            )
+            crop_min_layers_step3 = st.number_input(
+                "Minimum preserved z-layers",
+                min_value=2,
+                max_value=12,
+                value=4,
+                step=1,
+                key="crop_min_layers_step3",
+            )
+            if st.button("Apply z crop to prepared structure", key="btn_apply_step3_crop"):
+                try:
+                    a2, crop_meta = crop_top_slab_window(
+                        atoms_for_sites,
+                        keep_top_window_A=float(crop_keep_top_window_step3),
+                        target_vacuum_z=float(crop_target_vac_step3),
+                        keep_pbc_z=True,
+                        min_layers=int(crop_min_layers_step3),
+                        min_atoms=16,
+                        layer_tol=0.8,
+                    )
+                    _push_prepared_update(a2, "crop_top_window_step3", crop_meta)
+                    if bool(crop_meta.get("cropped", False)):
+                        st.success(
+                            f"Applied active-region z crop: kept {crop_meta.get('kept_atoms')} atoms, "
+                            f"removed {crop_meta.get('removed_atoms')} atoms, thickness "
+                            f"{crop_meta.get('original_thickness_A', float('nan')):.2f} → {crop_meta.get('cropped_thickness_A', float('nan')):.2f} Å."
+                        )
+                    else:
+                        st.info("No effective z crop was needed. Vacuum was normalized and the prepared structure was refreshed.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Active-region z crop failed: {e}")
+
     # --- Surfactant-class scenario (structural conditioning) ---
     # Placed here (Step 3) because this feature changes the *structure* used for site enumeration / adsorption,
     # not a CHE correction term.
@@ -1272,8 +1434,67 @@ else:
             key="pH_input",
         )
 
+    # HER thermochemistry mode
+    thermo_mode = "CHE correction (fast screening)"
+    zpe_target_mode = "Best-ranked by CHE"
+    zpe_target_label = None
+    local_zpe_cutoff = 2.5
+    local_zpe_max_neighbors = 3
+
+    if is_her:
+        st.markdown("### HER thermochemistry")
+        thermo_mode = st.selectbox(
+            "HER thermochemistry mode",
+            [
+                "CHE correction (fast screening)",
+                "Local ZPE correction (selected structure)",
+                "Local ZPE correction (all structures)",
+            ],
+            index=0,
+            key="her_thermo_mode",
+        )
+
+        ctm1, ctm2, ctm3 = st.columns(3)
+        with ctm1:
+            zpe_target_mode = st.selectbox(
+                "Selected structure rule",
+                ["Best-ranked by CHE", "User-selected site label"],
+                index=0,
+                key="zpe_target_mode",
+                disabled=(thermo_mode != "Local ZPE correction (selected structure)"),
+            )
+        with ctm2:
+            local_zpe_cutoff = st.number_input(
+                "Local ZPE neighbor cutoff (Å)",
+                min_value=1.5,
+                max_value=4.0,
+                value=2.5,
+                step=0.1,
+                key="local_zpe_cutoff",
+                disabled=(thermo_mode == "CHE correction (fast screening)"),
+            )
+        with ctm3:
+            local_zpe_max_neighbors = st.number_input(
+                "Max local neighbors",
+                min_value=1,
+                max_value=8,
+                value=3,
+                step=1,
+                key="local_zpe_max_neighbors",
+                disabled=(thermo_mode == "CHE correction (fast screening)"),
+            )
+
+        if thermo_mode == "Local ZPE correction (selected structure)" and zpe_target_mode == "User-selected site label":
+            zpe_target_label = st.text_input(
+                "Target site label",
+                value="",
+                key="zpe_target_label",
+                help="Example: ontop_0, bridge_1",
+            ).strip() or None
+
     if (not is_her):
         st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. ORR additionally writes a step-wise summary file (results_orr_summary.csv) using the entered U for one-electron CHE shifts.")
+
 
     # Defaults (so variables exist regardless of mode)
     co2rr_her_guardrail = False
@@ -1365,6 +1586,7 @@ else:
             )
     else:
         st.warning("No prepared structure available yet. Complete Step 1–3 first.")
+
     if st.button("Run Calculation", type="primary", key="btn_run_calc"):
         if atoms_for_calc is None:
             st.error("No prepared structure available.")
@@ -1416,6 +1638,11 @@ else:
                         relax_mode=relax_mode,
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         use_net_corr=True,
+                        thermo_mode=thermo_mode,
+                        zpe_target_mode=zpe_target_mode,
+                        zpe_target_label=zpe_target_label,
+                        local_zpe_cutoff=float(local_zpe_cutoff),
+                        local_zpe_max_neighbors=int(local_zpe_max_neighbors),
                     )
                 else:
                     csv_path, meta = run_oxide_che(
@@ -1424,6 +1651,11 @@ else:
                         relax_mode=relax_mode,
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         use_che_shift=True,
+                        thermo_mode=thermo_mode,
+                        zpe_target_mode=zpe_target_mode,
+                        zpe_target_label=zpe_target_label,
+                        local_zpe_cutoff=float(local_zpe_cutoff),
+                        local_zpe_max_neighbors=int(local_zpe_max_neighbors),
                     )
             elif is_orr:
                 # ── ORR branch ─────────────────────────────────────────
@@ -1747,6 +1979,84 @@ if last_run is not None:
                 "text/csv",
                 key="dl_co2rr_candidates_all",
             )
+
+    # --- Relaxed post-run structure viewer ---
+    viewer_frames = {}
+    df_dedup = locals().get("df_dedup", pd.DataFrame())
+    df_keep = locals().get("df_keep", pd.DataFrame())
+    df_reject = locals().get("df_reject", pd.DataFrame())
+
+    if bool(last_run.get("is_her")):
+        if isinstance(df_rel, pd.DataFrame) and (not df_rel.empty):
+            viewer_frames["Reliable results"] = df_rel
+        if isinstance(df_unrel, pd.DataFrame) and (not df_unrel.empty):
+            viewer_frames["Unreliable / unstable"] = df_unrel
+        if (not viewer_frames) and isinstance(df, pd.DataFrame) and (not df.empty):
+            viewer_frames["All results"] = df
+    else:
+        if isinstance(df_dedup, pd.DataFrame) and (not df_dedup.empty):
+            viewer_frames["Candidates (dedup)"] = df_dedup
+        if isinstance(df_keep, pd.DataFrame) and (not df_keep.empty):
+            viewer_frames["All candidate attempts"] = df_keep
+        if isinstance(df_reject, pd.DataFrame) and (not df_reject.empty):
+            viewer_frames["Rejected attempts"] = df_reject
+        if (not viewer_frames) and isinstance(df, pd.DataFrame) and (not df.empty):
+            viewer_frames["All results"] = df
+
+    if viewer_frames:
+        with st.expander("Relaxed post-run structure viewer", expanded=False):
+            viewer_source = st.selectbox(
+                "Result group",
+                list(viewer_frames.keys()),
+                index=0,
+                key="relaxed_view_source",
+            )
+            viewer_df = viewer_frames.get(viewer_source, pd.DataFrame()).reset_index(drop=True)
+
+            if isinstance(viewer_df, pd.DataFrame) and (not viewer_df.empty):
+                option_labels = [_format_relaxed_view_option(r, is_her=bool(last_run.get("is_her"))) for _, r in viewer_df.iterrows()]
+                viewer_idx = st.selectbox(
+                    "Select relaxed structure",
+                    list(range(len(option_labels))),
+                    format_func=lambda i: option_labels[i],
+                    index=0,
+                    key=f"relaxed_view_idx_{viewer_source}",
+                )
+
+                viewer_row = viewer_df.iloc[int(viewer_idx)]
+                viewer_path = _resolve_relaxed_structure_path(viewer_row, csv_path=last_run.get("csv_path"))
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("site_label", str(viewer_row.get("site_label", "?")))
+                m2.metric("initial", str(viewer_row.get("initial_site_kind", viewer_row.get("requested_site", "?"))))
+                m3.metric("final", str(viewer_row.get("final_site_kind", viewer_row.get("relaxed_site", "?"))))
+                disp_view = _safe_float(viewer_row.get("H_lateral_disp(Å)", viewer_row.get("ads_lateral_disp(Å)", np.nan)))
+                m4.metric("disp (Å)", f"{disp_view:.2f}" if np.isfinite(disp_view) else "n/a")
+
+                extra_cols = [c for c in [
+                    "migrated", "reliability", "qa", "ΔG_H(U,pH) (eV)", "ΔG_H (eV)",
+                    "ΔG_H_CHE (eV)", "ΔG_H_local (eV)", "local_thermo_corr (eV)",
+                    "ΔG_ads (eV)", "ΔE_H_user (eV)", "ΔE_ads_user (eV)",
+                    "zpe_scope", "zpe_selected_atoms", "zpe_warning"
+                ] if c in viewer_row.index]
+                if extra_cols:
+                    st.dataframe(pd.DataFrame([viewer_row[extra_cols].to_dict()]), use_container_width=True)
+
+                if viewer_path is not None and Path(viewer_path).is_file():
+                    try:
+                        at_view = read(str(viewer_path))
+                        show_atoms_3d(at_view, height=460, width=900, tag=f"relaxed_view_{viewer_source}_{viewer_idx}")
+                        st.download_button(
+                            "Download selected relaxed CIF",
+                            Path(viewer_path).read_bytes(),
+                            Path(viewer_path).name,
+                            "chemical/x-cif",
+                            key=f"dl_relaxed_cif_{viewer_source}_{viewer_idx}",
+                        )
+                    except Exception as e:
+                        st.warning(f"Could not render relaxed CIF: {e}")
+                else:
+                    st.info("Relaxed CIF path could not be resolved for this row. If needed, add 'structure_cif' to the exported result rows in CHE_mode.")
 
     # download full results
     try:
