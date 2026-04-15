@@ -38,6 +38,8 @@ from ocp_app.core.anchors.common import (
     site_energy_two_stage,
 )
 
+from ocp_app.core.anchors.local_zpe import compute_local_h_thermo_correction
+
 # =====================================================================
 # Unified CHE workflow (Metal & Oxide)
 #  - HER: ΔG_H (H* adsorption)
@@ -668,6 +670,11 @@ def _run_her_che(
     her_guardrail: bool = False,
     her_site_preference: str = "ontop",
     her_use_net_corr: bool = True,
+    thermo_mode: str = "CHE correction (fast screening)",
+    zpe_target_mode: str = "Best-ranked by CHE",
+    zpe_target_label: str | None = None,
+    local_zpe_cutoff: float = 2.5,
+    local_zpe_max_neighbors: int = 3,
 ):
     if gas != "H2":
         raise NotImplementedError("HER CHE_mode currently supports only 'H2' gas.")
@@ -776,6 +783,15 @@ def _run_her_che(
             "site": kind,
             "site_label": label,
             "seed_source": site_seed.get("seed_source"),
+            "structure_cif": str((UROOT / f"sites/user_{label}_H.cif").resolve()),
+            "n_slab_atoms": int(meta_flags["n_atoms"]),
+            "thermo_mode": str(thermo_mode),
+            "ΔG_H_CHE (eV)": float(dG_u),
+            "ΔG_H_local (eV)": np.nan,
+            "local_thermo_corr (eV)": np.nan,
+            "zpe_scope": "none",
+            "zpe_selected_atoms": "",
+            "zpe_warning": "",
             "seed_site_kind": tracking["seed_site_kind"],
             "initial_site_kind": tracking["initial_site_kind"],
             "final_site_kind": tracking["final_site_kind"],
@@ -814,15 +830,57 @@ def _run_her_che(
         rows.append(row)
         write(UROOT / f"sites/user_{label}_H.cif", Au)
 
+    # Second-pass HER thermochemistry refinement
+    if rows and str(thermo_mode) != "CHE correction (fast screening)":
+        df0 = pd.DataFrame(rows)
+        selected_idx = []
+
+        if str(thermo_mode) == "Local ZPE correction (selected structure)":
+            if str(zpe_target_mode) == "User-selected site label" and zpe_target_label:
+                mask = df0["site_label"].astype(str) == str(zpe_target_label)
+                selected_idx = df0.index[mask].tolist()[:1]
+            if not selected_idx:
+                selected_idx = df0["ΔG_H_CHE (eV)"].abs().sort_values().index.tolist()[:1]
+        elif str(thermo_mode) == "Local ZPE correction (all structures)":
+            selected_idx = df0.index.tolist()
+
+        for ridx in selected_idx:
+            try:
+                row = rows[int(ridx)]
+                cif_path = Path(str(row["structure_cif"]))
+                if not cif_path.is_file():
+                    row["zpe_warning"] = "structure_cif_missing"
+                    continue
+
+                slab_ads = read(str(cif_path))
+                zpe_meta = compute_local_h_thermo_correction(
+                    slab_ads,
+                    n_slab_atoms=int(row["n_slab_atoms"]),
+                    cutoff=float(local_zpe_cutoff),
+                    max_neighbors=int(local_zpe_max_neighbors),
+                )
+                local_corr = float(zpe_meta["local_corr_eV"])
+                row["ΔG_H_local (eV)"] = float(row["ΔE_H_user (eV)"] + local_corr)
+                row["local_thermo_corr (eV)"] = local_corr
+                row["zpe_scope"] = "selected" if str(thermo_mode) == "Local ZPE correction (selected structure)" else "all"
+                row["zpe_selected_atoms"] = ",".join(str(i) for i in zpe_meta.get("selected_indices", []))
+                row["zpe_warning"] = ";".join(zpe_meta.get("warnings", [])) if zpe_meta.get("warnings") else ""
+            except Exception as e:
+                rows[int(ridx)]["zpe_warning"] = f"local_zpe_failed:{e}"
+
     df = pd.DataFrame(rows)
-    if export_absolute and "ΔG_H (eV)" in df.columns:
-        df = df.assign(abs_val=lambda x: x["ΔG_H (eV)"].abs()).sort_values(
-            ["abs_val"]
-        )
+
+    if str(thermo_mode) == "CHE correction (fast screening)":
+        df["ΔG_H (eV)"] = df["ΔG_H_CHE (eV)"]
+    elif str(thermo_mode) == "Local ZPE correction (selected structure)":
+        df["ΔG_H (eV)"] = df["ΔG_H_local (eV)"].where(df["ΔG_H_local (eV)"].notna(), df["ΔG_H_CHE (eV)"])
     else:
-        df = df.assign(
-            abs_val=lambda x: x["ΔE_H_user (eV)"].abs()
-        ).sort_values(["abs_val"])
+        df["ΔG_H (eV)"] = df["ΔG_H_local (eV)"].where(df["ΔG_H_local (eV)"].notna(), df["ΔG_H_CHE (eV)"])
+
+    if export_absolute and "ΔG_H (eV)" in df.columns:
+        df = df.assign(abs_val=lambda x: x["ΔG_H (eV)"].abs()).sort_values(["abs_val"])
+    else:
+        df = df.assign(abs_val=lambda x: x["ΔE_H_user (eV)"].abs()).sort_values(["abs_val"])
 
     out_csv = out_root / "results_sites_her.csv"
     df.drop(columns=["abs_val"], errors="ignore").to_csv(
@@ -839,6 +897,11 @@ def _run_her_che(
         "thermo": {"NET_CORR": net_corr, "standard": f"{STANDARD_CHE_CORR:.2f} eV"},
         "E_H2": E_H2,
         "HER_GUARDRAIL": her_guard,
+        "thermo_mode": str(thermo_mode),
+        "zpe_target_mode": str(zpe_target_mode),
+        "zpe_target_label": zpe_target_label,
+        "local_zpe_cutoff": float(local_zpe_cutoff),
+        "local_zpe_max_neighbors": int(local_zpe_max_neighbors),
         "Model": MODEL_NAME,
         "Device": DEVICE,
         "warnings": {
@@ -2069,6 +2132,11 @@ def run_metal_che(
     her_guardrail: bool = False,
     her_site_preference: str = "ontop",
     her_use_net_corr: bool = True,
+    thermo_mode: str = "CHE correction (fast screening)",
+    zpe_target_mode: str = "Best-ranked by CHE",
+    zpe_target_label: str | None = None,
+    local_zpe_cutoff: float = 2.5,
+    local_zpe_max_neighbors: int = 3,
 ):
     return _run_her_che(
         "metal",
@@ -2085,6 +2153,11 @@ def run_metal_che(
         her_guardrail=her_guardrail,
         her_site_preference=her_site_preference,
         her_use_net_corr=her_use_net_corr,
+        thermo_mode=thermo_mode,
+        zpe_target_mode=zpe_target_mode,
+        zpe_target_label=zpe_target_label,
+        local_zpe_cutoff=local_zpe_cutoff,
+        local_zpe_max_neighbors=local_zpe_max_neighbors,
     )
 
 
@@ -2102,6 +2175,11 @@ def run_oxide_che(
     her_guardrail: bool = False,
     her_site_preference: str = "ontop",
     her_use_net_corr: bool = True,
+    thermo_mode: str = "CHE correction (fast screening)",
+    zpe_target_mode: str = "Best-ranked by CHE",
+    zpe_target_label: str | None = None,
+    local_zpe_cutoff: float = 2.5,
+    local_zpe_max_neighbors: int = 3,
 ):
     return _run_her_che(
         "oxide",
@@ -2118,6 +2196,11 @@ def run_oxide_che(
         her_guardrail=her_guardrail,
         her_site_preference=her_site_preference,
         her_use_net_corr=her_use_net_corr,
+        thermo_mode=thermo_mode,
+        zpe_target_mode=zpe_target_mode,
+        zpe_target_label=zpe_target_label,
+        local_zpe_cutoff=local_zpe_cutoff,
+        local_zpe_max_neighbors=local_zpe_max_neighbors,
     )
 
 
