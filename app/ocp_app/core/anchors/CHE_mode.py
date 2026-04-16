@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from ase import Atoms
 from ase.io import read, write
 from ase.constraints import FixAtoms
 from ase.optimize import BFGS
@@ -19,6 +20,7 @@ from ocp_app.core.ads_sites import (
     detect_oxide_surface_sites,
     expand_oxide_channels_for_adsorbate,
     oxide_surface_seed_position,
+    select_representative_sites,
     ANION_SYMBOLS,
 )
 from ocp_app.core.anchors.common import (
@@ -39,6 +41,7 @@ from ocp_app.core.anchors.common import (
 )
 
 from ocp_app.core.anchors.local_zpe import compute_local_h_thermo_correction
+from ocp_app.core.oxide_descriptor import run_oxide_descriptor_profile
 
 # =====================================================================
 # Unified CHE workflow (Metal & Oxide)
@@ -49,6 +52,18 @@ from ocp_app.core.anchors.local_zpe import compute_local_h_thermo_correction
 
 # --- HER CHE correction (calibrated on Ni(111)) ---
 STANDARD_CHE_CORR = 0.24  # eV
+
+THREE_STAGE_OXIDE_HER_CAUTION = (
+    "Caution: The O–H and reactive-H stages are evaluated using the OCP-based "
+    "relaxed-state workflow, whereas the H₂ pairing stage is only an approximate "
+    "release proxy rather than an explicit reaction barrier. The final-stage result "
+    "should therefore be used as a supportive screening indicator, not as a "
+    "quantitatively validated kinetic metric."
+)
+
+
+DESCRIPTOR_D1_DISP_THRESH_A = 1.20
+DESCRIPTOR_D2_DISP_THRESH_A = 1.00
 
 # --- CO2RR adsorbate-specific constant shifts (ZPE + TΔS lumped) ---
 # Defaults used when thermo_CO2RR.json is missing or cannot be parsed
@@ -655,6 +670,12 @@ def _build_target_sites(
 # ---------------------------------------------------------------------
 # HER mode
 # ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# HER mode
+# ---------------------------------------------------------------------
+
 def _run_her_che(
     mtype: str,
     user_slab_cif: str,
@@ -675,6 +696,9 @@ def _run_her_che(
     zpe_target_label: str | None = None,
     local_zpe_cutoff: float = 2.5,
     local_zpe_max_neighbors: int = 3,
+    oxide_descriptor_mode: str = "Basic HER screening",
+    oxide_descriptor_max_reactive_per_kind: int = 2,
+    oxide_descriptor_pair_limit: int = 6,
 ):
     if gas != "H2":
         raise NotImplementedError("HER CHE_mode currently supports only 'H2' gas.")
@@ -870,6 +894,28 @@ def _run_her_che(
 
     df = pd.DataFrame(rows)
 
+    oxide_descriptor_summary = None
+    if str(mtype).lower() == 'oxide' and str(oxide_descriptor_mode) != 'Basic HER screening':
+        try:
+            oxide_descriptor_summary = run_oxide_descriptor_profile(
+                slab_u_rel=slab_u_rel,
+                E_slab_u=float(E_slab_u),
+                E_H2=float(E_H2),
+                d1_rows_df=df.copy(),
+                d1_targets=target_sites,
+                out_root=out_root,
+                z_steps=int(z_steps),
+                free_steps=int(free_steps),
+                use_net_corr=bool(use_net_corr),
+                descriptor_mode=str(oxide_descriptor_mode),
+                max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
+                pair_limit=int(oxide_descriptor_pair_limit),
+            )
+        except Exception as e:
+            oxide_descriptor_summary = {'error': str(e), 'descriptor_mode': str(oxide_descriptor_mode)}
+            if str(oxide_descriptor_mode) in {'D3_pair only (H2 pairing proxy)', 'Full 3-stage profile (experimental)'}:
+                oxide_descriptor_summary['caution'] = THREE_STAGE_OXIDE_HER_CAUTION
+
     if str(thermo_mode) == "CHE correction (fast screening)":
         df["ΔG_H (eV)"] = df["ΔG_H_CHE (eV)"]
     elif str(thermo_mode) == "Local ZPE correction (selected structure)":
@@ -902,6 +948,11 @@ def _run_her_che(
         "zpe_target_label": zpe_target_label,
         "local_zpe_cutoff": float(local_zpe_cutoff),
         "local_zpe_max_neighbors": int(local_zpe_max_neighbors),
+        "OXIDE_DESCRIPTOR_MODE": str(oxide_descriptor_mode),
+        "OXIDE_DESCRIPTOR_SUMMARY": oxide_descriptor_summary,
+        "OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV": (oxide_descriptor_summary or {}).get("D2_candidates_csv", ""),
+        "OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV": (oxide_descriptor_summary or {}).get("D3_candidates_csv", ""),
+        "OXIDE_DESCRIPTOR_CAUTION": (oxide_descriptor_summary or {}).get("caution", ""),
         "Model": MODEL_NAME,
         "Device": DEVICE,
         "warnings": {
@@ -2137,6 +2188,9 @@ def run_metal_che(
     zpe_target_label: str | None = None,
     local_zpe_cutoff: float = 2.5,
     local_zpe_max_neighbors: int = 3,
+    oxide_descriptor_mode: str = "Basic HER screening",
+    oxide_descriptor_max_reactive_per_kind: int = 2,
+    oxide_descriptor_pair_limit: int = 6,
 ):
     return _run_her_che(
         "metal",
@@ -2158,6 +2212,9 @@ def run_metal_che(
         zpe_target_label=zpe_target_label,
         local_zpe_cutoff=local_zpe_cutoff,
         local_zpe_max_neighbors=local_zpe_max_neighbors,
+        oxide_descriptor_mode=oxide_descriptor_mode,
+        oxide_descriptor_max_reactive_per_kind=oxide_descriptor_max_reactive_per_kind,
+        oxide_descriptor_pair_limit=oxide_descriptor_pair_limit,
     )
 
 
@@ -2180,6 +2237,9 @@ def run_oxide_che(
     zpe_target_label: str | None = None,
     local_zpe_cutoff: float = 2.5,
     local_zpe_max_neighbors: int = 3,
+    oxide_descriptor_mode: str = "Basic HER screening",
+    oxide_descriptor_max_reactive_per_kind: int = 2,
+    oxide_descriptor_pair_limit: int = 6,
 ):
     return _run_her_che(
         "oxide",
@@ -2201,6 +2261,9 @@ def run_oxide_che(
         zpe_target_label=zpe_target_label,
         local_zpe_cutoff=local_zpe_cutoff,
         local_zpe_max_neighbors=local_zpe_max_neighbors,
+        oxide_descriptor_mode=oxide_descriptor_mode,
+        oxide_descriptor_max_reactive_per_kind=oxide_descriptor_max_reactive_per_kind,
+        oxide_descriptor_pair_limit=oxide_descriptor_pair_limit,
     )
 
 
