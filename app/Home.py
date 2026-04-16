@@ -15,6 +15,7 @@ from typing import Optional
 import numpy as np
 from ase import Atoms
 from ase.io import read, write
+from ase.constraints import FixAtoms
 import py3Dmol
 import streamlit.components.v1 as components
 
@@ -295,6 +296,113 @@ def _format_relaxed_view_option(row: pd.Series | dict, is_her: bool = True) -> s
     qa = str(row.get("qa", reliability or ""))
     dg = _safe_float(row.get("ΔG_ads (eV)", np.nan))
     return f"{ads} | {site_label} | final={relaxed_site} | ΔG_ads={dg:.3f} eV | {qa}"
+
+def _cluster_z_layers_simple(atoms, tol: float = 0.8):
+    pos = np.asarray(atoms.get_positions(), dtype=float)
+    if pos.size == 0:
+        return []
+    order = np.argsort(pos[:, 2])
+    layers = []
+    current = [int(order[0])]
+    z_ref = float(pos[order[0], 2])
+    for idx in order[1:]:
+        idx = int(idx)
+        z_val = float(pos[idx, 2])
+        if abs(z_val - z_ref) <= float(tol):
+            current.append(idx)
+            z_ref = float(np.mean(pos[current, 2]))
+        else:
+            layers.append(sorted(current))
+            current = [idx]
+            z_ref = z_val
+    if current:
+        layers.append(sorted(current))
+    return layers
+
+
+def _apply_top_free_layer_constraint(atoms, top_free_layers: int = 2, layer_tol: float = 0.8):
+    a = atoms.copy()
+    layers = _cluster_z_layers_simple(a, tol=float(layer_tol))
+    n_layers = len(layers)
+    n_free_layers = max(1, min(int(top_free_layers), max(1, n_layers)))
+    free_idx = set()
+    for layer in layers[-n_free_layers:]:
+        free_idx.update(int(i) for i in layer)
+    fixed_idx = [int(i) for i in range(len(a)) if i not in free_idx]
+    if fixed_idx:
+        a.set_constraint(FixAtoms(indices=fixed_idx))
+    meta = {
+        "n_layers": int(n_layers),
+        "free_top_layers": int(n_free_layers),
+        "fixed_atoms": int(len(fixed_idx)),
+        "free_atoms": int(len(a) - len(fixed_idx)),
+        "fixed_indices": fixed_idx,
+    }
+    return a, meta
+
+
+def _extract_relaxed_atoms_from_result(result):
+    if hasattr(result, "get_positions"):
+        return result
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            if hasattr(item, "get_positions"):
+                return item
+    if isinstance(result, dict):
+        for key in ("atoms", "relaxed_atoms", "slab_relaxed", "slab", "structure"):
+            item = result.get(key)
+            if hasattr(item, "get_positions"):
+                return item
+    return None
+
+
+def _run_chgnet_slab_relax_adaptive(atoms, *, fmax: float, max_steps: int, seed: Optional[int] = None):
+    if (not HAS_ADSORML) or ("relax_slab_chgnet" not in globals()):
+        raise RuntimeError(f"CHGNet slab relax unavailable: {ADSORML_IMPORT_ERR or 'not imported'}")
+    fn = relax_slab_chgnet
+    sig = inspect.signature(fn)
+    kwargs = {}
+    if "fmax" in sig.parameters:
+        kwargs["fmax"] = float(fmax)
+    if "max_steps" in sig.parameters:
+        kwargs["max_steps"] = int(max_steps)
+    elif "steps" in sig.parameters:
+        kwargs["steps"] = int(max_steps)
+    elif "nsteps" in sig.parameters:
+        kwargs["nsteps"] = int(max_steps)
+    if seed is not None and "seed" in sig.parameters:
+        kwargs["seed"] = int(seed)
+    try:
+        result = fn(atoms.copy(), **kwargs)
+    except TypeError:
+        result = fn(atoms.copy())
+    relaxed = _extract_relaxed_atoms_from_result(result)
+    if relaxed is None:
+        raise RuntimeError("Could not extract relaxed Atoms from relax_slab_chgnet(...) result.")
+    relaxed = relaxed.copy()
+    try:
+        relaxed.set_constraint()
+    except Exception:
+        pass
+    return relaxed
+
+
+def _get_oxide_her_constrained_prerelaxed_slab(
+    atoms, *, enable: bool, top_free_layers: int, layer_tol: float, fmax: float, max_steps: int, seed: Optional[int] = None
+):
+    if not bool(enable):
+        return atoms, None
+    prepared, meta = _apply_top_free_layer_constraint(atoms, top_free_layers=int(top_free_layers), layer_tol=float(layer_tol))
+    relaxed = _run_chgnet_slab_relax_adaptive(prepared, fmax=float(fmax), max_steps=int(max_steps), seed=seed)
+    meta = dict(meta)
+    meta.update({
+        "enabled": True,
+        "fmax": float(fmax),
+        "max_steps": int(max_steps),
+        "seed": None if seed is None else int(seed),
+    })
+    return relaxed, meta
+
 
 
 # ---------------- Sidebar: global options ----------------
@@ -1001,6 +1109,48 @@ else:
     cond_seed_ui = 0
     cond_seed = None
 
+    # Defaults for oxide HER constrained CHGNet preconditioning
+    her_constrained_prerelax = False
+    her_constrained_top_free_layers = int(st.session_state.get("her_constrained_top_free_layers", 2))
+    her_constrained_layer_tol = float(st.session_state.get("her_constrained_layer_tol", 0.8))
+    her_constrained_fmax = float(st.session_state.get("her_constrained_fmax", 0.05))
+    her_constrained_max_steps = int(st.session_state.get("her_constrained_max_steps", 80))
+    her_constrained_seed_ui = int(st.session_state.get("her_constrained_seed_ui", 0))
+    her_constrained_seed = None
+
+    if is_her and (mtype == "oxide"):
+        st.markdown("### Oxide HER constrained CHGNet preconditioning (experimental)")
+        her_constrained_prerelax = st.checkbox(
+            "Apply constrained CHGNet slab pre-relaxation",
+            value=bool(st.session_state.get("her_constrained_prerelax_ui", False)),
+            key="her_constrained_prerelax_ui",
+            help=(
+                "Precondition the clean oxide slab before O-top / reactive-H probing. "
+                "Only the top z-layers remain free; lower layers are fixed to preserve bulk-like support."
+            ),
+        )
+        if bool(her_constrained_prerelax):
+            if not HAS_ADSORML:
+                st.warning(f"CHGNet slab pre-relax unavailable: {ADSORML_IMPORT_ERR}")
+            with st.expander("Constrained CHGNet parameters", expanded=False):
+                her_constrained_top_free_layers = st.number_input(
+                    "Free top z-layers", min_value=1, max_value=4, value=int(her_constrained_top_free_layers), step=1, key="her_constrained_top_free_layers"
+                )
+                her_constrained_layer_tol = st.number_input(
+                    "z-layer clustering tolerance (Å)", min_value=0.3, max_value=1.5, value=float(her_constrained_layer_tol), step=0.1, key="her_constrained_layer_tol"
+                )
+                her_constrained_fmax = st.number_input(
+                    "CHGNet relax fmax", min_value=0.01, max_value=0.20, value=float(her_constrained_fmax), step=0.01, key="her_constrained_fmax"
+                )
+                her_constrained_max_steps = st.number_input(
+                    "CHGNet max steps", min_value=20, max_value=300, value=int(her_constrained_max_steps), step=10, key="her_constrained_max_steps"
+                )
+                her_constrained_seed_ui = st.number_input(
+                    "Seed (0 = auto)", min_value=0, max_value=2**31-1, value=int(her_constrained_seed_ui), step=1, key="her_constrained_seed_ui"
+                )
+                st.caption("Recommended for oxide HER: use 1–2 free top layers and keep the lower slab fixed. This is a slab preconditioning step, not the final HER metric.")
+            her_constrained_seed = None if int(her_constrained_seed_ui) == 0 else int(her_constrained_seed_ui)
+
     # Conditioning parameter UI only when the feature is enabled (CO2RR only)
     if (not is_her) and bool(surfactant_prerelax_slab):
         with st.expander("Conditioning parameters", expanded=False):
@@ -1043,7 +1193,26 @@ else:
     # Build the effective slab used for site detection (conditioned or original)
     atoms_for_sites_eff = atoms_for_sites
     slab_prerelax_meta_ui = None
-    if (not is_her) and bool(surfactant_prerelax_slab):
+    if is_her and (mtype == "oxide") and bool(her_constrained_prerelax):
+        try:
+            atoms_for_sites_eff, slab_prerelax_meta_ui = _get_oxide_her_constrained_prerelaxed_slab(
+                atoms_for_sites,
+                enable=bool(her_constrained_prerelax),
+                top_free_layers=int(her_constrained_top_free_layers),
+                layer_tol=float(her_constrained_layer_tol),
+                fmax=float(her_constrained_fmax),
+                max_steps=int(her_constrained_max_steps),
+                seed=her_constrained_seed,
+            )
+            if slab_prerelax_meta_ui:
+                st.caption(
+                    f"Constrained CHGNet slab pre-relax applied (free top layers={slab_prerelax_meta_ui.get('free_top_layers')}, "
+                    f"fixed atoms={slab_prerelax_meta_ui.get('fixed_atoms')}, fmax={float(her_constrained_fmax):.2f}, steps={int(her_constrained_max_steps)})."
+                )
+        except Exception as _e:
+            st.warning(f"Constrained CHGNet slab pre-relax (preview) skipped due to error: {_e}")
+            atoms_for_sites_eff, slab_prerelax_meta_ui = atoms_for_sites, None
+    elif (not is_her) and bool(surfactant_prerelax_slab):
         atoms_for_sites_eff, slab_prerelax_meta_ui = _get_conditioned_slab(
             atoms_for_sites,
             is_her=bool(is_her),
@@ -1492,6 +1661,62 @@ else:
                 help="Example: ontop_0, bridge_1",
             ).strip() or None
 
+
+    # Oxide HER descriptor mode
+    oxide_descriptor_mode = "Basic HER screening"
+    oxide_descriptor_max_reactive_per_kind = 2
+    oxide_descriptor_pair_limit = 6
+    if is_her and (mtype == "oxide"):
+        with st.expander("Oxide HER descriptor mode", expanded=False):
+            oxide_descriptor_mode = st.selectbox(
+                "Descriptor mode",
+                [
+                    "Basic HER screening",
+                    "D1_OH only (O-top protonation)",
+                    "D2_Hreact only (reactive H state)",
+                    "D3_pair only (H2 pairing proxy)",
+                    "Full 3-stage profile (experimental)",
+                ],
+                index=0,
+                key="oxide_descriptor_mode",
+                help=(
+                    "Basic HER screening keeps the legacy oxide HER workflow. "
+                    "D1 computes only the O-top protonation descriptor. "
+                    "D2 computes only the reactive-H-state descriptor. "
+                    "D3 computes only the H2 pairing proxy (with internal precursor generation). "
+                    "Full 3-stage profile computes D1, D2, and D3 together."
+                ),
+            )
+            needs_reactive = oxide_descriptor_mode in {
+                "D2_Hreact only (reactive H state)",
+                "D3_pair only (H2 pairing proxy)",
+                "Full 3-stage profile (experimental)",
+            }
+            needs_pair = oxide_descriptor_mode in {
+                "D3_pair only (H2 pairing proxy)",
+                "Full 3-stage profile (experimental)",
+            }
+            c3a, c3b = st.columns(2)
+            with c3a:
+                oxide_descriptor_max_reactive_per_kind = st.number_input(
+                    "Reactive-H seeds per kind",
+                    min_value=1, max_value=4, value=2, step=1,
+                    key="oxide_descriptor_max_reactive_per_kind",
+                    disabled=(not needs_reactive),
+                )
+            with c3b:
+                oxide_descriptor_pair_limit = st.number_input(
+                    "Pairing seed limit",
+                    min_value=2, max_value=12, value=6, step=1,
+                    key="oxide_descriptor_pair_limit",
+                    disabled=(not needs_pair),
+                )
+            if oxide_descriptor_mode in {
+                "D3_pair only (H2 pairing proxy)",
+                "Full 3-stage profile (experimental)",
+            }:
+                st.caption("The H₂ pairing stage is treated as an approximate release proxy rather than an explicit barrier.")
+
     if (not is_her):
         st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. ORR additionally writes a step-wise summary file (results_orr_summary.csv) using the entered U for one-electron CHE shifts.")
 
@@ -1598,17 +1823,28 @@ else:
         uploads.mkdir(parents=True, exist_ok=True)
         atoms_for_calc_run, slab_prerelax_meta_calc = atoms_for_calc, None
         try:
-            atoms_for_calc_run, slab_prerelax_meta_calc = _get_conditioned_slab(
-                atoms_for_calc,
-                is_her=bool(is_her),
-                surfactant_class=str(surfactant_class),
-                enable=bool(surfactant_prerelax_slab),
-                top_z_tol=float(cond_top_z_tol),
-                jiggle_amp=float(cond_jiggle_amp),
-                fmax=float(cond_fmax),
-                max_steps=int(cond_max_steps),
-                seed=cond_seed,
-            )
+            if is_her and (mtype == "oxide") and bool(her_constrained_prerelax):
+                atoms_for_calc_run, slab_prerelax_meta_calc = _get_oxide_her_constrained_prerelaxed_slab(
+                    atoms_for_calc,
+                    enable=bool(her_constrained_prerelax),
+                    top_free_layers=int(her_constrained_top_free_layers),
+                    layer_tol=float(her_constrained_layer_tol),
+                    fmax=float(her_constrained_fmax),
+                    max_steps=int(her_constrained_max_steps),
+                    seed=her_constrained_seed,
+                )
+            else:
+                atoms_for_calc_run, slab_prerelax_meta_calc = _get_conditioned_slab(
+                    atoms_for_calc,
+                    is_her=bool(is_her),
+                    surfactant_class=str(surfactant_class),
+                    enable=bool(surfactant_prerelax_slab),
+                    top_z_tol=float(cond_top_z_tol),
+                    jiggle_amp=float(cond_jiggle_amp),
+                    fmax=float(cond_fmax),
+                    max_steps=int(cond_max_steps),
+                    seed=cond_seed,
+                )
         except Exception as _e:
             st.warning(f"CHGNet slab pre-relax (calc) skipped due to error: {_e}")
             atoms_for_calc_run, slab_prerelax_meta_calc = atoms_for_calc, None
@@ -1656,6 +1892,9 @@ else:
                         zpe_target_label=zpe_target_label,
                         local_zpe_cutoff=float(local_zpe_cutoff),
                         local_zpe_max_neighbors=int(local_zpe_max_neighbors),
+                        oxide_descriptor_mode=str(oxide_descriptor_mode),
+                        oxide_descriptor_max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
+                        oxide_descriptor_pair_limit=int(oxide_descriptor_pair_limit),
                     )
             elif is_orr:
                 # ── ORR branch ─────────────────────────────────────────
@@ -1979,6 +2218,54 @@ if last_run is not None:
                 "text/csv",
                 key="dl_co2rr_candidates_all",
             )
+
+    # --- Oxide HER descriptor profile / summary ---
+    if bool(last_run.get("is_her")) and str(last_run.get("mtype", "")) == "oxide" and isinstance(meta, dict) and meta.get("OXIDE_DESCRIPTOR_SUMMARY"):
+        _ods = meta.get("OXIDE_DESCRIPTOR_SUMMARY") or {}
+        _mode = str(meta.get("OXIDE_DESCRIPTOR_MODE", _ods.get("descriptor_mode", "Basic HER screening")))
+        st.markdown("### Oxide HER descriptor summary")
+        if _mode in {"D3_pair only (H2 pairing proxy)", "Full 3-stage profile (experimental)"}:
+            st.warning(str(meta.get("OXIDE_DESCRIPTOR_CAUTION", _ods.get("caution", "The H₂ pairing stage is an approximate release proxy rather than an explicit barrier."))))
+
+        summary_cols = [
+            "descriptor_mode",
+            "D1_OH (eV)", "D2_Hreact (eV)", "D3_pair_proxy (eV)",
+            "Δ12 (eV)", "Δ23 (eV)", "classification",
+            "D3_H2_like_motif", "D3_final_HH_distance(Å)",
+            "D1_site_label", "D2_site_label", "D3_pair_label",
+        ]
+        _summary_df = pd.DataFrame([{k: _ods.get(k, np.nan) for k in summary_cols}])
+        st.dataframe(_summary_df, use_container_width=True)
+
+        _profile_points = []
+        _d1 = _safe_float(_ods.get("D1_OH (eV)"))
+        _d2 = _safe_float(_ods.get("D2_Hreact (eV)"))
+        _d3 = _safe_float(_ods.get("D3_pair_proxy (eV)"))
+        if np.isfinite(_d1):
+            _profile_points.append({"Stage": "O–H formation", "Energy (eV)": _d1})
+        if np.isfinite(_d2):
+            _profile_points.append({"Stage": "Reactive H state", "Energy (eV)": _d2})
+        if np.isfinite(_d3):
+            _profile_points.append({"Stage": "H₂ pairing proxy", "Energy (eV)": _d3})
+        if _profile_points:
+            _profile_df = pd.DataFrame(_profile_points)
+            st.line_chart(_profile_df.set_index("Stage"))
+
+        with st.expander("Show descriptor candidate tables", expanded=False):
+            _d2_csv = _ods.get("D2_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV", "")
+            _d3_csv = _ods.get("D3_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV", "")
+            if _d2_csv and Path(str(_d2_csv)).is_file():
+                st.markdown("#### D2 reactive-H candidates")
+                try:
+                    st.dataframe(pd.read_csv(str(_d2_csv)), use_container_width=True)
+                except Exception as _e:
+                    st.info(f"Could not load D2 candidate table: {_e}")
+            if _d3_csv and Path(str(_d3_csv)).is_file():
+                st.markdown("#### D3 H₂ pairing proxy candidates")
+                try:
+                    st.dataframe(pd.read_csv(str(_d3_csv)), use_container_width=True)
+                except Exception as _e:
+                    st.info(f"Could not load D3 candidate table: {_e}")
 
     # --- Relaxed post-run structure viewer ---
     viewer_frames = {}
