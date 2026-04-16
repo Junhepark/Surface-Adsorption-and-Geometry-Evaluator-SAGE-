@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-def split_reliable_unreliable(df, dE_thresh=3.0, disp_thresh=0.8):
+def split_reliable_unreliable(df, dE_thresh=3.0, disp_thresh=1.0):
     if df is None or df.empty:
         return df, df
 
@@ -333,15 +333,8 @@ def build_compact_table(df, mode: str):
             "migration_path",
             "actual_migration_path",
             "site_transition_type",
-            "thermo_mode",
             "ΔG_H(U,pH) (eV)",
             "ΔG_H (eV)",
-            "ΔG_H_CHE (eV)",
-            "ΔG_H_local (eV)",
-            "local_thermo_corr (eV)",
-            "zpe_scope",
-            "zpe_selected_atoms",
-            "zpe_warning",
             "ΔE_H_user (eV)",
             "H_lateral_disp(Å)",
             "is_duplicate",
