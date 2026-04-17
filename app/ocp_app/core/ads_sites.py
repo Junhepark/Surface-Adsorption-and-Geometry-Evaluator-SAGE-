@@ -397,6 +397,65 @@ def detect_metal_111_sites(
     )
 
 
+def _top_layer_neighbor_counts(top_xy: np.ndarray) -> np.ndarray:
+    if len(top_xy) == 0:
+        return np.array([], dtype=int)
+    if len(top_xy) == 1:
+        return np.array([0], dtype=int)
+    diff = top_xy[:, None, :] - top_xy[None, :, :]
+    dmat = np.sqrt((diff ** 2).sum(axis=-1))
+    dmat += np.eye(len(top_xy)) * 1e6
+    d_min = float(np.min(dmat)) if len(top_xy) > 1 else np.inf
+    if (not np.isfinite(d_min)) or d_min <= 0.0:
+        return np.zeros(len(top_xy), dtype=int)
+    cut = 1.25 * d_min
+    return np.sum(dmat < cut, axis=1).astype(int)
+
+
+def _site_frac_xy(site: AdsSite, cell: np.ndarray) -> Tuple[float, float]:
+    a_vec = np.asarray(cell[0, :2], dtype=float)
+    b_vec = np.asarray(cell[1, :2], dtype=float)
+    A = np.column_stack([a_vec, b_vec])
+    xy = np.asarray(site.position[:2], dtype=float)
+    try:
+        frac = np.linalg.solve(A, xy)
+        fx, fy = frac[0] - np.floor(frac[0]), frac[1] - np.floor(frac[1])
+        return float(fx), float(fy)
+    except Exception:
+        ax = max(float(np.linalg.norm(a_vec)), 1.0)
+        bx = max(float(np.linalg.norm(b_vec)), 1.0)
+        return float((xy[0] / ax) % 1.0), float((xy[1] / bx) % 1.0)
+
+
+def _filter_oxide_sites_terrace_like(
+    sites: List[AdsSite],
+    pos: np.ndarray,
+    top_idx: np.ndarray,
+    cell: np.ndarray,
+    boundary_frac_cut: float = 0.08,
+    min_mean_nn: float = 2.0,
+) -> List[AdsSite]:
+    if not sites or len(top_idx) == 0:
+        return sites
+    top_idx = np.asarray(top_idx, dtype=int)
+    nn_counts = _top_layer_neighbor_counts(pos[top_idx][:, :2])
+    top_lookup = {int(idx): int(nn_counts[i]) for i, idx in enumerate(top_idx.tolist())}
+    kept: List[AdsSite] = []
+    for s in sites:
+        fx, fy = _site_frac_xy(s, cell)
+        edge_margin = min(fx, 1.0 - fx, fy, 1.0 - fy)
+        if edge_margin < float(boundary_frac_cut):
+            continue
+        surf_idx = tuple(int(i) for i in (getattr(s, 'surface_indices', ()) or ()))
+        if surf_idx:
+            support = [top_lookup.get(int(i), 0) for i in surf_idx]
+            mean_nn = float(np.mean(support)) if support else 0.0
+            if mean_nn < float(min_mean_nn):
+                continue
+        kept.append(s)
+    return kept if kept else sites
+
+
 # ----------------  Metal oxide slab  ----------------
 
 def detect_oxide_surface_sites(
@@ -437,12 +496,20 @@ def detect_oxide_surface_sites(
         h_hollow=h_hollow,
     )
     cell = atoms.get_cell()
-    return _dedupe_sites(
+    deduped = _dedupe_sites(
         raw_sites,
         cell,
         tol=0.20,
         max_sites_per_kind=max_sites_per_kind,
         edge_frac_cut=0.02,
+    )
+    return _filter_oxide_sites_terrace_like(
+        deduped,
+        pos,
+        top_idx,
+        np.asarray(cell, dtype=float),
+        boundary_frac_cut=0.08,
+        min_mean_nn=2.0,
     )
 
 
