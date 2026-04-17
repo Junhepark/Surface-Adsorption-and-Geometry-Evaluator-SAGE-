@@ -100,6 +100,18 @@ The application will open in your default browser.
 
 ---
 
+## Developer Sanity Check
+
+For a quick repository health check after installation:
+
+```bash
+pytest -q
+```
+
+If all tests pass, you should see output similar to `...... [100%]`.
+
+---
+
 ## Quick Start
 
 ### 1. Load a structure
