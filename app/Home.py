@@ -1109,7 +1109,9 @@ else:
     cond_seed_ui = 0
     cond_seed = None
 
-    # Defaults for oxide HER constrained CHGNet preconditioning
+    # Oxide HER constrained CHGNet preconditioning is intentionally disabled.
+    # The current oxide HER workflow controls freedom through the relaxation scope
+    # (rigid / partial / full), so the legacy slab preconditioning UI is hidden.
     her_constrained_prerelax = False
     her_constrained_top_free_layers = int(st.session_state.get("her_constrained_top_free_layers", 2))
     her_constrained_layer_tol = float(st.session_state.get("her_constrained_layer_tol", 0.8))
@@ -1117,39 +1119,6 @@ else:
     her_constrained_max_steps = int(st.session_state.get("her_constrained_max_steps", 80))
     her_constrained_seed_ui = int(st.session_state.get("her_constrained_seed_ui", 0))
     her_constrained_seed = None
-
-    if is_her and (mtype == "oxide"):
-        st.markdown("### Oxide HER constrained CHGNet preconditioning (experimental)")
-        her_constrained_prerelax = st.checkbox(
-            "Apply constrained CHGNet slab pre-relaxation",
-            value=bool(st.session_state.get("her_constrained_prerelax_ui", False)),
-            key="her_constrained_prerelax_ui",
-            help=(
-                "Precondition the clean oxide slab before O-top / reactive-H probing. "
-                "Only the top z-layers remain free; lower layers are fixed to preserve bulk-like support."
-            ),
-        )
-        if bool(her_constrained_prerelax):
-            if not HAS_ADSORML:
-                st.warning(f"CHGNet slab pre-relax unavailable: {ADSORML_IMPORT_ERR}")
-            with st.expander("Constrained CHGNet parameters", expanded=False):
-                her_constrained_top_free_layers = st.number_input(
-                    "Free top z-layers", min_value=1, max_value=4, value=int(her_constrained_top_free_layers), step=1, key="her_constrained_top_free_layers"
-                )
-                her_constrained_layer_tol = st.number_input(
-                    "z-layer clustering tolerance (Å)", min_value=0.3, max_value=1.5, value=float(her_constrained_layer_tol), step=0.1, key="her_constrained_layer_tol"
-                )
-                her_constrained_fmax = st.number_input(
-                    "CHGNet relax fmax", min_value=0.01, max_value=0.20, value=float(her_constrained_fmax), step=0.01, key="her_constrained_fmax"
-                )
-                her_constrained_max_steps = st.number_input(
-                    "CHGNet max steps", min_value=20, max_value=300, value=int(her_constrained_max_steps), step=10, key="her_constrained_max_steps"
-                )
-                her_constrained_seed_ui = st.number_input(
-                    "Seed (0 = auto)", min_value=0, max_value=2**31-1, value=int(her_constrained_seed_ui), step=1, key="her_constrained_seed_ui"
-                )
-                st.caption("Recommended for oxide HER: use 1–2 free top layers and keep the lower slab fixed. This is a slab preconditioning step, not the final HER metric.")
-            her_constrained_seed = None if int(her_constrained_seed_ui) == 0 else int(her_constrained_seed_ui)
 
     # Conditioning parameter UI only when the feature is enabled (CO2RR only)
     if (not is_her) and bool(surfactant_prerelax_slab):
@@ -1226,16 +1195,32 @@ else:
         )
         if slab_prerelax_meta_ui:
             st.caption(f"Surface conditioning applied (class={surfactant_class}, jiggle={cond_jiggle_amp:.2f} Å).")
-    use_auto_sites = st.checkbox("Use auto-detected sites (recommended)", value=True, key="use_auto_sites")
-    site_selection_method = st.selectbox(
-        "Site selection method",
-        ["Geometry (representative)", "ML screening (AdsorbML-lite)"],
-        index=0,
-        key="site_sel_method",
+    st.markdown("### B. Site generation mode")
+    site_generation_mode = st.radio(
+        "Choose how Step 3 should generate candidate sites",
+        ["Manual sites", "Geometry auto-detection", "ML-assisted screening"],
+        index=1,
+        horizontal=True,
+        key="site_generation_mode",
+        help=(
+            "Manual sites uses the sidebar site preset only. "
+            "Geometry auto-detection generates representative sites directly from the prepared slab. "
+            "ML-assisted screening first generates geometry candidates, then ranks them with AdsorbML-lite."
+        ),
     )
 
-    ml_enabled = site_selection_method.startswith("ML")
+    use_auto_sites = site_generation_mode != "Manual sites"
+    ml_enabled = site_generation_mode == "ML-assisted screening"
+    site_selection_method = "ML screening (AdsorbML-lite)" if ml_enabled else ("Geometry (representative)" if use_auto_sites else "Manual")
     rep_site_map = None
+
+    st.markdown("### C. Site selection details")
+    if site_generation_mode == "Manual sites":
+        st.info("Manual mode selected. Step 4 will use the sidebar 'Sites (Manual mode)' preset without Step 3 auto-generated candidates.")
+    elif site_generation_mode == "Geometry auto-detection":
+        st.caption("Representative geometry-based sites are generated from the prepared slab below.")
+    else:
+        st.caption("AdsorbML-lite screening uses geometry-generated seeds first, then ranks candidates with ML.")
 
     if use_auto_sites and (not ml_enabled):
         st.markdown("### Geometry representative sites")
@@ -1663,7 +1648,7 @@ else:
 
 
     # Oxide HER descriptor mode
-    oxide_descriptor_mode = "Basic HER screening"
+    oxide_descriptor_mode = "Full 2-stage profile (recommended)"
     oxide_descriptor_max_reactive_per_kind = 2
     oxide_descriptor_pair_limit = 6
     if is_her and (mtype == "oxide"):
@@ -1671,31 +1656,23 @@ else:
             oxide_descriptor_mode = st.selectbox(
                 "Descriptor mode",
                 [
-                    "Basic HER screening",
-                    "D1_OH only (O-top protonation)",
                     "D2_Hreact only (reactive H state)",
-                    "D3_pair only (H2 pairing proxy)",
-                    "Full 3-stage profile (experimental)",
+                    "Full 2-stage profile (recommended)",
                 ],
-                index=0,
+                index=1,
                 key="oxide_descriptor_mode",
                 help=(
-                    "Basic HER screening keeps the legacy oxide HER workflow. "
-                    "D1 computes only the O-top protonation descriptor. "
-                    "D2 computes only the reactive-H-state descriptor. "
-                    "D3 computes only the H2 pairing proxy (with internal precursor generation). "
-                    "Full 3-stage profile computes D1, D2, and D3 together."
+                    "D2 reuses the best reliable basic oxide HER screening row. "
+                    "Full 2-stage profile computes D1 explicit O-hydroxylation plus D2 basic HER screening together."
                 ),
             )
             needs_reactive = oxide_descriptor_mode in {
                 "D2_Hreact only (reactive H state)",
-                "D3_pair only (H2 pairing proxy)",
-                "Full 3-stage profile (experimental)",
+                "Full 2-stage profile (recommended)",
+                # "D3_pair only (H2 pairing proxy)",
+                # "Full 3-stage profile (experimental)",
             }
-            needs_pair = oxide_descriptor_mode in {
-                "D3_pair only (H2 pairing proxy)",
-                "Full 3-stage profile (experimental)",
-            }
+            needs_pair = False
             c3a, c3b = st.columns(2)
             with c3a:
                 oxide_descriptor_max_reactive_per_kind = st.number_input(
@@ -1706,16 +1683,12 @@ else:
                 )
             with c3b:
                 oxide_descriptor_pair_limit = st.number_input(
-                    "Pairing seed limit",
+                    "Pairing seed limit (disabled)",
                     min_value=2, max_value=12, value=6, step=1,
                     key="oxide_descriptor_pair_limit",
-                    disabled=(not needs_pair),
+                    disabled=True,
                 )
-            if oxide_descriptor_mode in {
-                "D3_pair only (H2 pairing proxy)",
-                "Full 3-stage profile (experimental)",
-            }:
-                st.caption("The H₂ pairing stage is treated as an approximate release proxy rather than an explicit barrier.")
+            st.caption("D3 / H₂ pairing proxy is disabled in the current app build. The code skeleton is retained only as commented legacy logic.")
 
     if (not is_her):
         st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. ORR additionally writes a step-wise summary file (results_orr_summary.csv) using the entered U for one-electron CHE shifts.")
@@ -2224,15 +2197,18 @@ if last_run is not None:
         _ods = meta.get("OXIDE_DESCRIPTOR_SUMMARY") or {}
         _mode = str(meta.get("OXIDE_DESCRIPTOR_MODE", _ods.get("descriptor_mode", "Basic HER screening")))
         st.markdown("### Oxide HER descriptor summary")
-        if _mode in {"D3_pair only (H2 pairing proxy)", "Full 3-stage profile (experimental)"}:
-            st.warning(str(meta.get("OXIDE_DESCRIPTOR_CAUTION", _ods.get("caution", "The H₂ pairing stage is an approximate release proxy rather than an explicit barrier."))))
+        # if _mode in {"D3_pair only (H2 pairing proxy)", "Full 3-stage profile (experimental)"}:
+        #     st.warning(str(meta.get("OXIDE_DESCRIPTOR_CAUTION", _ods.get("caution", "The H₂ pairing stage is an approximate release proxy rather than an explicit barrier."))))
 
         summary_cols = [
             "descriptor_mode",
-            "D1_OH (eV)", "D2_Hreact (eV)", "D3_pair_proxy (eV)",
-            "Δ12 (eV)", "Δ23 (eV)", "classification",
-            "D3_H2_like_motif", "D3_final_HH_distance(Å)",
-            "D1_site_label", "D2_site_label", "D3_pair_label",
+            "D1_OH (eV)", "D2_Hreact (eV)",
+            "Δ12 (eV)", "classification",
+            "D1_site_label", "D1_binding_class", "D2_site_label", "D2_binding_class",
+            "D2_same_basin_as_D1", "D2_basin_note",
+            # "D3_pair_proxy (eV)", "Δ23 (eV)",
+            # "D3_H2_like_motif", "D3_final_HH_distance(Å)",
+            # "D3_pair_label", "D3_status", "D3_pair_seed_count", "D3_valid_pair_count",
         ]
         _summary_df = pd.DataFrame([{k: _ods.get(k, np.nan) for k in summary_cols}])
         st.dataframe(_summary_df, use_container_width=True)
@@ -2240,32 +2216,96 @@ if last_run is not None:
         _profile_points = []
         _d1 = _safe_float(_ods.get("D1_OH (eV)"))
         _d2 = _safe_float(_ods.get("D2_Hreact (eV)"))
-        _d3 = _safe_float(_ods.get("D3_pair_proxy (eV)"))
+        # _d3 = _safe_float(_ods.get("D3_pair_proxy (eV)"))
         if np.isfinite(_d1):
             _profile_points.append({"Stage": "O–H formation", "Energy (eV)": _d1})
         if np.isfinite(_d2):
-            _profile_points.append({"Stage": "Reactive H state", "Energy (eV)": _d2})
-        if np.isfinite(_d3):
-            _profile_points.append({"Stage": "H₂ pairing proxy", "Energy (eV)": _d3})
+            _profile_points.append({"Stage": "Basic HER screening", "Energy (eV)": _d2})
+        # if np.isfinite(_d3):
+        #     _profile_points.append({"Stage": "H₂ pairing proxy", "Energy (eV)": _d3})
         if _profile_points:
             _profile_df = pd.DataFrame(_profile_points)
             st.line_chart(_profile_df.set_index("Stage"))
 
+        def _render_descriptor_stage_viewer(stage_key: str, title: str, energy_key: str, label_key: str, extra_items: list[tuple[str, str]] | None = None):
+            stage_path = _ods.get(f"{stage_key}_structure_cif", "")
+            stage_label = str(_ods.get(label_key, "NA"))
+            stage_energy = _safe_float(_ods.get(energy_key, np.nan))
+            with st.expander(title, expanded=False):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("label", stage_label)
+                c2.metric("energy (eV)", f"{stage_energy:.4f}" if np.isfinite(stage_energy) else "n/a")
+                if extra_items:
+                    extra_key, extra_label = extra_items[0]
+                    extra_val = _ods.get(extra_key, "")
+                    c3.metric(extra_label, str(extra_val) if str(extra_val).strip() else "n/a")
+                else:
+                    c3.metric("structure", "available" if stage_path and Path(str(stage_path)).is_file() else "missing")
+                if extra_items and len(extra_items) > 1:
+                    extra_df = pd.DataFrame([{lbl: _ods.get(key, np.nan) for key, lbl in extra_items[1:]}])
+                    st.dataframe(extra_df, use_container_width=True)
+                stage_meta_keys = [
+                    (f"{stage_key}_relaxation_scope", "scope"),
+                    (f"{stage_key}_total_relax_n_steps", "total steps"),
+                    (f"{stage_key}_fine_relax_relaxed_atoms", "relaxed atoms"),
+                ]
+                stage_meta_row = {lbl: _ods.get(key, np.nan) for key, lbl in stage_meta_keys if key in _ods}
+                if stage_meta_row:
+                    st.dataframe(pd.DataFrame([stage_meta_row]), use_container_width=True)
+                if stage_path and Path(str(stage_path)).is_file():
+                    try:
+                        _at_stage = read(str(stage_path))
+                        show_atoms_3d(_at_stage, height=420, width=880, tag=f"descriptor_{stage_key}_{uuid.uuid4().hex[:8]}")
+                        st.download_button(
+                            f"Download {stage_key} CIF",
+                            Path(stage_path).read_bytes(),
+                            Path(stage_path).name,
+                            "chemical/x-cif",
+                            key=f"dl_descriptor_{stage_key}_{uuid.uuid4().hex[:8]}",
+                        )
+                    except Exception as _e:
+                        st.info(f"Could not render {stage_key} CIF: {_e}")
+                else:
+                    st.info(f"{stage_key} CIF is not available for this run.")
+
+        st.markdown("#### Descriptor stage structures")
+        _render_descriptor_stage_viewer(
+            "D1",
+            "D1 structure — constrained O–H formation",
+            "D1_OH (eV)",
+            "D1_site_label",
+            extra_items=[("D1_binding_class", "binding class"), ("D1_seed_quality", "seed quality"), ("D1_seed_disp(Å)", "seed disp (Å)"), ("D1_seed_warning", "seed warning")],
+        )
+        _render_descriptor_stage_viewer(
+            "D2",
+            "D2 structure — basic HER screening",
+            "D2_Hreact (eV)",
+            "D2_site_label",
+            extra_items=[("D2_binding_class", "binding class"), ("D2_same_basin_as_D1", "same basin as D1"), ("D2_basin_note", "basin note"), ("D2_seed_disp(Å)", "seed disp (Å)")],
+        )
+        # _render_descriptor_stage_viewer(
+        #     "D3",
+        #     "D3 structure — H₂ pairing proxy",
+        #     "D3_pair_proxy (eV)",
+        #     "D3_pair_label",
+        #     extra_items=[("D3_H2_like_motif", "H2-like motif"), ("D3_final_HH_distance(Å)", "final HH dist (Å)"), ("D3_status", "status")],
+        # )
+
         with st.expander("Show descriptor candidate tables", expanded=False):
             _d2_csv = _ods.get("D2_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV", "")
-            _d3_csv = _ods.get("D3_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV", "")
+            # _d3_csv = _ods.get("D3_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV", "")
             if _d2_csv and Path(str(_d2_csv)).is_file():
-                st.markdown("#### D2 reactive-H candidates")
+                st.markdown("#### D2 basic HER screening rows")
                 try:
                     st.dataframe(pd.read_csv(str(_d2_csv)), use_container_width=True)
                 except Exception as _e:
                     st.info(f"Could not load D2 candidate table: {_e}")
-            if _d3_csv and Path(str(_d3_csv)).is_file():
-                st.markdown("#### D3 H₂ pairing proxy candidates")
-                try:
-                    st.dataframe(pd.read_csv(str(_d3_csv)), use_container_width=True)
-                except Exception as _e:
-                    st.info(f"Could not load D3 candidate table: {_e}")
+            # if _d3_csv and Path(str(_d3_csv)).is_file():
+            #     st.markdown("#### D3 H₂ pairing proxy candidates")
+            #     try:
+            #         st.dataframe(pd.read_csv(str(_d3_csv)), use_container_width=True)
+            #     except Exception as _e:
+            #         st.info(f"Could not load D3 candidate table: {_e}")
 
     # --- Relaxed post-run structure viewer ---
     viewer_frames = {}
@@ -2320,12 +2360,17 @@ if last_run is not None:
                 disp_view = _safe_float(viewer_row.get("H_lateral_disp(Å)", viewer_row.get("ads_lateral_disp(Å)", np.nan)))
                 m4.metric("disp (Å)", f"{disp_view:.2f}" if np.isfinite(disp_view) else "n/a")
 
-                extra_cols = [c for c in [
+                thermo_mode_run = str(meta.get("thermo_mode", "CHE correction (fast screening)")) if isinstance(meta, dict) else "CHE correction (fast screening)"
+                extra_order = [
                     "migrated", "reliability", "qa", "ΔG_H(U,pH) (eV)", "ΔG_H (eV)",
                     "ΔG_H_CHE (eV)", "ΔG_H_local (eV)", "local_thermo_corr (eV)",
                     "ΔG_ads (eV)", "ΔE_H_user (eV)", "ΔE_ads_user (eV)",
+                    "selected_h0", "her_relaxation_scope", "z_relax_n_steps", "fine_relax_n_steps", "fine_relax_relaxed_atoms", "total_relax_n_steps",
                     "zpe_scope", "zpe_selected_atoms", "zpe_warning"
-                ] if c in viewer_row.index]
+                ]
+                if bool(last_run.get("is_her")) and thermo_mode_run.startswith("Local ZPE correction"):
+                    extra_order = [c for c in extra_order if c != "ΔG_H_CHE (eV)"]
+                extra_cols = [c for c in extra_order if c in viewer_row.index]
                 if extra_cols:
                     st.dataframe(pd.DataFrame([viewer_row[extra_cols].to_dict()]), use_container_width=True)
 
