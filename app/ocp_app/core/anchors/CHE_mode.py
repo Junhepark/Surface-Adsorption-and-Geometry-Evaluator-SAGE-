@@ -36,12 +36,17 @@ from ocp_app.core.anchors.common import (
     UNUSUAL_DDELTA,
     ensure_pbc3,
     layer_indices,
+    normalize_relaxation_scope,
     relax_freeH,
     site_energy_two_stage,
 )
 
 from ocp_app.core.anchors.local_zpe import compute_local_h_thermo_correction
 from ocp_app.core.oxide_descriptor import run_oxide_descriptor_profile
+from ocp_app.core.anchors.oxide_her import (
+    _generate_oxide_her_oanchor_sites,
+    _project_oxide_her_sites_to_otop,
+)
 
 # =====================================================================
 # Unified CHE workflow (Metal & Oxide)
@@ -105,6 +110,14 @@ THERMO_ORR_NAME = "thermo_ORR.json"
 # Number of electrons consumed per ORR intermediate (4e⁻ pathway)
 ORR_N_ELECTRONS: Dict[str, int] = {"OOH": 1, "O": 2, "OH": 3}
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _safe_float(x, default=np.nan) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
 
 
 def _load_ads_corr(ref_dir: str | Path = "ref_gas") -> Dict[str, float]:
@@ -572,11 +585,23 @@ def _prepare_slab(
     write(GROOT / "H2_box.cif", h2_rel)
 
     # slab relaxation
-    slab_u_rel, E_slab_u = relax_freeH(slab_u_raw, steps=slab_steps, fmax=0.03)
+    slab_u_rel, E_slab_u = relax_freeH(
+        slab_u_raw,
+        steps=slab_steps,
+        fmax=0.03,
+        relaxation_scope="partial",
+        n_fix_layers=2,
+    )
     write(UROOT / "slab/user_slab_relaxed.cif", slab_u_rel)
 
     # Check energy difference before/after relaxation
-    _, E_slab_u_raw = relax_freeH(slab_u_raw, steps=0, fmax=0.03)
+    _, E_slab_u_raw = relax_freeH(
+        slab_u_raw,
+        steps=0,
+        fmax=0.03,
+        relaxation_scope="partial",
+        n_fix_layers=2,
+    )
     slab_relax_drop = bool(abs(E_slab_u - E_slab_u_raw) > 0.60)
 
     n_top_u = len(layer_indices(slab_u_rel, n=1)[0])
@@ -615,56 +640,116 @@ def _build_target_sites(
     metadata needed for post-relaxation tracking.
     """
     target_sites: List[Dict[str, object]] = []
+    mtype_norm = str(mtype).lower()
+    site_names = [str(s) for s in (sites or ())]
 
     if user_ads_sites:
-        for label, site in user_ads_sites.items():
+        projected_sites = user_ads_sites
+        if mtype_norm == "oxide":
+            projected_sites = _project_oxide_her_sites_to_otop(
+                slab_u_rel,
+                user_ads_sites,
+                dz=0.0,
+                extra_z=0.0,
+            )
+        for label, site in projected_sites.items():
             kind = getattr(site, "kind", "unknown")
             pos = np.asarray(getattr(site, "position", []), dtype=float)
             surface_indices = tuple(int(i) for i in getattr(site, "surface_indices", ()) or ())
-            if pos.shape[0] >= 2:
-                xyz = (
-                    np.asarray(pos[:3], dtype=float)
-                    if pos.shape[0] >= 3
-                    else np.asarray([pos[0], pos[1], np.nan], dtype=float)
-                )
-                target_sites.append({
-                    "site_label": str(label),
-                    "site_kind": str(kind),
-                    "xy": np.asarray(pos[:2], dtype=float),
-                    "initial_xyz": xyz,
-                    "surface_indices": surface_indices,
-                    "seed_source": "user_ads_sites",
-                })
-    else:
-        if mtype == "metal":
-            xy_map = site_xy_by_layers_metal(slab_u_rel)
-            sites_iter = []
-            seen_metal = set()
-            for site_name in sites_iter:
-                s_norm = _canonicalize_metal_kind(site_name)
-                if s_norm in seen_metal:
-                    continue
-                seen_metal.add(s_norm)
-                sites_iter.append(s_norm)
-        elif mtype == "oxide":
-            sites_iter = list(sites)
-            xy_map = site_xy_by_layers_oxide(slab_u_rel)
-        else:
-            raise ValueError(f"Unknown mtype='{mtype}'.")
+            if pos.shape[0] < 2:
+                continue
+            xyz = (
+                np.asarray(pos[:3], dtype=float)
+                if pos.shape[0] >= 3
+                else np.asarray([pos[0], pos[1], np.nan], dtype=float)
+            )
+            target_sites.append({
+                "site_label": str(label),
+                "site_kind": str(kind),
+                "xy": np.asarray(pos[:2], dtype=float),
+                "initial_xyz": xyz,
+                "surface_indices": surface_indices,
+                "seed_source": "user_ads_sites_projected" if mtype_norm == "oxide" else "user_ads_sites",
+            })
+        return target_sites
+
+    if mtype_norm == "metal":
+        xy_map = site_xy_by_layers_metal(slab_u_rel)
+        seen_metal = set()
+        sites_iter: List[str] = []
+        for site_name in site_names:
+            s_norm = _canonicalize_metal_kind(site_name)
+            if s_norm in seen_metal:
+                continue
+            seen_metal.add(s_norm)
+            sites_iter.append(s_norm)
+        if not sites_iter:
+            sites_iter = list(xy_map.keys())
 
         for site_name in sites_iter:
-            if site_name in xy_map:
-                xy = np.asarray(xy_map[site_name], dtype=float)
-                target_sites.append({
-                    "site_label": str(site_name),
-                    "site_kind": str(site_name),
-                    "xy": xy,
-                    "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
-                    "surface_indices": tuple(),
-                    "seed_source": "geometry_default",
-                })
+            if site_name not in xy_map:
+                continue
+            xy = np.asarray(xy_map[site_name], dtype=float)
+            target_sites.append({
+                "site_label": str(site_name),
+                "site_kind": str(site_name),
+                "xy": xy,
+                "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
+                "surface_indices": tuple(),
+                "seed_source": "geometry_default",
+            })
+        return target_sites
 
-    return target_sites
+    if mtype_norm == "oxide":
+        max_sites = max(1, len(site_names)) if site_names else 6
+        oxide_sites = _generate_oxide_her_oanchor_sites(
+            slab_u_rel,
+            max_sites=int(max_sites),
+        )
+        oxide_sites = _project_oxide_her_sites_to_otop(
+            slab_u_rel,
+            oxide_sites,
+            dz=0.0,
+            extra_z=0.0,
+        )
+
+        for idx, site in enumerate(oxide_sites or [], start=1):
+            pos = np.asarray(getattr(site, "position", []), dtype=float)
+            if pos.shape[0] < 2:
+                continue
+            xyz = (
+                np.asarray(pos[:3], dtype=float)
+                if pos.shape[0] >= 3
+                else np.asarray([pos[0], pos[1], np.nan], dtype=float)
+            )
+            target_sites.append({
+                "site_label": f"o_top_{idx}",
+                "site_kind": str(getattr(site, "kind", "o_top")),
+                "xy": np.asarray(pos[:2], dtype=float),
+                "initial_xyz": xyz,
+                "surface_indices": tuple(int(i) for i in getattr(site, "surface_indices", ()) or ()),
+                "seed_source": "oxide_o_anchor",
+            })
+
+        if target_sites:
+            return target_sites
+
+        xy_map = site_xy_by_layers_oxide(slab_u_rel)
+        for site_name in site_names:
+            if site_name not in xy_map:
+                continue
+            xy = np.asarray(xy_map[site_name], dtype=float)
+            target_sites.append({
+                "site_label": str(site_name),
+                "site_kind": str(site_name),
+                "xy": xy,
+                "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
+                "surface_indices": tuple(),
+                "seed_source": "geometry_default_fallback",
+            })
+        return target_sites
+
+    raise ValueError(f"Unknown mtype='{mtype}'.")
 
 
 # ---------------------------------------------------------------------
@@ -699,6 +784,8 @@ def _run_her_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
+    her_relaxation_scope: str = "auto",
+    her_n_fix_layers: int = 2,
 ):
     if gas != "H2":
         raise NotImplementedError("HER CHE_mode currently supports only 'H2' gas.")
@@ -723,6 +810,14 @@ def _run_her_che(
 
     target_sites = _build_target_sites(mtype, slab_u_rel, sites, user_ads_sites)
 
+    if not target_sites:
+        raise RuntimeError(f"No target adsorption sites were built for mtype='{mtype}'.")
+
+    if str(her_relaxation_scope).strip().lower() == "auto":
+        resolved_her_relaxation_scope = "rigid" if str(mtype).lower() == "oxide" else "partial"
+    else:
+        resolved_her_relaxation_scope = normalize_relaxation_scope(her_relaxation_scope)
+
     # --- Optional HER guardrail (single-site; cheap) ---
     her_guard = None
     if bool(her_guardrail):
@@ -740,6 +835,8 @@ def _run_her_che(
                 site_preference=str(her_site_preference),
                 use_net_corr=bool(her_use_net_corr),
                 out_cif=out_cif_g,
+                relaxation_scope=resolved_her_relaxation_scope,
+                n_fix_layers=int(her_n_fix_layers),
             )
             if her_guard is not None:
                 her_guard["z_steps_used"] = int(z_steps_g)
@@ -759,12 +856,15 @@ def _run_her_che(
         kind = str(site_seed.get("site_kind", "unknown"))
         xy = np.asarray(site_seed.get("xy", [np.nan, np.nan]), dtype=float)
 
-        Au, E_uH, _disp_raw = site_energy_two_stage(
+        Au, E_uH, _disp_raw, relax_meta = site_energy_two_stage(
             slab_u_rel,
             xy,
             H0S,
             z_steps,
             free_steps,
+            relaxation_scope=resolved_her_relaxation_scope,
+            n_fix_layers=int(her_n_fix_layers),
+            return_meta=True,
         )
 
         dE_u = E_uH - E_slab_u - 0.5 * E_H2
@@ -810,6 +910,16 @@ def _run_her_che(
             "structure_cif": str((UROOT / f"sites/user_{label}_H.cif").resolve()),
             "n_slab_atoms": int(meta_flags["n_atoms"]),
             "thermo_mode": str(thermo_mode),
+            "her_relaxation_scope": str(resolved_her_relaxation_scope),
+            "her_n_fix_layers": int(her_n_fix_layers),
+            "selected_h0": _safe_float((relax_meta or {}).get("selected_h0")),
+            "z_relax_n_steps": int((relax_meta or {}).get("z_relax_n_steps", 0)),
+            "z_relax_converged": (relax_meta or {}).get("z_relax_converged", None),
+            "z_relax_relaxed_atoms": int((relax_meta or {}).get("z_relax_relaxed_atoms", 0)),
+            "fine_relax_n_steps": int((relax_meta or {}).get("fine_relax_n_steps", 0)),
+            "fine_relax_converged": (relax_meta or {}).get("fine_relax_converged", None),
+            "fine_relax_relaxed_atoms": int((relax_meta or {}).get("fine_relax_relaxed_atoms", 0)),
+            "total_relax_n_steps": int((relax_meta or {}).get("total_relax_n_steps", 0)),
             "ΔG_H_CHE (eV)": float(dG_u),
             "ΔG_H_local (eV)": np.nan,
             "local_thermo_corr (eV)": np.nan,
@@ -893,28 +1003,7 @@ def _run_her_che(
                 rows[int(ridx)]["zpe_warning"] = f"local_zpe_failed:{e}"
 
     df = pd.DataFrame(rows)
-
     oxide_descriptor_summary = None
-    if str(mtype).lower() == 'oxide' and str(oxide_descriptor_mode) != 'Basic HER screening':
-        try:
-            oxide_descriptor_summary = run_oxide_descriptor_profile(
-                slab_u_rel=slab_u_rel,
-                E_slab_u=float(E_slab_u),
-                E_H2=float(E_H2),
-                d1_rows_df=df.copy(),
-                d1_targets=target_sites,
-                out_root=out_root,
-                z_steps=int(z_steps),
-                free_steps=int(free_steps),
-                use_net_corr=bool(use_net_corr),
-                descriptor_mode=str(oxide_descriptor_mode),
-                max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
-                pair_limit=int(oxide_descriptor_pair_limit),
-            )
-        except Exception as e:
-            oxide_descriptor_summary = {'error': str(e), 'descriptor_mode': str(oxide_descriptor_mode)}
-            if str(oxide_descriptor_mode) in {'D3_pair only (H2 pairing proxy)', 'Full 3-stage profile (experimental)'}:
-                oxide_descriptor_summary['caution'] = THREE_STAGE_OXIDE_HER_CAUTION
 
     if str(thermo_mode) == "CHE correction (fast screening)":
         df["ΔG_H (eV)"] = df["ΔG_H_CHE (eV)"]
@@ -928,6 +1017,29 @@ def _run_her_che(
     else:
         df = df.assign(abs_val=lambda x: x["ΔE_H_user (eV)"].abs()).sort_values(["abs_val"])
 
+    if str(mtype).lower() == 'oxide' and str(oxide_descriptor_mode) != 'Basic HER screening':
+        try:
+            oxide_descriptor_summary = run_oxide_descriptor_profile(
+                slab_u_rel=slab_u_rel,
+                E_slab_u=float(E_slab_u),
+                E_H2=float(E_H2),
+                d1_rows_df=df.drop(columns=["abs_val"], errors="ignore").copy(),
+                d1_targets=target_sites,
+                out_root=out_root,
+                z_steps=int(z_steps),
+                free_steps=int(free_steps),
+                use_net_corr=bool(use_net_corr),
+                descriptor_mode=str(oxide_descriptor_mode),
+                max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
+                pair_limit=int(oxide_descriptor_pair_limit),
+                relaxation_scope=str(resolved_her_relaxation_scope),
+                n_fix_layers=int(her_n_fix_layers),
+            )
+        except Exception as e:
+            oxide_descriptor_summary = {'error': str(e), 'descriptor_mode': str(oxide_descriptor_mode)}
+            if str(oxide_descriptor_mode) in {'D3_pair only (H2 pairing proxy)', 'Full 3-stage profile (experimental)'}:
+                oxide_descriptor_summary['caution'] = THREE_STAGE_OXIDE_HER_CAUTION
+
     out_csv = out_root / "results_sites_her.csv"
     df.drop(columns=["abs_val"], errors="ignore").to_csv(
         out_csv,
@@ -940,6 +1052,8 @@ def _run_her_che(
         "user_slab": str(Path(user_slab_cif).resolve()),
         "relax_mode": relax_mode,
         "steps": {"slab": slab_steps, "H": z_steps, "H2": h2_steps},
+        "HER_RELAXATION_SCOPE": str(resolved_her_relaxation_scope),
+        "HER_N_FIX_LAYERS": int(her_n_fix_layers),
         "thermo": {"NET_CORR": net_corr, "standard": f"{STANDARD_CHE_CORR:.2f} eV"},
         "E_H2": E_H2,
         "HER_GUARDRAIL": her_guard,
@@ -1639,6 +1753,8 @@ def _compute_her_guardrail_from_prepared(
     site_preference: str = "ontop",
     use_net_corr: bool = True,
     out_cif: Path | None = None,
+    relaxation_scope: str = "partial",
+    n_fix_layers: int = 2,
 ) -> dict[str, object] | None:
     """Compute a single H* adsorption as a guardrail using the prepared slab and H2 ref."""
     pick = _pick_guardrail_site(target_sites, preference=site_preference)
@@ -1654,6 +1770,8 @@ def _compute_her_guardrail_from_prepared(
         H0S,
         int(z_steps),
         int(free_steps),
+        relaxation_scope=relaxation_scope,
+        n_fix_layers=int(n_fix_layers),
     )
 
     slab_only = Au[: len(slab_u_rel)]
@@ -2191,6 +2309,8 @@ def run_metal_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
+    her_relaxation_scope: str = "auto",
+    her_n_fix_layers: int = 2,
 ):
     return _run_her_che(
         "metal",
@@ -2215,6 +2335,8 @@ def run_metal_che(
         oxide_descriptor_mode=oxide_descriptor_mode,
         oxide_descriptor_max_reactive_per_kind=oxide_descriptor_max_reactive_per_kind,
         oxide_descriptor_pair_limit=oxide_descriptor_pair_limit,
+        her_relaxation_scope=her_relaxation_scope,
+        her_n_fix_layers=her_n_fix_layers,
     )
 
 
@@ -2240,6 +2362,8 @@ def run_oxide_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
+    her_relaxation_scope: str = "auto",
+    her_n_fix_layers: int = 2,
 ):
     return _run_her_che(
         "oxide",
@@ -2264,6 +2388,8 @@ def run_oxide_che(
         oxide_descriptor_mode=oxide_descriptor_mode,
         oxide_descriptor_max_reactive_per_kind=oxide_descriptor_max_reactive_per_kind,
         oxide_descriptor_pair_limit=oxide_descriptor_pair_limit,
+        her_relaxation_scope=her_relaxation_scope,
+        her_n_fix_layers=her_n_fix_layers,
     )
 
 

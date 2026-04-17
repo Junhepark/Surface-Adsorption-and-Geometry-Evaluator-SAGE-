@@ -55,6 +55,28 @@ def _pbc_min_image_xy_distance_sq(atoms, xy_ref, xy_target):
         d = np.asarray(xy_target, dtype=float) - np.asarray(xy_ref, dtype=float)
         return float(np.dot(d, d))
 
+
+def _xy_frac_and_center_distance_sq(atoms, xy):
+    """Return wrapped fractional (fx, fy) and squared distance to cell center (0.5, 0.5)."""
+    cell = np.array(atoms.get_cell(), dtype=float)
+    A = np.column_stack([cell[0, :2], cell[1, :2]])
+    invA = np.linalg.inv(A)
+    f = invA @ np.asarray(xy, dtype=float)
+    fx, fy = f - np.floor(f)
+    d2 = float((fx - 0.5) ** 2 + (fy - 0.5) ** 2)
+    return float(fx), float(fy), d2
+
+
+def _inside_fractional_margin(atoms, xy, frac_margin: float = 0.15):
+    """True if xy lies away from PBC boundaries in fractional xy coordinates."""
+    try:
+        fx, fy, _ = _xy_frac_and_center_distance_sq(atoms, xy)
+        m = float(frac_margin)
+        return (m < fx < (1.0 - m)) and (m < fy < (1.0 - m))
+    except Exception:
+        return True
+
+
 def _top_surface_o_indices(atoms, z_window: float = 2.2, min_expand_to: float = 4.0):
     syms = np.array(atoms.get_chemical_symbols(), dtype=object)
     pos = atoms.get_positions()
@@ -71,19 +93,38 @@ def _top_surface_o_indices(atoms, z_window: float = 2.2, min_expand_to: float = 
     i_best = int(o_idx[np.argmax(z[o_idx])])
     return [i_best]
 
-def _generate_oxide_her_oanchor_sites(atoms, max_sites: int = 6, z_window: float = 2.2, min_xy_sep: float = 1.5):
-    """Generate oxide-HER site seeds directly from top-surface oxygen anchors.
 
-    Returns AdsSite objects whose positions sit on top-surface O atoms. The actual H height
-    is added later by the common O-top projection helper / run path.
+def _generate_oxide_her_oanchor_sites(
+    atoms,
+    max_sites: int = 6,
+    z_window: float = 2.2,
+    min_xy_sep: float = 1.5,
+    frac_margin: float = 0.15,
+):
+    """Generate oxide-HER O-top seeds with preference for central top-surface O anchors.
+
+    The initial H/OH seed is still physically equivalent under PBC if placed near a cell boundary,
+    but center-biased seeds are easier to interpret visually and reduce fallback/label ambiguity.
     """
     pos = atoms.get_positions()
     top_o = _top_surface_o_indices(atoms, z_window=float(z_window))
     if not top_o:
         return []
 
+    # Prefer top-surface O atoms that are away from fractional cell boundaries and close to cell center.
+    central = [int(i) for i in top_o if _inside_fractional_margin(atoms, pos[int(i), :2], frac_margin=frac_margin)]
+    candidates = central if central else [int(i) for i in top_o]
+
+    def _sort_key(i):
+        try:
+            fx, fy, d2c = _xy_frac_and_center_distance_sq(atoms, pos[int(i), :2])
+        except Exception:
+            d2c = 0.0
+        # prioritize centrality first, then highest z as tie-breaker
+        return (float(d2c), -float(pos[int(i), 2]))
+
     chosen = []
-    for idx in sorted(top_o, key=lambda i: float(pos[i, 2]), reverse=True):
+    for idx in sorted(candidates, key=_sort_key):
         xy_i = pos[idx, :2]
         too_close = False
         for j in chosen:
@@ -96,10 +137,28 @@ def _generate_oxide_her_oanchor_sites(atoms, max_sites: int = 6, z_window: float
         if len(chosen) >= int(max_sites):
             break
 
+    # Fallback: if the central set was exhausted or empty after separation filtering, add more top-O anchors.
+    if len(chosen) < int(max_sites):
+        for idx in sorted([int(i) for i in top_o], key=_sort_key):
+            if idx in chosen:
+                continue
+            xy_i = pos[idx, :2]
+            too_close = False
+            for j in chosen:
+                if _pbc_min_image_xy_distance_sq(atoms, xy_i, pos[j, :2]) < float(min_xy_sep) ** 2:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            chosen.append(int(idx))
+            if len(chosen) >= int(max_sites):
+                break
+
     sites = []
     for k, idx in enumerate(chosen):
         sites.append(AdsSite(kind='o_top', position=tuple(float(x) for x in pos[idx]), surface_indices=(int(idx),)))
     return sites
+
 
 def _project_single_oxide_her_site_to_otop(atoms, site, dz: float = 1.0, extra_z: float = 0.0):
     """Project one oxide HER seed to a top-surface oxygen anchor.
@@ -133,6 +192,7 @@ def _project_single_oxide_her_site_to_otop(atoms, site, dz: float = 1.0, extra_z
     x, y, z = [float(v) for v in pos[int(anchor_idx)]]
     return AdsSite(kind='o_top', position=(x, y, z + float(dz) + float(extra_z)), surface_indices=(int(anchor_idx),))
 
+
 def _project_oxide_her_sites_to_otop(atoms, sites, dz: float = 1.0, extra_z: float = 0.0):
     if not sites:
         return sites
@@ -143,4 +203,3 @@ def _project_oxide_her_sites_to_otop(atoms, sites, dz: float = 1.0, extra_z: flo
     if isinstance(sites, list):
         return [_project_single_oxide_her_site_to_otop(atoms, site, dz=dz, extra_z=extra_z) for site in sites]
     return sites
-
