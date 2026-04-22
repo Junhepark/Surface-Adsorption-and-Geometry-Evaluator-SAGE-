@@ -1,4 +1,4 @@
-from math import gcd
+from math import ceil, gcd
 
 import numpy as np
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -23,6 +23,10 @@ except Exception as e:
 
 _DEFAULT_SLAB_MIN_THICKNESS = 12.0
 _DEFAULT_SLAB_MAX_CANDIDATES = 6
+_DEFAULT_MIN_BULK_ATOMS_BEFORE_SLABIFY = 8
+_DEFAULT_TARGET_BULK_ATOMS_BEFORE_SLABIFY = 16
+_DEFAULT_MAX_BULK_REPEAT_BEFORE_SLABIFY = 3
+_DEFAULT_MIN_AXIS_SPAN_BEFORE_SLABIFY_A = 8.0
 
 
 def _facet_warning_for_family_miller(surface_family: str, miller) -> str:
@@ -154,11 +158,97 @@ def _vacuum_target_from_ui(choice_label: str, custom_value: float | None = None)
     return 30.0
 
 
+
+
+def _suggest_miller_aware_bulk_repeat(
+    atoms,
+    miller=(1, 1, 1),
+    *,
+    min_axis_span_A: float = _DEFAULT_MIN_AXIS_SPAN_BEFORE_SLABIFY_A,
+    max_repeat: int = _DEFAULT_MAX_BULK_REPEAT_BEFORE_SLABIFY,
+):
+    """Heuristic pre-slabify repeat suggestion tied to the requested Miller index.
+
+    This is intentionally conservative. It does not guarantee an ideal slab for every
+    crystal system, but it reduces the chance that a very short parent cell is asked
+    to support a non-trivial Miller cut without enough real-space span.
+    """
+    hkl = tuple(int(x) for x in miller)
+    cell = np.asarray(atoms.get_cell(), dtype=float)
+    axis_lengths = [float(np.linalg.norm(cell[i])) for i in range(3)]
+    reps = [1, 1, 1]
+    for i, (h_i, axis_len) in enumerate(zip(hkl, axis_lengths)):
+        if int(h_i) == 0:
+            continue
+        if axis_len <= 1e-8:
+            continue
+        reps[i] = int(min(max_repeat, max(1, ceil(float(min_axis_span_A) / float(axis_len)))))
+    return tuple(int(x) for x in reps), {
+        "bulk_axis_lengths_before_slabify_A": tuple(float(x) for x in axis_lengths),
+        "bulk_min_axis_span_target_before_slabify_A": float(min_axis_span_A),
+    }
+
+
+
+def _expand_small_bulk_before_slabify(
+    atoms,
+    *,
+    miller=(1, 1, 1),
+    min_bulk_atoms: int = _DEFAULT_MIN_BULK_ATOMS_BEFORE_SLABIFY,
+    target_bulk_atoms: int = _DEFAULT_TARGET_BULK_ATOMS_BEFORE_SLABIFY,
+    max_repeat: int = _DEFAULT_MAX_BULK_REPEAT_BEFORE_SLABIFY,
+    min_axis_span_A: float = _DEFAULT_MIN_AXIS_SPAN_BEFORE_SLABIFY_A,
+):
+    """Pre-expand bulk before slabify using bounded isotropic + Miller-aware heuristics.
+
+    Two bounded rules are combined:
+      1) isotropic upscaling for ultra-small bulk cells;
+      2) axis-wise upscaling when the requested Miller index relies on axes that are too short.
+
+    The final repeat is the element-wise maximum of those two suggestions, capped by
+    ``max_repeat`` on each axis.
+    """
+    n_before = int(len(atoms))
+    iso_rep = 1
+    if n_before > 0 and n_before < int(min_bulk_atoms):
+        iso_rep = int(max(2, ceil((float(target_bulk_atoms) / float(n_before)) ** (1.0 / 3.0))))
+        iso_rep = int(min(max_repeat, max(2, iso_rep)))
+
+    miller_rep, miller_meta = _suggest_miller_aware_bulk_repeat(
+        atoms,
+        miller=miller,
+        min_axis_span_A=float(min_axis_span_A),
+        max_repeat=int(max_repeat),
+    )
+    total_rep = tuple(int(max(iso_rep, miller_rep[i])) for i in range(3))
+
+    meta = {
+        "bulk_atoms_before_slabify": n_before,
+        "bulk_atoms_after_prescale": n_before,
+        "bulk_atoms_after_miller_prescale": n_before,
+        "bulk_expanded_before_slabify": total_rep != (1, 1, 1),
+        "bulk_supercell_before_slabify": total_rep,
+        "bulk_isotropic_supercell_before_slabify": (iso_rep, iso_rep, iso_rep),
+        "bulk_miller_aware_supercell_before_slabify": tuple(int(x) for x in miller_rep),
+        "bulk_requested_miller_for_prescale": tuple(int(x) for x in miller),
+        **miller_meta,
+    }
+    if total_rep == (1, 1, 1):
+        return atoms.copy(), meta
+
+    expanded = atoms.repeat(total_rep)
+    meta["bulk_atoms_after_prescale"] = int(len(expanded))
+    meta["bulk_atoms_after_miller_prescale"] = int(len(expanded))
+    return expanded, meta
+
+
 def slabify_from_bulk(atoms, miller=(1, 1, 1), min_slab_size=12.0, min_vacuum_size=30.0, max_candidates=6):
     if not HAS_SLABIFY:
         raise RuntimeError(f"pymatgen SlabGenerator not available: {SLABIFY_IMPORT_ERR}")
 
-    struct = AseAtomsAdaptor.get_structure(atoms)
+    miller = tuple(int(x) for x in miller)
+    atoms_for_slabify, prescale_meta = _expand_small_bulk_before_slabify(atoms, miller=miller)
+    struct = AseAtomsAdaptor.get_structure(atoms_for_slabify)
     gen = SlabGenerator(
         initial_structure=struct,
         miller_index=tuple(int(x) for x in miller),
@@ -173,8 +263,8 @@ def slabify_from_bulk(atoms, miller=(1, 1, 1), min_slab_size=12.0, min_vacuum_si
 
     cand_atoms = []
     cand_meta = []
-    oxide_info = infer_oxide_family_from_atoms(atoms)
-    fam = _infer_interface_surface_family(atoms)
+    oxide_info = infer_oxide_family_from_atoms(atoms_for_slabify)
+    fam = _infer_interface_surface_family(atoms_for_slabify)
     facet_warning = _facet_warning_for_family_miller(fam, miller)
 
     for i, s in enumerate(slabs):
@@ -183,7 +273,7 @@ def slabify_from_bulk(atoms, miller=(1, 1, 1), min_slab_size=12.0, min_vacuum_si
         rep = validate_structure(a, target_area=70.0)
         meta = {
             "idx": i,
-            "miller": tuple(miller),
+            "miller": miller,
             "n_atoms": len(a),
             "formula": a.get_chemical_formula(),
             "vacuum_z": float(getattr(rep, "vacuum_z", np.nan)),
@@ -194,6 +284,7 @@ def slabify_from_bulk(atoms, miller=(1, 1, 1), min_slab_size=12.0, min_vacuum_si
             "spacegroup_symbol": oxide_info.get("spacegroup_symbol"),
             "spacegroup_number": oxide_info.get("spacegroup_number"),
             "facet_warning": facet_warning,
+            **prescale_meta,
         }
         if fam != "metal":
             meta.update(_classify_surface_exposure(a, z_window=1.8))

@@ -25,21 +25,32 @@ from ocp_app.core.anchors.common import (
     relax_freeH,
     normalize_relaxation_scope,
     site_energy_two_stage,
-    site_energy_oh_anchoronly,
     site_energy_oh_constrained,
+    site_energy_oh_anchoronly, 
 )
 
 THREE_STAGE_OXIDE_HER_CAUTION = (
-    "Caution: The O–H and reactive-H stages are evaluated using the OCP-based "
-    "relaxed-state workflow, whereas the H₂ pairing stage is only an approximate "
-    "release proxy rather than an explicit reaction barrier. The final-stage result "
-    "should therefore be used as a supportive screening indicator, not as a "
-    "quantitatively validated kinetic metric."
+    "Caution: In the current oxide workflow, D1 is treated as a contextual O-top protonation probe, "
+    "whereas D2 is the primary reactive-H screening output. D2 follows the main oxide HER (including rigid-initialization handling and seed-height selection) "
+    "relaxation setting selected upstream, so changes in relaxation freedom can shift the final "
+    "screening value. Both values should be interpreted as screening indicators rather than "
+    "quantitatively validated absolute thermodynamic metrics."
 )
 
 DESCRIPTOR_D1_DISP_THRESH_A = 1.60
 DESCRIPTOR_D2_DISP_THRESH_A = 1.20
 DESCRIPTOR_ABS_DE_THRESH_EV = 3.0
+
+D1_CLEAN_HOOK_K = 18.0
+D1_PREOH_HOOK_K = 12.0
+D1_HOOK_EXTRA_A = 0.12
+D1_SHELL_MARGIN_A = 0.20
+D1_ANCHOR_MAX_Z_LIFT_A = 0.90
+D1_ANCHOR_WARN_Z_LIFT_A = 0.60
+D1_ANCHOR_METAL_DIST_ABS_MAX_A = 2.80
+D1_ANCHOR_METAL_DIST_RATIO_MAX = 1.35
+D1_ANCHOR_METAL_DIST_BUFFER_A = 0.35
+D1_RETAINED_NEIGHBORS_MIN = 1
 
 
 def _safe_float(x, default=np.nan) -> float:
@@ -131,62 +142,91 @@ def _classify_h_binding_state(atoms, h_index: int = -1) -> tuple[str, dict[str, 
     return cls, near
 
 
-def _compute_anchor_oh_distance(atoms, anchor_index: int, h_index: int = -1) -> float:
-    try:
-        pos = atoms.get_positions()
-        if h_index < 0:
-            h_index = len(atoms) + int(h_index)
-        dvec = np.asarray(pos[int(anchor_index)], dtype=float) - np.asarray(pos[int(h_index)], dtype=float)
-        _vec, dist = find_mic(dvec, atoms.get_cell(), atoms.get_pbc())
-        return float(dist)
-    except Exception:
-        return float('nan')
 
 
-def _infer_binding_class_from_basic_row(row: dict[str, object]) -> str:
-    p = str(row.get('structure_cif', '') or '').strip()
-    if p:
+def _metal_indices(atoms) -> np.ndarray:
+    syms = np.asarray(atoms.get_chemical_symbols(), dtype=object)
+    return np.asarray([i for i, s in enumerate(syms) if str(s).upper() != 'H' and str(s) not in ANION_SYMBOLS], dtype=int)
+
+
+def _nearest_metal_neighbors(atoms, anchor_index: int, max_neighbors: int = 2) -> list[dict[str, object]]:
+    pos = atoms.get_positions()
+    ref = np.asarray(pos[int(anchor_index)], dtype=float)
+    rows = []
+    for i in _metal_indices(atoms):
+        _vec, dist = find_mic(np.asarray(pos[int(i)], dtype=float) - ref, atoms.get_cell(), atoms.get_pbc())
+        rows.append({'index': int(i), 'symbol': str(atoms[int(i)].symbol), 'distance': float(dist)})
+    rows.sort(key=lambda r: (r['distance'], r['index']))
+    return rows[:max(1, int(max_neighbors))]
+
+
+def _classify_anchor_oh_state(initial_atoms, relaxed_atoms, anchor_index: int, h_index: int = -1) -> dict[str, object]:
+    initial_neighbors = _nearest_metal_neighbors(initial_atoms, anchor_index=anchor_index, max_neighbors=2)
+    relaxed_neighbors = _nearest_metal_neighbors(relaxed_atoms, anchor_index=anchor_index, max_neighbors=4)
+
+    pos0 = np.asarray(initial_atoms.get_positions()[int(anchor_index)], dtype=float)
+    pos1 = np.asarray(relaxed_atoms.get_positions()[int(anchor_index)], dtype=float)
+    z_lift = float(pos1[2] - pos0[2])
+
+    retained = 0
+    retained_ids = []
+    for nn in initial_neighbors:
+        ridx = int(nn['index'])
+        r0 = float(nn['distance'])
         try:
-            at = read(p)
-            cls, _near = _classify_h_binding_state(at, h_index=len(at)-1)
-            return str(cls)
+            _vec, r1 = find_mic(
+                np.asarray(relaxed_atoms.get_positions()[ridx], dtype=float) - pos1,
+                relaxed_atoms.get_cell(),
+                relaxed_atoms.get_pbc(),
+            )
+            r1 = float(r1)
         except Exception:
-            pass
-    relaxed = str(row.get('relaxed_site', row.get('final_site_kind', ''))).strip().lower()
-    if 'anion' in relaxed or 'o_' in relaxed:
-        return 'o_bound'
-    if any(tok in relaxed for tok in ('ontop', 'bridge', 'fcc', 'hcp', 'metal')):
-        return 'metal_adjacent'
-    return 'unresolved'
+            r1 = float('nan')
+        cutoff = max(D1_ANCHOR_METAL_DIST_ABS_MAX_A, r0 * D1_ANCHOR_METAL_DIST_RATIO_MAX, r0 + D1_ANCHOR_METAL_DIST_BUFFER_A)
+        if np.isfinite(r1) and r1 <= cutoff:
+            retained += 1
+            retained_ids.append(ridx)
 
+    nearest_relaxed = relaxed_neighbors[0] if relaxed_neighbors else {'index': -1, 'symbol': 'unknown', 'distance': float('nan')}
+    h_near = _nearest_non_h_info(relaxed_atoms, h_index=h_index)
 
-def _build_d2_from_basic_screening(df: pd.DataFrame, *, stage_dir: Path) -> tuple[dict[str, object] | None, str, str, str]:
-    if df is None or df.empty:
-        return None, 'missing', 'no basic HER screening rows', ''
-    work = df.copy()
-    energy_col = None
-    for c in ('ΔG_H(U,pH) (eV)', 'ΔG_H (eV)', 'ΔE_H_user (eV)'):
-        if c in work.columns:
-            energy_col = c
-            break
-    if energy_col is None:
-        return None, 'missing', 'no D2 energy column found', ''
-    csv_path = stage_dir / 'D2_candidates.csv'
-    try:
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        work.to_csv(csv_path, index=False)
-    except Exception:
-        csv_path = Path('')
-    best, q, w = _pick_descriptor_seed_row(work, energy_col=energy_col, disp_thresh=DESCRIPTOR_D2_DISP_THRESH_A)
-    if best is None:
-        return None, q, w, str(csv_path.resolve()) if str(csv_path) else ''
-    row = dict(best)
-    row['ΔG (eV)'] = _safe_float(best.get(energy_col))
-    row['binding_class'] = _infer_binding_class_from_basic_row(best)
-    row['relaxation_scope'] = str(best.get('her_relaxation_scope', best.get('relaxation_scope', best.get('fine_relax_scope', 'basic_her'))))
-    row['total_relax_n_steps'] = int(_safe_float(best.get('total_relax_n_steps', best.get('fine_relax_n_steps', 0)), 0.0))
-    row['fine_relax_relaxed_atoms'] = int(_safe_float(best.get('fine_relax_relaxed_atoms', best.get('relaxed_atom_count', 0)), 0.0))
-    return row, q, w, str(csv_path.resolve()) if str(csv_path) else ''
+    flags = []
+    valid = True
+    binding_class = 'o_bound'
+
+    nearest_metal_dist = float(nearest_relaxed.get('distance', float('nan')))
+    if retained < int(D1_RETAINED_NEIGHBORS_MIN):
+        valid = False
+        binding_class = 'detached_oh'
+        flags.append('detached_oh')
+    elif np.isfinite(z_lift) and z_lift > float(D1_ANCHOR_MAX_Z_LIFT_A):
+        valid = False
+        binding_class = 'detached_oh'
+        flags.append('anchor_lift_off')
+    elif np.isfinite(z_lift) and z_lift > float(D1_ANCHOR_WARN_Z_LIFT_A):
+        binding_class = 'lifted_but_bound'
+        flags.append('lifted_but_bound')
+
+    if not np.isfinite(nearest_metal_dist) or nearest_metal_dist > float(D1_ANCHOR_METAL_DIST_ABS_MAX_A):
+        valid = False
+        binding_class = 'detached_oh'
+        if 'detached_oh' not in flags:
+            flags.append('detached_oh')
+
+    return {
+        'descriptor_valid': bool(valid),
+        'binding_class': str(binding_class),
+        'qc_flags': ';'.join(flags) if flags else '',
+        'anchor_z_lift(Å)': float(z_lift),
+        'anchor_retained_m_neighbors': int(retained),
+        'anchor_retained_neighbor_ids': ','.join(str(i) for i in retained_ids) if retained_ids else '',
+        'anchor_nearest_metal_index': int(nearest_relaxed.get('index', -1)),
+        'anchor_nearest_metal_symbol': str(nearest_relaxed.get('symbol', 'unknown')),
+        'anchor_nearest_metal_distance(Å)': float(nearest_metal_dist),
+        'nearest_symbol': str(h_near.get('symbol', 'unknown')),
+        'nearest_index': int(h_near.get('index', -1)),
+        'nearest_distance(Å)': float(h_near.get('distance', float('nan'))),
+    }
 
 
 def _rows_same_basin(d1_row: dict[str, object] | None, d2_row: dict[str, object] | None, slab_u_rel=None, xy_tol: float = 0.20) -> bool:
@@ -256,10 +296,21 @@ def _pick_descriptor_seed_row(
     de_s = _series_or_default(work, "ΔE_H_user (eV)", np.nan)
     work["_abs_dE"] = np.abs(pd.to_numeric(de_s, errors="coerce"))
 
+    valid_s = _series_or_default(work, "descriptor_valid", True)
+    if getattr(valid_s, "dtype", None) == bool:
+        work["_valid"] = valid_s.fillna(False)
+    else:
+        work["_valid"] = valid_s.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
+
+    flags_s = _series_or_default(work, "qc_flags", "")
+    work["_flags"] = flags_s.astype(str)
+
     base = work[
         work["_energy"].notna()
         & work["_disp"].notna()
         & (work["_disp"] <= float(disp_thresh))
+        & (work["_valid"])
+        & (~work["_flags"].str.contains(r"detached_oh|surface_atom_extraction|water_like_fragment", case=False, na=False))
         & (
             work["_abs_dE"].isna()
             | (work["_abs_dE"] <= float(DESCRIPTOR_ABS_DE_THRESH_EV))
@@ -269,12 +320,15 @@ def _pick_descriptor_seed_row(
     if not ranked.empty:
         return ranked.iloc[0].to_dict(), "reliable", ""
 
-    finite = work[work["_energy"].notna()].copy()
-    ranked = _quality_rank(finite)
+    finite_valid = work[work["_energy"].notna() & work["_valid"]].copy()
+    ranked = _quality_rank(finite_valid)
     if not ranked.empty:
         disp_val = _safe_float(ranked.iloc[0].get("H_lateral_disp(Å)"))
         warning = f"Using low-confidence fallback seed (disp={disp_val:.3f} Å)."
         return ranked.iloc[0].to_dict(), "fallback_unreliable", warning
+
+    if work[work["_energy"].notna()].shape[0] > 0:
+        return None, "missing", "No descriptor-valid candidates remained after D1 QC."
 
     return None, "missing", "descriptor seed selection failed"
 
@@ -311,23 +365,34 @@ def _evaluate_constrained_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: fl
     xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float)
     sidx = tuple(int(i) for i in (site_seed.get('surface_indices') or ()))
     anchor_index = int(sidx[0]) if sidx else -1
+    if anchor_index < 0:
+        syms = np.asarray(slab_u_rel.get_chemical_symbols(), dtype=object)
+        pos = slab_u_rel.get_positions()
+        o_idx = np.where(syms == 'O')[0]
+        if len(o_idx) == 0:
+            raise ValueError('No oxygen atoms available for D1 anchor selection.')
+        d2 = [float(np.dot(pos[int(i), :2] - xy, pos[int(i), :2] - xy)) for i in o_idx]
+        anchor_index = int(o_idx[int(np.argmin(d2))])
 
     Au, E_uH, _disp_raw, relax_meta = site_energy_oh_anchoronly(
         slab_u_rel,
         xy,
-        anchor_index=anchor_index,
+        anchor_index=int(anchor_index),
         h0s=H0S,
         z_steps=int(z_steps),
         free_steps=int(free_steps),
         return_meta=True,
+        shell_margin=D1_SHELL_MARGIN_A,
+        hook_k=D1_CLEAN_HOOK_K,
+        hook_extra=D1_HOOK_EXTRA_A,
     )
     dE_u = float(E_uH) - float(E_slab_u) - 0.5 * float(E_H2)
     dG_u = float(dE_u + (0.24 if use_net_corr else 0.0))
 
     h_pos_final = np.asarray(Au.get_positions()[-1], dtype=float)
     _, disp_mic = _mic_xy_delta(slab_u_rel.get_cell(), slab_u_rel.get_pbc(), xy, h_pos_final[:2])
-    ho_dist = _compute_anchor_oh_distance(Au, anchor_index=anchor_index, h_index=len(Au)-1) if anchor_index >= 0 else float('nan')
 
+    qc = _classify_anchor_oh_state(slab_u_rel, Au, anchor_index=int(anchor_index), h_index=len(Au)-1)
     if out_cif is not None:
         out_cif.parent.mkdir(parents=True, exist_ok=True)
         write(out_cif, Au)
@@ -340,18 +405,29 @@ def _evaluate_constrained_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: fl
         'ΔE (eV)': float(dE_u),
         'ΔG (eV)': float(dG_u),
         'H_lateral_disp(Å)': float(disp_mic),
-        'binding_class': 'o_bound',
-        'nearest_symbol': 'O',
-        'nearest_index': int(anchor_index),
-        'nearest_distance(Å)': float(ho_dist),
+        'binding_class': str(qc.get('binding_class', 'unresolved')),
+        'descriptor_valid': bool(qc.get('descriptor_valid', False)),
+        'qc_flags': str(qc.get('qc_flags', '')),
+        'nearest_symbol': str(qc.get('nearest_symbol', 'unknown')),
+        'nearest_index': int(qc.get('nearest_index', anchor_index)),
+        'nearest_distance(Å)': float(qc.get('nearest_distance(Å)', float('nan'))),
+        'anchor_z_lift(Å)': float(qc.get('anchor_z_lift(Å)', float('nan'))),
+        'anchor_retained_m_neighbors': int(qc.get('anchor_retained_m_neighbors', 0)),
+        'anchor_retained_neighbor_ids': str(qc.get('anchor_retained_neighbor_ids', '')),
+        'anchor_nearest_metal_index': int(qc.get('anchor_nearest_metal_index', -1)),
+        'anchor_nearest_metal_symbol': str(qc.get('anchor_nearest_metal_symbol', 'unknown')),
+        'anchor_nearest_metal_distance(Å)': float(qc.get('anchor_nearest_metal_distance(Å)', float('nan'))),
         'final_h_x(Å)': float(h_pos_final[0]),
         'final_h_y(Å)': float(h_pos_final[1]),
         'final_h_z(Å)': float(h_pos_final[2]),
-        'site_transition_type': 'stable' if np.isfinite(disp_mic) and disp_mic <= MIGRATE_THR else 'displaced_same_site',
+        'site_transition_type': (
+            'stable' if bool(qc.get('descriptor_valid', False)) and np.isfinite(disp_mic) and disp_mic <= MIGRATE_THR
+            else ('lifted_but_bound' if str(qc.get('binding_class', '')) == 'lifted_but_bound' else 'detached_oh')
+        ),
         'placement_mismatch': False,
         'migrated': bool(np.isfinite(disp_mic) and disp_mic > MIGRATE_THR),
         'structure_cif': str(out_cif.resolve()) if out_cif is not None and out_cif.exists() else '',
-        'relaxation_scope': 'anchor_oh_only',
+        'relaxation_scope': 'anchor_oh_hookean',
         'n_fix_layers': 0,
         'selected_h0': _safe_float((relax_meta or {}).get('selected_h0')),
         'z_relax_n_steps': int((relax_meta or {}).get('z_relax_n_steps', 0)),
@@ -361,7 +437,183 @@ def _evaluate_constrained_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: fl
         'fine_relax_converged': (relax_meta or {}).get('fine_relax_converged', None),
         'fine_relax_relaxed_atoms': int((relax_meta or {}).get('fine_relax_relaxed_atoms', 0)),
         'total_relax_n_steps': int((relax_meta or {}).get('total_relax_n_steps', 0)),
-        'local_free_count': int((relax_meta or {}).get('local_free_count', 1)),
+        'local_free_count': int((relax_meta or {}).get('local_free_count', 0)),
+        'shell_count': int((relax_meta or {}).get('shell_count', 0)),
+        'hook_k': _safe_float((relax_meta or {}).get('hook_k', D1_CLEAN_HOOK_K)),
+        'hook_extra': _safe_float((relax_meta or {}).get('hook_extra', D1_HOOK_EXTRA_A)),
+    }
+    return row
+
+
+def _resolve_anchor_index_from_seed(slab_u_rel, site_seed: dict[str, object]) -> int:
+    xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float)
+    sidx = tuple(int(i) for i in (site_seed.get('surface_indices') or ()))
+    anchor_index = int(sidx[0]) if sidx else -1
+    if anchor_index >= 0:
+        return int(anchor_index)
+    syms = np.asarray(slab_u_rel.get_chemical_symbols(), dtype=object)
+    pos = slab_u_rel.get_positions()
+    o_idx = np.where(syms == 'O')[0]
+    if len(o_idx) == 0:
+        raise ValueError('No oxygen atoms available for D1 anchor selection.')
+    d2 = [float(np.dot(pos[int(i), :2] - xy, pos[int(i), :2] - xy)) for i in o_idx]
+    return int(o_idx[int(np.argmin(d2))])
+
+
+def _select_background_oh_site(anchor_seed: dict[str, object], d1_targets: list[dict[str, object]], slab_u_rel, min_xy_sep: float = 1.2):
+    if not d1_targets:
+        return None
+    axy = np.asarray(anchor_seed.get('xy', [np.nan, np.nan]), dtype=float).reshape(2)
+    alabel = str(anchor_seed.get('site_label', ''))
+    best = None
+    best_key = None
+    for cand in d1_targets:
+        clabel = str(cand.get('site_label', ''))
+        if clabel == alabel:
+            continue
+        cxy = np.asarray(cand.get('xy', [np.nan, np.nan]), dtype=float).reshape(2)
+        if not np.isfinite(cxy).all():
+            continue
+        _, dxy = _mic_xy_delta(slab_u_rel.get_cell(), slab_u_rel.get_pbc(), axy, cxy)
+        if np.isfinite(dxy) and dxy < float(min_xy_sep):
+            continue
+        key = (-float(dxy), clabel)
+        if best is None or key < best_key:
+            best = cand
+            best_key = key
+    if best is not None:
+        return best
+    # fallback: farthest even if close
+    for cand in d1_targets:
+        clabel = str(cand.get('site_label', ''))
+        if clabel == alabel:
+            continue
+        cxy = np.asarray(cand.get('xy', [np.nan, np.nan]), dtype=float).reshape(2)
+        if not np.isfinite(cxy).all():
+            continue
+        _, dxy = _mic_xy_delta(slab_u_rel.get_cell(), slab_u_rel.get_pbc(), axy, cxy)
+        key = (-float(dxy), clabel)
+        if best is None or key < best_key:
+            best = cand
+            best_key = key
+    return best
+
+
+def _evaluate_prehydroxylated_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, site_seed: dict[str, object],
+                                           d1_targets: list[dict[str, object]], z_steps: int, free_steps: int, use_net_corr: bool,
+                                           out_cif: Path | None = None, bg_out_cif: Path | None = None) -> dict[str, object]:
+    label = str(site_seed.get('site_label', 'unknown'))
+    kind = str(site_seed.get('site_kind', 'unknown'))
+    xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float)
+    anchor_index = _resolve_anchor_index_from_seed(slab_u_rel, site_seed)
+
+    bg_seed = _select_background_oh_site(site_seed, d1_targets, slab_u_rel, min_xy_sep=1.2)
+    if bg_seed is None:
+        row = _evaluate_constrained_oh_descriptor(
+            slab_u_rel=slab_u_rel,
+            E_slab_u=E_slab_u,
+            E_H2=E_H2,
+            site_seed=site_seed,
+            z_steps=z_steps, free_steps=free_steps,
+            use_net_corr=use_net_corr,
+            out_cif=out_cif,
+        )
+        row['D1_model'] = 'clean_fallback'
+        row['background_site_label'] = 'NA'
+        row['background_structure_cif'] = ''
+        row['background_total_relax_n_steps'] = 0
+        return row
+
+    bg_xy = np.asarray(bg_seed.get('xy', [np.nan, np.nan]), dtype=float)
+    bg_index = _resolve_anchor_index_from_seed(slab_u_rel, bg_seed)
+
+    A_bg, E_bg, _bg_disp, bg_meta = site_energy_oh_anchoronly(
+        slab_u_rel,
+        bg_xy,
+        anchor_index=int(bg_index),
+        h0s=H0S,
+        z_steps=int(z_steps),
+        free_steps=int(free_steps),
+        return_meta=True,
+        shell_margin=D1_SHELL_MARGIN_A,
+        hook_k=D1_PREOH_HOOK_K,
+        hook_extra=D1_HOOK_EXTRA_A,
+    )
+    if bg_out_cif is not None:
+        bg_out_cif.parent.mkdir(parents=True, exist_ok=True)
+        write(bg_out_cif, A_bg)
+
+    Au, E_uH, _disp_raw, relax_meta = site_energy_oh_anchoronly(
+        A_bg,
+        xy,
+        anchor_index=int(anchor_index),
+        h0s=H0S,
+        z_steps=int(z_steps),
+        free_steps=int(free_steps),
+        return_meta=True,
+        shell_margin=D1_SHELL_MARGIN_A,
+        hook_k=D1_PREOH_HOOK_K,
+        hook_extra=D1_HOOK_EXTRA_A,
+    )
+    dE_u = float(E_uH) - float(E_bg) - 0.5 * float(E_H2)
+    dG_u = float(dE_u + (0.24 if use_net_corr else 0.0))
+
+    h_pos_final = np.asarray(Au.get_positions()[-1], dtype=float)
+    _, disp_mic = _mic_xy_delta(A_bg.get_cell(), A_bg.get_pbc(), xy, h_pos_final[:2])
+
+    qc = _classify_anchor_oh_state(A_bg, Au, anchor_index=int(anchor_index), h_index=len(Au)-1)
+    if out_cif is not None:
+        out_cif.parent.mkdir(parents=True, exist_ok=True)
+        write(out_cif, Au)
+
+    row = {
+        'site_label': label,
+        'site_kind': kind,
+        'seed_x': float(xy[0]),
+        'seed_y': float(xy[1]),
+        'ΔE (eV)': float(dE_u),
+        'ΔG (eV)': float(dG_u),
+        'H_lateral_disp(Å)': float(disp_mic),
+        'binding_class': str(qc.get('binding_class', 'unresolved')),
+        'descriptor_valid': bool(qc.get('descriptor_valid', False)),
+        'qc_flags': str(qc.get('qc_flags', '')),
+        'nearest_symbol': str(qc.get('nearest_symbol', 'unknown')),
+        'nearest_index': int(qc.get('nearest_index', anchor_index)),
+        'nearest_distance(Å)': float(qc.get('nearest_distance(Å)', float('nan'))),
+        'anchor_z_lift(Å)': float(qc.get('anchor_z_lift(Å)', float('nan'))),
+        'anchor_retained_m_neighbors': int(qc.get('anchor_retained_m_neighbors', 0)),
+        'anchor_retained_neighbor_ids': str(qc.get('anchor_retained_neighbor_ids', '')),
+        'anchor_nearest_metal_index': int(qc.get('anchor_nearest_metal_index', -1)),
+        'anchor_nearest_metal_symbol': str(qc.get('anchor_nearest_metal_symbol', 'unknown')),
+        'anchor_nearest_metal_distance(Å)': float(qc.get('anchor_nearest_metal_distance(Å)', float('nan'))),
+        'final_h_x(Å)': float(h_pos_final[0]),
+        'final_h_y(Å)': float(h_pos_final[1]),
+        'final_h_z(Å)': float(h_pos_final[2]),
+        'site_transition_type': (
+            'stable' if bool(qc.get('descriptor_valid', False)) and np.isfinite(disp_mic) and disp_mic <= MIGRATE_THR
+            else ('lifted_but_bound' if str(qc.get('binding_class', '')) == 'lifted_but_bound' else 'detached_oh')
+        ),
+        'placement_mismatch': False,
+        'migrated': bool(np.isfinite(disp_mic) and disp_mic > MIGRATE_THR),
+        'structure_cif': str(out_cif.resolve()) if out_cif is not None and out_cif.exists() else '',
+        'relaxation_scope': 'anchor_oh_hookean_preOH',
+        'n_fix_layers': 0,
+        'selected_h0': _safe_float((relax_meta or {}).get('selected_h0')),
+        'z_relax_n_steps': int((relax_meta or {}).get('z_relax_n_steps', 0)),
+        'z_relax_converged': (relax_meta or {}).get('z_relax_converged', None),
+        'z_relax_relaxed_atoms': int((relax_meta or {}).get('z_relax_relaxed_atoms', 0)),
+        'fine_relax_n_steps': int((relax_meta or {}).get('fine_relax_n_steps', 0)),
+        'fine_relax_converged': (relax_meta or {}).get('fine_relax_converged', None),
+        'fine_relax_relaxed_atoms': int((relax_meta or {}).get('fine_relax_relaxed_atoms', 0)),
+        'total_relax_n_steps': int((relax_meta or {}).get('total_relax_n_steps', 0)),
+        'local_free_count': int((relax_meta or {}).get('local_free_count', 0)),
+        'shell_count': int((relax_meta or {}).get('shell_count', 0)),
+        'hook_k': _safe_float((relax_meta or {}).get('hook_k', D1_PREOH_HOOK_K)),
+        'hook_extra': _safe_float((relax_meta or {}).get('hook_extra', D1_HOOK_EXTRA_A)),
+        'background_site_label': str(bg_seed.get('site_label', 'NA')),
+        'background_structure_cif': str(bg_out_cif.resolve()) if bg_out_cif is not None and bg_out_cif.exists() else '',
+        'background_total_relax_n_steps': int((bg_meta or {}).get('total_relax_n_steps', 0)),
+        'D1_model': 'prehydroxylated',
     }
     return row
 
@@ -537,29 +789,64 @@ def _build_pair_seed_records(best_d2_row: dict[str, object] | None = None, d2_ta
 def _classify_summary(summary: dict[str, object], mode: str) -> str:
     d1 = _safe_float(summary.get('D1_OH (eV)'))
     d2 = _safe_float(summary.get('D2_Hreact (eV)'))
+    d3 = _safe_float(summary.get('D3_pair_proxy (eV)'))
+    h2_like = bool(summary.get('D3_H2_like_motif', False))
+    d3_status = str(summary.get('D3_status', '')).strip().lower()
 
+    if mode == 'D1_OH only (O-top protonation)':
+        if not np.isfinite(d1):
+            return 'unresolved D1 probe'
+        if d1 > 0.3:
+            return 'weak O-top protonation tendency'
+        if d1 < -1.0:
+            return 'strong O-top OH tendency'
+        return 'moderate O-top protonation tendency'
     if mode == 'D2_Hreact only (reactive H state)':
         if not np.isfinite(d2):
-            return 'no D2 / basic HER result found'
-        if d2 > 0.3:
-            return 'weak H adsorption'
+            return 'no reactive-H screening state found'
+        if abs(d2) <= 0.5:
+            return 'promising reactive-H regime'
         if d2 < -0.5:
-            return 'strong H stabilization'
-        return 'moderate H adsorption'
+            return 'strong reactive-H stabilization'
+        return 'weak reactive-H stabilization'
+    if mode == 'D3_pair only (H2 pairing proxy)':
+        if d3_status in {'no_pair_seeds', 'no_valid_pair', 'all_candidates_failed', 'skip_same_basin', 'd2_unavailable'}:
+            return 'no pairing proxy resolved'
+        if not np.isfinite(d3):
+            return 'no pairing proxy resolved'
+        if h2_like and abs(d3) <= 0.5:
+            return 'promising pairing proxy'
+        if h2_like and d3 < -0.5:
+            return 'paired-H surface trapping'
+        if (not h2_like) and d3 < -0.5:
+            return 'non-H2-like paired trapping'
+        return 'pairing proxy / user review needed'
 
-    if not np.isfinite(d1) and not np.isfinite(d2):
-        return 'unresolved'
-    if np.isfinite(d1) and np.isfinite(d2):
-        if d1 > 0.3 and d2 > 0.3:
-            return 'poor proton acceptor'
-        if d1 < 0.0 and d2 > 0.3:
-            return 'OH-forming but poor HER surface'
-        if d1 > 0.3 and d2 <= 0.3:
-            return 'reactive-H favored over hydroxylation'
-        return 'intermediate / user review needed'
+    # Full 2-stage profile: D2 is the primary screening output; D1 is contextual.
+    if np.isfinite(d2):
+        if bool(summary.get('D2_same_basin_as_D1', False)):
+            return 'D2 reactive-H state overlaps the D1 OH basin'
+        if abs(d2) <= 0.5:
+            base = 'promising reactive-H regime'
+        elif d2 < -0.5:
+            base = 'strong reactive-H stabilization'
+        else:
+            base = 'weak reactive-H stabilization'
+        if np.isfinite(d1) and d1 > 0.3:
+            return f'{base} | weak O-top protonation tendency'
+        if np.isfinite(d1) and d1 < -1.0:
+            return f'{base} | strong O-top OH tendency'
+        if np.isfinite(d1):
+            return f'{base} | moderate O-top protonation tendency'
+        return base
+
     if np.isfinite(d1):
-        return 'D1 only resolved'
-    return 'D2 only resolved'
+        if d1 > 0.3:
+            return 'D2 unresolved | weak O-top protonation tendency'
+        if d1 < -1.0:
+            return 'D2 unresolved | strong O-top OH tendency'
+        return 'D2 unresolved | moderate O-top protonation tendency'
+    return 'unresolved oxide descriptor profile'
 
 
 def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
@@ -586,6 +873,8 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
         'D1_OH (eV)': np.nan, 'D1_site_label': 'NA', 'D1_structure_cif': '',
         'D1_seed_quality': 'missing', 'D1_seed_warning': '', 'D1_seed_disp(Å)': np.nan,
         'D1_binding_class': 'NA', 'D1_relaxation_scope': '', 'D1_total_relax_n_steps': 0, 'D1_fine_relax_relaxed_atoms': 0,
+        'D1_clean_OH (eV)': np.nan, 'D1_preOH_OH (eV)': np.nan, 'ΔD1_preOH-clean (eV)': np.nan,
+        'D1_background_site_label': 'NA', 'D1_background_structure_cif': '', 'D1_model': 'NA',
         'D2_Hreact (eV)': np.nan, 'D2_site_label': 'NA', 'D2_binding_class': 'NA',
         'D2_structure_cif': '', 'D2_seed_quality': 'missing', 'D2_seed_warning': '', 'D2_seed_disp(Å)': np.nan,
         'D2_relaxation_scope': '', 'D2_total_relax_n_steps': 0, 'D2_fine_relax_relaxed_atoms': 0,
@@ -608,76 +897,124 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
         summary['descriptor_mode'] = mode
         summary['caution'] = (str(summary.get('caution', '')).strip() + ' D3 is disabled in the user-facing app build.').strip()
 
-    need_d1 = mode in {'Full 2-stage profile (recommended)'}
+    need_d1 = mode in {'D1_OH only (O-top protonation)', 'Full 2-stage profile (recommended)'}
     need_d2 = mode in {'D2_Hreact only (reactive H state)', 'Full 2-stage profile (recommended)'}
     need_d3 = False
 
     d1_best = None
     d2_best = None
     d2_targets: list[dict[str, object]] = []
-    d1_scope = 'anchor_oh_only'
-    d2_scope = 'basic_her_screening'
+    d1_scope = 'anchor_oh_hookean_preOH'
+    d2_scope = 'partial' if resolved_scope == 'rigid' else resolved_scope
     d3_scope = d2_scope
 
     if need_d1:
         try:
-            d1_rows = []
+            d1_clean_rows = []
+            d1_pre_rows = []
             for i, site_seed in enumerate(d1_targets or []):
-                out_cif = stage_dir / f"D1_{i}_{_safe_label_token(site_seed.get('site_label','site'))}.cif"
-                row = _evaluate_constrained_oh_descriptor(
+                clean_cif = stage_dir / f"D1clean_{i}_{_safe_label_token(site_seed.get('site_label','site'))}.cif"
+                preoh_bg_cif = stage_dir / f"D1bg_{i}_{_safe_label_token(site_seed.get('site_label','site'))}.cif"
+                preoh_cif = stage_dir / f"D1_{i}_{_safe_label_token(site_seed.get('site_label','site'))}.cif"
+                clean_row = _evaluate_constrained_oh_descriptor(
                     slab_u_rel=slab_u_rel,
                     E_slab_u=E_slab_u,
                     E_H2=E_H2,
                     site_seed=site_seed,
-                    z_steps=z_steps,
-                    free_steps=free_steps,
+                    z_steps=z_steps, free_steps=free_steps,
                     use_net_corr=use_net_corr,
-                    out_cif=out_cif,
+                    out_cif=clean_cif,
                 )
-                row['stage'] = 'D1_OH'
-                d1_rows.append(row)
-            d1_df = pd.DataFrame(d1_rows)
+                clean_row['stage'] = 'D1_clean'
+                d1_clean_rows.append(clean_row)
+
+                pre_row = _evaluate_prehydroxylated_oh_descriptor(
+                    slab_u_rel=slab_u_rel,
+                    E_slab_u=E_slab_u,
+                    E_H2=E_H2,
+                    site_seed=site_seed,
+                    d1_targets=d1_targets or [],
+                    z_steps=z_steps, free_steps=free_steps,
+                    use_net_corr=use_net_corr,
+                    out_cif=preoh_cif,
+                    bg_out_cif=preoh_bg_cif,
+                )
+                pre_row['stage'] = 'D1_preOH'
+                d1_pre_rows.append(pre_row)
+
+            d1_clean_df = pd.DataFrame(d1_clean_rows)
+            d1_pre_df = pd.DataFrame(d1_pre_rows)
+            d1_clean_csv = stage_dir / 'D1_clean_candidates.csv'
             d1_csv = stage_dir / 'D1_candidates.csv'
-            if not d1_df.empty:
-                d1_df.to_csv(d1_csv, index=False)
+            clean_best = None
+            pre_best = None
+            if not d1_clean_df.empty:
+                d1_clean_df.to_csv(d1_clean_csv, index=False)
+                clean_best, q_clean, w_clean = _pick_descriptor_seed_row(d1_clean_df, energy_col='ΔG (eV)', disp_thresh=DESCRIPTOR_D1_DISP_THRESH_A)
+                if clean_best is not None:
+                    summary['D1_clean_OH (eV)'] = _safe_float(clean_best.get('ΔG (eV)'))
+            if not d1_pre_df.empty:
+                d1_pre_df.to_csv(d1_csv, index=False)
                 summary['D1_candidates_csv'] = str(d1_csv.resolve())
-                d1_best, q, w = _pick_descriptor_seed_row(d1_df, energy_col='ΔG (eV)', disp_thresh=DESCRIPTOR_D1_DISP_THRESH_A)
-                summary['D1_seed_quality'] = q
-                summary['D1_seed_warning'] = w
-                if d1_best is not None:
-                    summary['D1_OH (eV)'] = _safe_float(d1_best.get('ΔG (eV)'))
-                    summary['D1_site_label'] = str(d1_best.get('site_label', 'unknown'))
-                    summary['D1_structure_cif'] = str(d1_best.get('structure_cif', ''))
-                    summary['D1_seed_disp(Å)'] = _safe_float(d1_best.get('H_lateral_disp(Å)'))
-                    summary['D1_binding_class'] = str(d1_best.get('binding_class', 'unknown'))
-                    summary['D1_relaxation_scope'] = str(d1_best.get('relaxation_scope', d1_scope))
-                    summary['D1_total_relax_n_steps'] = int(_safe_float(d1_best.get('total_relax_n_steps'), 0.0))
-                    summary['D1_fine_relax_relaxed_atoms'] = int(_safe_float(d1_best.get('fine_relax_relaxed_atoms'), 0.0))
+                pre_best, q_pre, w_pre = _pick_descriptor_seed_row(d1_pre_df, energy_col='ΔG (eV)', disp_thresh=DESCRIPTOR_D1_DISP_THRESH_A)
+                summary['D1_seed_quality'] = q_pre
+                summary['D1_seed_warning'] = w_pre
+                if pre_best is not None:
+                    summary['D1_preOH_OH (eV)'] = _safe_float(pre_best.get('ΔG (eV)'))
+                    summary['D1_background_site_label'] = str(pre_best.get('background_site_label', 'NA'))
+                    summary['D1_background_structure_cif'] = str(pre_best.get('background_structure_cif', ''))
+                    summary['D1_model'] = str(pre_best.get('D1_model', 'prehydroxylated'))
+            d1_best = None
+            if isinstance(pre_best, dict) and bool(pre_best.get('descriptor_valid', True)):
+                d1_best = pre_best
+            elif isinstance(clean_best, dict) and bool(clean_best.get('descriptor_valid', True)):
+                d1_best = clean_best
+            if d1_best is not None:
+                summary['D1_OH (eV)'] = _safe_float(d1_best.get('ΔG (eV)'))
+                summary['D1_site_label'] = str(d1_best.get('site_label', 'unknown'))
+                summary['D1_structure_cif'] = str(d1_best.get('structure_cif', ''))
+                summary['D1_seed_disp(Å)'] = _safe_float(d1_best.get('H_lateral_disp(Å)'))
+                summary['D1_binding_class'] = str(d1_best.get('binding_class', 'unknown'))
+                summary['D1_relaxation_scope'] = str(d1_best.get('relaxation_scope', d1_scope))
+                summary['D1_total_relax_n_steps'] = int(_safe_float(d1_best.get('total_relax_n_steps'), 0.0))
+                summary['D1_fine_relax_relaxed_atoms'] = int(_safe_float(d1_best.get('fine_relax_relaxed_atoms'), 0.0))
             else:
                 summary['D1_seed_quality'] = 'missing'
                 summary['D1_seed_warning'] = 'No D1 O-top targets were evaluated.'
+            if np.isfinite(_safe_float(summary.get('D1_clean_OH (eV)'))) and np.isfinite(_safe_float(summary.get('D1_preOH_OH (eV)'))):
+                summary['ΔD1_preOH-clean (eV)'] = float(_safe_float(summary.get('D1_preOH_OH (eV)')) - _safe_float(summary.get('D1_clean_OH (eV)')))
         except Exception as e:
             summary['D1_error'] = str(e)
 
     if need_d2:
         try:
-            basic_df = d1_rows_df.copy() if isinstance(d1_rows_df, pd.DataFrame) else pd.DataFrame()
-            d2_best, q, w, d2_csv_path = _build_d2_from_basic_screening(basic_df, stage_dir=stage_dir)
-            summary['D2_seed_quality'] = q
-            summary['D2_seed_warning'] = w
-            summary['D2_candidates_csv'] = d2_csv_path
-            if d2_best is not None:
-                summary['D2_Hreact (eV)'] = _safe_float(d2_best.get('ΔG (eV)'))
-                summary['D2_site_label'] = str(d2_best.get('site_label', 'unknown'))
-                summary['D2_binding_class'] = str(d2_best.get('binding_class', 'unknown'))
-                summary['D2_structure_cif'] = str(d2_best.get('structure_cif', ''))
-                summary['D2_seed_disp(Å)'] = _safe_float(d2_best.get('H_lateral_disp(Å)'))
-                summary['D2_relaxation_scope'] = str(d2_best.get('relaxation_scope', d2_scope))
-                summary['D2_total_relax_n_steps'] = int(_safe_float(d2_best.get('total_relax_n_steps'), 0.0))
-                summary['D2_fine_relax_relaxed_atoms'] = int(_safe_float(d2_best.get('fine_relax_relaxed_atoms'), 0.0))
-                if _rows_same_basin(d1_best, d2_best, slab_u_rel=slab_u_rel):
-                    summary['D2_same_basin_as_D1'] = True
-                    summary['D2_basin_note'] = 'D2 overlaps the same final basin as D1.'
+            # Reuse the main oxide HER screening results as the D2/basic-H descriptor.
+            d2_df = (d1_rows_df.copy() if isinstance(d1_rows_df, pd.DataFrame) else pd.DataFrame())
+            d2_csv = stage_dir / 'D2_candidates.csv'
+            if not d2_df.empty:
+                d2_df.to_csv(d2_csv, index=False)
+                summary['D2_candidates_csv'] = str(d2_csv.resolve())
+
+            energy_col = 'ΔG_H (eV)' if 'ΔG_H (eV)' in d2_df.columns else ('ΔE_H_user (eV)' if 'ΔE_H_user (eV)' in d2_df.columns else None)
+            if not d2_df.empty and energy_col is not None:
+                d2_best, q, w = _pick_descriptor_seed_row(d2_df, energy_col=energy_col, disp_thresh=DESCRIPTOR_D2_DISP_THRESH_A)
+                summary['D2_seed_quality'] = q
+                summary['D2_seed_warning'] = w
+                if d2_best is not None:
+                    summary['D2_Hreact (eV)'] = _safe_float(d2_best.get(energy_col))
+                    summary['D2_site_label'] = str(d2_best.get('site_label', d2_best.get('site', 'unknown')))
+                    summary['D2_binding_class'] = str(d2_best.get('final_site_kind', d2_best.get('binding_class', d2_best.get('site_kind', 'unknown'))))
+                    summary['D2_structure_cif'] = str(d2_best.get('structure_cif', ''))
+                    summary['D2_seed_disp(Å)'] = _safe_float(d2_best.get('H_lateral_disp(Å)'))
+                    summary['D2_relaxation_scope'] = str(d2_best.get('relaxation_scope', d2_best.get('site_tracking_mode', resolved_scope)))
+                    summary['D2_total_relax_n_steps'] = int(_safe_float(d2_best.get('total_relax_n_steps', d2_best.get('z_relax_n_steps', 0.0)), 0.0))
+                    summary['D2_fine_relax_relaxed_atoms'] = int(_safe_float(d2_best.get('fine_relax_relaxed_atoms', 0.0), 0.0))
+                    if _rows_same_basin(d1_best, d2_best, slab_u_rel=slab_u_rel):
+                        summary['D2_same_basin_as_D1'] = True
+                        summary['D2_basin_note'] = 'D2 main HER row matches the same final basin as D1.'
+            elif energy_col is None:
+                summary['D2_seed_quality'] = 'missing'
+                summary['D2_seed_warning'] = 'Main HER screening rows did not contain a usable energy column.'
         except Exception as e:
             summary['D2_error'] = str(e)
 
