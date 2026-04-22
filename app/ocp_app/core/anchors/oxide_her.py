@@ -156,7 +156,7 @@ def _generate_oxide_her_oanchor_sites(
 
     sites = []
     for k, idx in enumerate(chosen):
-        sites.append(AdsSite(kind='o_top', position=tuple(float(x) for x in pos[idx]), surface_indices=(int(idx),)))
+        sites.append(AdsSite(kind='anion_ontop', position=tuple(float(x) for x in pos[idx]), surface_indices=(int(idx),)))
     return sites
 
 
@@ -190,7 +190,7 @@ def _project_single_oxide_her_site_to_otop(atoms, site, dz: float = 1.0, extra_z
         anchor_idx = min(top_o, key=lambda i: _pbc_min_image_xy_distance_sq(atoms, xy_ref, pos[int(i), :2]))
 
     x, y, z = [float(v) for v in pos[int(anchor_idx)]]
-    return AdsSite(kind='o_top', position=(x, y, z + float(dz) + float(extra_z)), surface_indices=(int(anchor_idx),))
+    return AdsSite(kind='anion_ontop', position=(x, y, z + float(dz) + float(extra_z)), surface_indices=(int(anchor_idx),))
 
 
 def _project_oxide_her_sites_to_otop(atoms, sites, dz: float = 1.0, extra_z: float = 0.0):

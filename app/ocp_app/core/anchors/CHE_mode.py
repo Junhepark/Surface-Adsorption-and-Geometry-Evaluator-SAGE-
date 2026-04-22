@@ -32,6 +32,8 @@ from ocp_app.core.anchors.common import (
     NET_CORR,
     H0S,
     MIGRATE_THR,
+    recommend_h0s_for_relaxation,
+    default_min_clearance_for_scope,
     VAC_WARN_MIN,
     UNUSUAL_DDELTA,
     ensure_pbc3,
@@ -784,7 +786,7 @@ def _run_her_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
-    her_relaxation_scope: str = "auto",
+    her_relaxation_scope: str = "rigid",
     her_n_fix_layers: int = 2,
 ):
     if gas != "H2":
@@ -856,15 +858,26 @@ def _run_her_che(
         kind = str(site_seed.get("site_kind", "unknown"))
         xy = np.asarray(site_seed.get("xy", [np.nan, np.nan]), dtype=float)
 
+        anchor_xyz = np.asarray(site_seed.get("initial_xyz", [np.nan, np.nan, np.nan]), dtype=float)
+        h0s_used = recommend_h0s_for_relaxation(
+            resolved_her_relaxation_scope,
+            mtype=mtype,
+            site_kind=kind,
+            default_h0s=H0S,
+        )
         Au, E_uH, _disp_raw, relax_meta = site_energy_two_stage(
             slab_u_rel,
             xy,
-            H0S,
+            h0s_used,
             z_steps,
             free_steps,
             relaxation_scope=resolved_her_relaxation_scope,
             n_fix_layers=int(her_n_fix_layers),
             return_meta=True,
+            anchor_xyz=anchor_xyz,
+            mtype=mtype,
+            site_kind=kind,
+            min_clearance=default_min_clearance_for_scope(resolved_her_relaxation_scope, mtype=mtype),
         )
 
         dE_u = E_uH - E_slab_u - 0.5 * E_H2
@@ -913,6 +926,8 @@ def _run_her_che(
             "her_relaxation_scope": str(resolved_her_relaxation_scope),
             "her_n_fix_layers": int(her_n_fix_layers),
             "selected_h0": _safe_float((relax_meta or {}).get("selected_h0")),
+            "h0_candidates": str((relax_meta or {}).get("h0_candidates", "")),
+            "placement_mode": str((relax_meta or {}).get("placement_mode", "slab_top")),
             "z_relax_n_steps": int((relax_meta or {}).get("z_relax_n_steps", 0)),
             "z_relax_converged": (relax_meta or {}).get("z_relax_converged", None),
             "z_relax_relaxed_atoms": int((relax_meta or {}).get("z_relax_relaxed_atoms", 0)),
@@ -1764,14 +1779,20 @@ def _compute_her_guardrail_from_prepared(
     label = str(pick.get("site_label", "unknown"))
     kind = str(pick.get("site_kind", "unknown"))
     xy = np.asarray(pick.get("xy", [np.nan, np.nan]), dtype=float)
+    anchor_xyz = np.asarray(pick.get("initial_xyz", [np.nan, np.nan, np.nan]), dtype=float)
+    h0s_used = recommend_h0s_for_relaxation(relaxation_scope, mtype="oxide", site_kind=kind, default_h0s=H0S)
     Au, E_uH, _disp_raw = site_energy_two_stage(
         slab_u_rel,
         xy,
-        H0S,
+        h0s_used,
         int(z_steps),
         int(free_steps),
         relaxation_scope=relaxation_scope,
         n_fix_layers=int(n_fix_layers),
+        anchor_xyz=anchor_xyz,
+        mtype="oxide",
+        site_kind=kind,
+        min_clearance=default_min_clearance_for_scope(relaxation_scope, mtype="oxide"),
     )
 
     slab_only = Au[: len(slab_u_rel)]
@@ -2309,7 +2330,7 @@ def run_metal_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
-    her_relaxation_scope: str = "auto",
+    her_relaxation_scope: str = "rigid",
     her_n_fix_layers: int = 2,
 ):
     return _run_her_che(
@@ -2362,7 +2383,7 @@ def run_oxide_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
-    her_relaxation_scope: str = "auto",
+    her_relaxation_scope: str = "rigid",
     her_n_fix_layers: int = 2,
 ):
     return _run_her_che(
