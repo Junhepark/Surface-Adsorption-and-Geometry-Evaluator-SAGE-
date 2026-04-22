@@ -90,6 +90,12 @@ from ocp_app.core.structure_ops import (
     crop_top_slab_window,
 )
 from ocp_app.ui.viewers import _render_min_dist_panel, show_atoms_3d
+try:
+    from ocp_app.core.slab_reduction import get_slab_reduction_presets, reduce_slab_symmetrically
+except Exception:
+    get_slab_reduction_presets = None
+    reduce_slab_symmetrically = None
+
 from ocp_app.core.oxide_surface_rules import (
     infer_oxide_family_from_atoms,
     _classify_surface_exposure,
@@ -237,6 +243,126 @@ def _safe_float(val, default=np.nan):
         return float(val)
     except Exception:
         return float(default)
+
+
+def _pick_oxide_her_representatives(df_rel: pd.DataFrame):
+    """Return representative oxide-HER sites from reliable rows.
+
+    Definitions:
+      - occupied representative: most stabilized reliable H* site (minimum ΔG_H)
+      - HER-optimal representative: reliable site with ΔG_H closest to 0 eV
+
+    Non-duplicate rows are preferred when the column is available.
+    """
+    if not isinstance(df_rel, pd.DataFrame) or df_rel.empty:
+        return {}
+
+    energy_col = None
+    for cand in ("ΔG_H(U,pH) (eV)", "ΔG_H (eV)"):
+        if cand in df_rel.columns:
+            energy_col = cand
+            break
+    if energy_col is None:
+        return {}
+
+    work = df_rel.copy()
+    if "is_duplicate" in work.columns:
+        try:
+            nondup = work[pd.to_numeric(work["is_duplicate"], errors="coerce").fillna(0).astype(int) == 0].copy()
+            if not nondup.empty:
+                work = nondup
+        except Exception:
+            pass
+
+    work["_rep_energy"] = pd.to_numeric(work[energy_col], errors="coerce")
+    work = work[np.isfinite(work["_rep_energy"])].copy()
+    if work.empty:
+        return {}
+
+    def _pack(row):
+        row = row.copy()
+        return {
+            "site_label": str(row.get("site_label", "NA")),
+            "relaxed_site": str(row.get("relaxed_site", row.get("final_site_kind", "NA"))),
+            "binding_class": str(row.get("binding_class", row.get("D2_binding_class", ""))),
+            "energy": float(row.get("_rep_energy", np.nan)),
+            "row": row,
+            "energy_col": energy_col,
+        }
+
+    idx_occ = work["_rep_energy"].idxmin()
+    idx_opt = work["_rep_energy"].abs().idxmin()
+
+    return {
+        "occupied": _pack(work.loc[idx_occ]),
+        "her_optimal": _pack(work.loc[idx_opt]),
+        "n_candidates": int(len(work)),
+        "energy_col": energy_col,
+    }
+
+def _normalize_hkl_sign(hkl):
+    vals = [int(v) for v in tuple(hkl)]
+    for v in vals:
+        if v != 0:
+            if v < 0:
+                vals = [-x for x in vals]
+            break
+    return tuple(vals)
+
+
+def _canonical_hkl_family(hkl):
+    try:
+        red = tuple(int(v) for v in _reduce_hkl_by_gcd(tuple(int(x) for x in hkl)))
+    except Exception:
+        red = tuple(int(x) for x in hkl)
+    return _normalize_hkl_sign(red)
+
+
+def _augment_oxide_low_index_facets(facet_choices, scope_label):
+    base = []
+    seen = set()
+    for hkl in (facet_choices or []):
+        can = _canonical_hkl_family(hkl)
+        if can not in seen:
+            seen.add(can)
+            base.append(can)
+
+    scope_s = str(scope_label or "")
+    force = []
+
+    # Always expose the c-axis low-index family so literature facets such as
+    # (002)/(003) can be selected via the reduced (001) family in the UI.
+    if scope_s in {"Recommended oxide facets", "Recommended facets", "Low-index facets (up to 1)", "Extended facets (up to 2)"}:
+        force.extend([(0, 0, 1)])
+
+    if scope_s in {"Low-index facets (up to 1)", "Extended facets (up to 2)"}:
+        force.extend([
+            (1, 0, 0), (0, 1, 0), (1, 1, 0),
+            (1, 0, 1), (0, 1, 1), (1, 1, 1),
+        ])
+
+    if scope_s == "Extended facets (up to 2)":
+        force.extend([
+            (1, 0, 2), (0, 1, 2), (1, 1, 2),
+            (2, 0, 1), (0, 2, 1), (2, 1, 0), (1, 2, 0),
+            (2, 1, 1), (1, 2, 1),
+        ])
+
+    for hkl in force:
+        can = _canonical_hkl_family(hkl)
+        if can not in seen:
+            seen.add(can)
+            base.append(can)
+
+    return base
+
+
+def _format_facet_label_with_alias(hkl):
+    can = _canonical_hkl_family(hkl)
+    label = _format_hkl_label(can)
+    if can == (0, 0, 1):
+        return f"{label} [00l family; literature 002/003 alias]"
+    return label
 
 
 def _resolve_relaxed_structure_path(row: pd.Series | dict, csv_path: str | Path | None = None):
@@ -404,6 +530,78 @@ def _get_oxide_her_constrained_prerelaxed_slab(
     return relaxed, meta
 
 
+def _surface_fraction_from_meta(meta: dict, side: str):
+    if meta is None:
+        return None
+    for key in (
+        f"surface_O_fraction_{side}",
+        f"surface_0_fraction_{side}",
+        f"surface_o_fraction_{side}",
+        f"surface_fraction_{side}",
+    ):
+        if key in meta and meta.get(key) is not None:
+            try:
+                return float(meta.get(key))
+            except Exception:
+                continue
+    return None
+
+
+def _annotate_step2_slab_symmetry(meta: Optional[dict], *, frac_tol_strict: float = 0.03, frac_tol_loose: float = 0.12):
+    """Lightweight top/bottom symmetry annotation for Step 2 QC/UI.
+
+    This does not attempt a crystallographic symmetry analysis.
+    It only evaluates whether top/bottom surface terminations look similar enough
+    to treat the slab as symmetric for screening purposes.
+    """
+    md = dict(meta or {})
+    top_exp = str(md.get("top_exposure", "unknown") or "unknown").strip().lower()
+    bot_exp = str(md.get("bottom_exposure", "unknown") or "unknown").strip().lower()
+    f_top = _surface_fraction_from_meta(md, "top")
+    f_bot = _surface_fraction_from_meta(md, "bottom")
+    asym_flag = bool(md.get("top_bottom_asymmetric", False))
+
+    reasons = []
+    frac_flag = "unknown"
+    if (f_top is not None) and (f_bot is not None):
+        df = abs(float(f_top) - float(f_bot))
+        if df <= float(frac_tol_strict):
+            frac_flag = "match"
+            reasons.append(f"surface fraction match (Δ={df:.3f})")
+        elif df <= float(frac_tol_loose):
+            frac_flag = "close"
+            reasons.append(f"surface fraction close (Δ={df:.3f})")
+        else:
+            frac_flag = "mismatch"
+            reasons.append(f"surface fraction mismatch (Δ={df:.3f})")
+    else:
+        reasons.append("surface fraction unavailable")
+
+    if top_exp != "unknown" and bot_exp != "unknown":
+        if top_exp == bot_exp:
+            exp_flag = "match"
+            reasons.append(f"exposure match ({top_exp})")
+        else:
+            exp_flag = "mismatch"
+            reasons.append(f"exposure mismatch ({top_exp} vs {bot_exp})")
+    else:
+        exp_flag = "unknown"
+        reasons.append("exposure unavailable")
+
+    if asym_flag or exp_flag == "mismatch" or frac_flag == "mismatch":
+        slab_symmetry = "asymmetric"
+    elif exp_flag == "match" and frac_flag == "match":
+        slab_symmetry = "symmetric"
+    else:
+        slab_symmetry = "quasi-symmetric"
+
+    md["surface_fraction_top"] = f_top
+    md["surface_fraction_bottom"] = f_bot
+    md["slab_symmetry"] = slab_symmetry
+    md["slab_symmetry_basis"] = "; ".join(reasons)
+    return md
+
+
 
 # ---------------- Sidebar: global options ----------------
 with st.sidebar:
@@ -458,7 +656,7 @@ with st.sidebar:
     else:
         default_sites = ["fcc", "bridge", "ontop"]
 
-    site_preset = st.multiselect("Sites (Manual mode)", default_sites, default=default_sites)
+    site_preset = tuple(default_sites)
 
     if is_her:
         co2_ads = []
@@ -598,7 +796,56 @@ else:
         help="Choose either the current structure directly or first split the bulk into a slab/facet.",
     )
 
-    if surface_route == "Slabify from bulk":
+    route_prev = st.session_state.get("_surface_route_prev", None)
+    route_stage_default = 0 if surface_route == "Slabify from bulk" else 1
+    if route_prev != surface_route:
+        st.session_state["_surface_route_prev"] = surface_route
+        st.session_state["surface_setup_stage"] = route_stage_default
+        if surface_route != "Slabify from bulk":
+            try:
+                st.session_state["slab_reduction_base_atoms"] = prepared.copy()
+            except Exception:
+                pass
+    surface_setup_stage = int(st.session_state.get("surface_setup_stage", route_stage_default))
+    if surface_route != "Slabify from bulk" and surface_setup_stage < 1:
+        surface_setup_stage = 1
+        st.session_state["surface_setup_stage"] = 1
+
+    stage_labels = {
+        0: "2-1. Select slab",
+        1: "2-2. Set vacuum",
+        2: "2-3. Expand XY supercell",
+        3: "2-4. Reduce slab thickness",
+        4: "2-5. Review prepared slab",
+    }
+    stage_short_labels = {
+        0: "2-1",
+        1: "2-2",
+        2: "2-3",
+        3: "2-4",
+        4: "2-5",
+    }
+    visible_stage_ids = [0, 1, 2, 3, 4] if surface_route == "Slabify from bulk" else [1, 2, 3, 4]
+    max_revisit_stage = max(visible_stage_ids[0], min(int(surface_setup_stage), max(visible_stage_ids)))
+
+    st.caption(f"Surface-setup wizard: **{stage_labels.get(surface_setup_stage, '2-1. Select slab')}**")
+    nav_cols = st.columns(len(visible_stage_ids))
+    for _col, _sid in zip(nav_cols, visible_stage_ids):
+        _is_current = int(surface_setup_stage) == int(_sid)
+        _is_accessible = int(_sid) <= int(max_revisit_stage)
+        _prefix = "●" if _is_current else "○"
+        with _col:
+            if st.button(
+                f"{_prefix} {stage_short_labels.get(_sid, _sid)}",
+                key=f"btn_surface_stage_nav_{surface_route}_{_sid}",
+                disabled=not _is_accessible,
+                use_container_width=True,
+            ):
+                st.session_state["surface_setup_stage"] = int(_sid)
+                st.rerun()
+    st.caption("Click a completed stage to revisit it. Forward jumps to incomplete stages are disabled.")
+
+    if surface_route == "Slabify from bulk" and surface_setup_stage == 0:
         if mtype == "oxide":
             st.markdown("### Oxide surface builder")
             st.caption("For oxides, clean slab candidates are ranked with family-aware validity rules. The app distinguishes conservative reference surfaces from exploratory or advanced clean facets.")
@@ -618,19 +865,13 @@ else:
                     help="Recommended oxide facets are conservative and bias toward less problematic low-index surfaces.",
                 )
                 facet_scope_for_calc = "Recommended facets" if facet_scope == "Recommended oxide facets" else facet_scope
-                facet_choices = _facet_choices_for_scope(prepared, facet_scope_for_calc)
-                facet_labels = [_format_hkl_label(hkl) for hkl in facet_choices]
-                oxide_surface_mode = st.selectbox(
-                    "Oxide clean-surface selection mode",
-                    ["Reference clean surface", "O-dominant surface preference", "Exploratory any clean termination"],
-                    index=0,
-                    key="oxide_surface_mode",
-                    help="Reference clean surface keeps conservative family-aware candidates. O-dominant preference still favors O-rich or mixed tops. Exploratory any clean termination keeps non-rejected clean candidates.",
+                facet_choices = _augment_oxide_low_index_facets(
+                    _facet_choices_for_scope(prepared, facet_scope_for_calc),
+                    facet_scope,
                 )
-                st.caption(
-                    "O-dominant preference does not enforce a pure O-top surface. "
-                    "Please check `surface_O_fraction_top` and `facet_warning` before using this slab."
-                )
+                facet_labels = [_format_facet_label_with_alias(hkl) for hkl in facet_choices]
+                oxide_surface_mode = "Exploratory any clean termination"
+                st.caption("Low-index c-axis facets are exposed through the reduced (001) family. Literature 00l labels such as (002) are treated as the same selectable family.")
                 oxide_hydrox_mode = "Clean only"
                 _oxide_info = infer_oxide_family_from_atoms(prepared)
                 _oxide_family = _infer_interface_surface_family(prepared)
@@ -740,22 +981,37 @@ else:
                 cand_atoms = st.session_state.get("slabify_candidates_atoms") or []
                 cand_meta = st.session_state.get("slabify_candidates_meta") or []
                 if cand_meta:
+                    if mtype == "oxide":
+                        cand_meta = [_annotate_step2_slab_symmetry(m) for m in cand_meta]
+                        st.session_state["slabify_candidates_meta"] = cand_meta
                     df_cands = pd.DataFrame(cand_meta)
                     if mtype == "oxide":
                         st.warning(
-                            "Please review `surface_O_fraction_top`, `surface_family`, and `facet_warning` before selecting an oxide slab."
+                            "Please review `slab_symmetry`, `surface_O_fraction_top`, `slab_usability`, and `facet_warning` before selecting an oxide slab."
                         )
-                        pref_cols = [c for c in [
-                            "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
-                            "surface_O_fraction_bottom", "top_bottom_asymmetric", "flipped_for_oxide_top_exposure", "oxide_top_surface_ok", "facet_warning", "n_atoms",
-                            "vacuum_z", "recommend_repeat", "slab_usability_reason", "oxide_rule_notes", "surface_diagnostics_notes", "issues"
+                        basic_cols = [c for c in [
+                            "idx", "miller", "top_exposure", "surface_O_fraction_top", "slab_symmetry", "slab_usability", "n_atoms", "vacuum_z"
                         ] if c in df_cands.columns]
-                        st.dataframe(df_cands[pref_cols], use_container_width=True)
+                        st.dataframe(df_cands[basic_cols], use_container_width=True)
+                        with st.expander("Show detailed slab candidate metadata", expanded=False):
+                            detail_cols = [c for c in [
+                                "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
+                                "surface_O_fraction_bottom", "surface_fraction_top", "surface_fraction_bottom", "slab_symmetry", "slab_symmetry_basis", "top_bottom_asymmetric", "flipped_for_oxide_top_exposure", "oxide_top_surface_ok", "facet_warning", "n_atoms",
+                                "vacuum_z", "recommend_repeat", "slab_usability_reason", "oxide_rule_notes", "surface_diagnostics_notes", "issues"
+                            ] if c in df_cands.columns]
+                            st.dataframe(df_cands[detail_cols], use_container_width=True)
                         auto_atoms, auto_meta = _pick_best_oxide_slab_candidate(cand_atoms, cand_meta)
+                        auto_meta = _annotate_step2_slab_symmetry(auto_meta)
                         auto_idx = next((i for i, m in enumerate(cand_meta) if m.get("idx") == auto_meta.get("idx")), 0)
-                        st.caption(f"Auto-selected oxide candidate: #{auto_idx} | usability={auto_meta.get('slab_usability')} | rule={auto_meta.get('rule_validity')}/{auto_meta.get('rule_role')} | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}")
+                        st.caption(
+                            f"Auto-selected oxide candidate: #{auto_idx} | symmetry={auto_meta.get('slab_symmetry')} | usability={auto_meta.get('slab_usability')} | "
+                            f"rule={auto_meta.get('rule_validity')}/{auto_meta.get('rule_role')} | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
+                        )
                     else:
-                        st.dataframe(df_cands, use_container_width=True)
+                        basic_cols = [c for c in ["idx", "miller", "n_atoms", "vacuum_z", "formula"] if c in df_cands.columns]
+                        st.dataframe(df_cands[basic_cols], use_container_width=True)
+                        with st.expander("Show detailed slab candidate metadata", expanded=False):
+                            st.dataframe(df_cands, use_container_width=True)
                         auto_idx = 0
 
                     sel_idx = st.selectbox(
@@ -763,7 +1019,7 @@ else:
                         list(range(len(cand_atoms))),
                         index=int(auto_idx),
                         format_func=lambda i: (
-                            f"#{i} | {cand_meta[i].get('slab_usability')} | rule={cand_meta[i].get('rule_validity')}/{cand_meta[i].get('rule_role')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
+                            f"#{i} | {cand_meta[i].get('slab_symmetry', '?')} | {cand_meta[i].get('slab_usability')} | rule={cand_meta[i].get('rule_validity')}/{cand_meta[i].get('rule_role')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
                             if mtype == "oxide" else
                             f"#{i} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
                         ),
@@ -789,9 +1045,16 @@ else:
                                 "slab_usability": cand_meta[sel_idx].get("slab_usability"),
                                 "oxide_validity": cand_meta[sel_idx].get("oxide_validity"),
                                 "oxide_role": cand_meta[sel_idx].get("oxide_role"),
+                                "slab_symmetry": cand_meta[sel_idx].get("slab_symmetry"),
+                                "slab_symmetry_basis": cand_meta[sel_idx].get("slab_symmetry_basis"),
                             },
                         )
-                        st.success("Selected slab applied. Continue with vacuum / supercell / QC below.")
+                        try:
+                            st.session_state["slab_reduction_base_atoms"] = cand_atoms[sel_idx].copy()
+                        except Exception:
+                            pass
+                        st.session_state["surface_setup_stage"] = 1
+                        st.success("Selected slab applied. Continue to vacuum setup.")
                         st.rerun()
 
         prepared = st.session_state.get("atoms_prepared")
@@ -808,6 +1071,7 @@ else:
         st.write(f"- Vacuum_z: **{vac_z:.2f} Å**")
         st.write(f"- PBC: **{pbc}**")
 
+        st.markdown("#### Min distances by element pair")
         _render_min_dist_panel(rep)
 
         if mtype == "oxide":
@@ -817,21 +1081,26 @@ else:
                     f"Detected Oxide: {fam['family']} ({fam['reduced_formula']}) | crystal={fam.get('crystal_system')} | sg={fam.get('spacegroup_symbol')}"
                 )
             surf_meta = _classify_surface_exposure(prepared, z_window=1.8)
-            st.write(f"- Surface exposure (top/bottom): **{surf_meta['top_exposure']} / {surf_meta['bottom_exposure']}**")
-            st.write(f"- Surface O fraction (top): **{surf_meta['surface_O_fraction_top']:.2f}**")
             prep_meta = _normalize_oxide_candidate_top_surface(prepared, {"surface_family": _infer_interface_surface_family(prepared), "miller": None}, z_window=1.8)[1]
-            st.write(f"- Rule validity: **{prep_meta.get('rule_validity', 'warn')}** | role: **{prep_meta.get('rule_role', 'exploratory')}**")
-            st.write(f"- Surface diagnostics: **{prep_meta.get('surface_diagnostics_status', 'warn')}** | slab usability: **{prep_meta.get('slab_usability', 'exploratory_only')}**")
-            if prep_meta.get('slab_usability_reason'):
-                st.caption(f"Slab usability: {prep_meta.get('slab_usability_reason')}")
-            if prep_meta.get('oxide_rule_notes'):
-                for _note in prep_meta.get('oxide_rule_notes', [])[:2]:
-                    st.caption(f"Oxide rule: {_note}")
-            if prep_meta.get('surface_diagnostics_notes'):
-                for _note in prep_meta.get('surface_diagnostics_notes', [])[:2]:
-                    st.caption(f"Surface diagnostic: {_note}")
-            if surf_meta['top_bottom_asymmetric']:
-                st.caption("Oxide note: top/bottom terminations are asymmetric. Interpret clean-slab HER outputs cautiously.")
+            prep_meta = _annotate_step2_slab_symmetry({**prep_meta, **surf_meta})
+            with st.expander("Show oxide surface diagnostics", expanded=False):
+                st.write(f"- Surface exposure (top/bottom): **{prep_meta['top_exposure']} / {prep_meta['bottom_exposure']}**")
+                st.write(f"- Surface O fraction (top): **{prep_meta['surface_O_fraction_top']:.2f}**")
+                st.write(f"- Slab symmetry: **{prep_meta.get('slab_symmetry', 'unknown')}**")
+                st.write(f"- Rule validity: **{prep_meta.get('rule_validity', 'warn')}** | role: **{prep_meta.get('rule_role', 'exploratory')}**")
+                st.write(f"- Surface diagnostics: **{prep_meta.get('surface_diagnostics_status', 'warn')}** | slab usability: **{prep_meta.get('slab_usability', 'exploratory_only')}**")
+                if prep_meta.get('slab_usability_reason'):
+                    st.caption(f"Slab usability: {prep_meta.get('slab_usability_reason')}")
+                if prep_meta.get('oxide_rule_notes'):
+                    for _note in prep_meta.get('oxide_rule_notes', [])[:2]:
+                        st.caption(f"Oxide rule: {_note}")
+                if prep_meta.get('surface_diagnostics_notes'):
+                    for _note in prep_meta.get('surface_diagnostics_notes', [])[:2]:
+                        st.caption(f"Surface diagnostic: {_note}")
+                if prep_meta.get('slab_symmetry') == 'asymmetric':
+                    st.caption("Oxide note: top/bottom terminations are asymmetric. Interpret clean-slab HER outputs cautiously.")
+                elif prep_meta.get('slab_symmetry') == 'quasi-symmetric':
+                    st.caption("Oxide note: top/bottom terminations are only quasi-symmetric. Treat representative-surface claims cautiously.")
 
         bulk_like = (vac_z < 10.0) and bool(prepared.get_pbc()[2])
         if bulk_like:
@@ -864,6 +1133,11 @@ else:
         with c1:
             if st.button("Reset prepared", key="btn_reset_prepared"):
                 _reset_prepared_from_working()
+                try:
+                    st.session_state["slab_reduction_base_atoms"] = st.session_state.get("atoms_prepared").copy()
+                except Exception:
+                    pass
+                st.session_state["surface_setup_stage"] = (0 if surface_route == "Slabify from bulk" else 1)
                 st.success("Prepared reset to working.")
                 st.rerun()
 
@@ -877,83 +1151,240 @@ else:
             )
 
         st.markdown("---")
-        st.markdown("#### Vacuum")
-        vac_choice = st.selectbox(
-            "Target vacuum_z",
-            ["20 Å", "30 Å (recommended)", "40 Å", "Custom"],
-            index=1,
-            key="common_vac_choice",
-        )
-        vac_custom = None
-        if vac_choice == "Custom":
-            vac_custom = st.number_input(
-                "Custom total vacuum_z (Å)",
-                min_value=8.0,
-                max_value=80.0,
-                value=30.0,
-                step=1.0,
-                key="common_vac_custom",
+        status_lines = []
+        status_lines.append(f"Slab selected: **{'yes' if (surface_route != 'Slabify from bulk' or surface_setup_stage >= 1) else 'no'}**")
+        status_lines.append(f"Vacuum reviewed: **{'yes' if surface_setup_stage >= 2 else 'no'}**")
+        status_lines.append(f"XY supercell reviewed: **{'yes' if surface_setup_stage >= 3 else 'no'}**")
+        status_lines.append(f"Slab reduction reviewed: **{'yes' if surface_setup_stage >= 4 else 'no'}**")
+        st.caption(" | ".join(status_lines))
+
+        if surface_setup_stage == 1:
+            st.markdown("#### 2-2. Set vacuum")
+            st.caption("Recommended next step: set the z vacuum before XY supercell expansion.")
+            vac_choice = st.selectbox(
+                "Target vacuum_z",
+                ["20 Å", "30 Å (recommended)", "40 Å", "Custom"],
+                index=1,
+                key="common_vac_choice",
             )
-        keep_pbc_z = st.checkbox("Keep pbc_z=True", value=True, key="vac_keep_pbc_z")
-        target_vac = _vacuum_target_from_ui(vac_choice, vac_custom)
-        if st.button("Apply vacuum", key="btn_apply_vacuum_common"):
-            a2 = add_vacuum_z(prepared, total_vacuum_z=float(target_vac), keep_pbc_z=bool(keep_pbc_z))
-            _push_prepared_update(a2, "add_vacuum", {"total_vacuum_z": float(target_vac), "keep_pbc_z": bool(keep_pbc_z)})
-            st.success(f"Vacuum set to {float(target_vac):.1f} Å.")
-            st.rerun()
-
-        st.markdown("#### Supercell (XY only)")
-        if surface_route == "Slabify from bulk":
-            st.caption("For the slabify route, keep 1×1 by default and expand only when the in-plane slab is too small.")
-            a_len, b_len = _surface_xy_lengths(prepared)
-            nx_auto, ny_auto = _suggest_minimal_xy_repeat(prepared, min_length_a=8.0, min_length_b=8.0, max_repeat=3)
-            st.write(f"- In-plane lengths: **a = {a_len:.2f} Å**, **b = {b_len:.2f} Å**")
-            st.write(f"- Minimal suggested repeat: **{nx_auto}×{ny_auto}×1**")
-
-            colR1, colR2, colR3 = st.columns(3)
-            with colR1:
-                if st.button("Keep 1×1", key="btn_rep_keep_111"):
-                    st.info("Kept current slab at 1×1.")
-            with colR2:
-                if st.button("Apply minimal repeat", key="btn_rep_auto_minimal"):
-                    if int(nx_auto) == 1 and int(ny_auto) == 1:
-                        st.info("Current slab already satisfies the minimal in-plane size target.")
-                    else:
-                        a2 = repeat_xy(prepared, int(nx_auto), int(ny_auto))
-                        _push_prepared_update(a2, "repeat_xy_minimal", {"nx": int(nx_auto), "ny": int(ny_auto), "from": "slabify_minimal_xy"})
-                        st.success(f"Applied minimal repeat: {int(nx_auto)}×{int(ny_auto)}×1.")
-                        st.rerun()
-            with colR3:
-                if st.button("Apply 2×2×1", key="btn_rep_221_slabify"):
-                    a2 = repeat_xy(prepared, 2, 2)
-                    _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2, "from": "slabify_manual"})
-                    st.success("Applied 2×2×1.")
+            vac_custom = None
+            if vac_choice == "Custom":
+                vac_custom = st.number_input(
+                    "Custom total vacuum_z (Å)",
+                    min_value=8.0,
+                    max_value=80.0,
+                    value=30.0,
+                    step=1.0,
+                    key="common_vac_custom",
+                )
+            keep_pbc_z = st.checkbox("Keep pbc_z=True", value=True, key="vac_keep_pbc_z")
+            target_vac = _vacuum_target_from_ui(vac_choice, vac_custom)
+            v1, v2 = st.columns(2)
+            with v1:
+                if st.button("Apply vacuum and continue", key="btn_apply_vacuum_common"):
+                    a2 = add_vacuum_z(prepared, total_vacuum_z=float(target_vac), keep_pbc_z=bool(keep_pbc_z))
+                    _push_prepared_update(a2, "add_vacuum", {"total_vacuum_z": float(target_vac), "keep_pbc_z": bool(keep_pbc_z)})
+                    st.session_state["surface_setup_stage"] = 2
+                    st.success(f"Vacuum set to {float(target_vac):.1f} Å.")
                     st.rerun()
+            with v2:
+                if st.button("Skip to XY supercell →", key="btn_skip_to_xy"):
+                    st.session_state["surface_setup_stage"] = 2
+                    st.rerun()
+            if surface_route == "Slabify from bulk":
+                if st.button("← Back to slab selection", key="btn_back_stage1"):
+                    st.session_state["surface_setup_stage"] = 0
+                    st.rerun()
+
+        elif surface_setup_stage == 2:
+            st.markdown("#### 2-3. Expand XY supercell")
+            st.caption("Recommended next step: adjust the XY supercell first, then reduce slab thickness from that XY-expanded base slab.")
+            if surface_route == "Slabify from bulk":
+                st.caption("For the slabify route, keep 1×1 by default and expand only when the in-plane slab is too small.")
+                a_len, b_len = _surface_xy_lengths(prepared)
+                nx_auto, ny_auto = _suggest_minimal_xy_repeat(prepared, min_length_a=8.0, min_length_b=8.0, max_repeat=3)
+                st.write(f"- In-plane lengths: **a = {a_len:.2f} Å**, **b = {b_len:.2f} Å**")
+                st.write(f"- Minimal suggested repeat: **{nx_auto}×{ny_auto}×1**")
+
+                colR1, colR2, colR3 = st.columns(3)
+                with colR1:
+                    if st.button("Keep 1×1 and continue", key="btn_rep_keep_111"):
+                        try:
+                            st.session_state["slab_reduction_base_atoms"] = prepared.copy()
+                        except Exception:
+                            pass
+                        st.session_state["surface_setup_stage"] = 3
+                        st.info("Kept current slab at 1×1.")
+                        st.rerun()
+                with colR2:
+                    if st.button("Apply minimal repeat", key="btn_rep_auto_minimal"):
+                        if int(nx_auto) == 1 and int(ny_auto) == 1:
+                            try:
+                                st.session_state["slab_reduction_base_atoms"] = prepared.copy()
+                            except Exception:
+                                pass
+                            st.session_state["surface_setup_stage"] = 3
+                            st.info("Current slab already satisfies the minimal in-plane size target.")
+                            st.rerun()
+                        else:
+                            a2 = repeat_xy(prepared, int(nx_auto), int(ny_auto))
+                            _push_prepared_update(a2, "repeat_xy_minimal", {"nx": int(nx_auto), "ny": int(ny_auto), "from": "slabify_minimal_xy"})
+                            try:
+                                st.session_state["slab_reduction_base_atoms"] = a2.copy()
+                            except Exception:
+                                pass
+                            st.session_state["surface_setup_stage"] = 3
+                            st.success(f"Applied minimal repeat: {int(nx_auto)}×{int(ny_auto)}×1.")
+                            st.rerun()
+                with colR3:
+                    if st.button("Apply 2×2×1", key="btn_rep_221_slabify"):
+                        a2 = repeat_xy(prepared, 2, 2)
+                        _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2, "from": "slabify_manual"})
+                        try:
+                            st.session_state["slab_reduction_base_atoms"] = a2.copy()
+                        except Exception:
+                            pass
+                        st.session_state["surface_setup_stage"] = 3
+                        st.success("Applied 2×2×1.")
+                        st.rerun()
+            else:
+                colR1, colR2, colR3 = st.columns(3)
+                with colR1:
+                    if st.button("2×2×1", key="btn_rep_221"):
+                        a2 = repeat_xy(prepared, 2, 2)
+                        _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2})
+                        try:
+                            st.session_state["slab_reduction_base_atoms"] = a2.copy()
+                        except Exception:
+                            pass
+                        st.session_state["surface_setup_stage"] = 3
+                        st.success("Applied 2×2×1.")
+                        st.rerun()
+                with colR2:
+                    if st.button("4×4×1", key="btn_rep_441"):
+                        a2 = repeat_xy(prepared, 4, 4)
+                        _push_prepared_update(a2, "repeat_xy", {"nx": 4, "ny": 4})
+                        try:
+                            st.session_state["slab_reduction_base_atoms"] = a2.copy()
+                        except Exception:
+                            pass
+                        st.session_state["surface_setup_stage"] = 3
+                        st.success("Applied 4×4×1.")
+                        st.rerun()
+                with colR3:
+                    if st.button("Use auto recommendation", key="btn_rep_auto"):
+                        rec = getattr(rep, "recommend_repeat", None)
+                        if not rec:
+                            st.warning("No repeat recommendation available.")
+                        else:
+                            nx, ny, _nz = rec
+                            a2 = repeat_xy(prepared, int(nx), int(ny))
+                            _push_prepared_update(a2, "repeat_xy_auto", {"nx": int(nx), "ny": int(ny), "from": "validate_structure"})
+                            try:
+                                st.session_state["slab_reduction_base_atoms"] = a2.copy()
+                            except Exception:
+                                pass
+                            st.session_state["surface_setup_stage"] = 3
+                            st.success(f"Applied {int(nx)}×{int(ny)}×1.")
+                            st.rerun()
+            if st.button("← Back to vacuum", key="btn_back_stage2"):
+                st.session_state["surface_setup_stage"] = 1
+                st.rerun()
+
+        elif surface_setup_stage == 3:
+            st.markdown("#### 2-4. Reduce slab thickness")
+            st.caption("Recommended next step: reduce slab thickness from the final XY supercell, then review the prepared slab.")
+            if reduce_slab_symmetrically is None or get_slab_reduction_presets is None:
+                st.caption("slab_reduction.py is not available in the current app path.")
+            else:
+                reduction_base = st.session_state.get("slab_reduction_base_atoms") or prepared
+                base_layers = len(_cluster_z_layers_simple(reduction_base, tol=0.8))
+                st.write(f"- Reduction base z-layers: **{base_layers}**")
+                reduction_presets = get_slab_reduction_presets()
+                reduction_label_to_level = {
+                    "Medium (recommended)": "Medium",
+                    "Large": "Large",
+                    "Small (aggressive)": "Small",
+                    "Custom": "Custom",
+                }
+                reduction_mode_label = st.selectbox(
+                    "Slab reduction preset",
+                    ["Medium (recommended)", "Large", "Small (aggressive)", "Custom"],
+                    index=0,
+                    key="step2_slab_reduction_level",
+                    help="The reduction target is defined by preserved z-layer count on the XY-expanded base slab.",
+                )
+                reduction_mode = reduction_label_to_level.get(str(reduction_mode_label), "Medium")
+                target_preserved_layers = None
+                if reduction_mode in reduction_presets:
+                    preset_meta = reduction_presets.get(reduction_mode, {})
+                    st.caption(str(preset_meta.get("description", "")))
+                    target_preserved_layers = int(preset_meta.get("target_preserved_layers", 4))
+                    st.write(f"- Target preserved layers: **{target_preserved_layers}**")
+                    if reduction_mode == "Small":
+                        st.warning("Small is aggressive. Oxide terminations may become unstable or fragmented.")
+                elif reduction_mode == "Custom":
+                    target_preserved_layers = int(st.number_input(
+                        "Custom preserved z-layer count",
+                        min_value=2,
+                        max_value=max(2, int(base_layers)),
+                        value=min(max(2, int(base_layers)), 4),
+                        step=1,
+                        key="step2_custom_preserved_layers",
+                    ))
+                    st.caption("Custom uses the preserved z-layer count on the current XY-expanded base slab. Parity is adjusted automatically when needed.")
+
+                r1, r2, r3 = st.columns(3)
+                with r1:
+                    if st.button("Apply slab reduction", key="btn_apply_slab_reduction"):
+                        try:
+                            a2, reduction_meta = reduce_slab_symmetrically(
+                                reduction_base,
+                                level=(None if reduction_mode == "Custom" else str(reduction_mode)),
+                                target_preserved_layers=int(target_preserved_layers) if target_preserved_layers is not None else None,
+                                keep_pbc_z=True,
+                            )
+                            _push_prepared_update(a2, "slab_reduction", reduction_meta)
+                            if bool(reduction_meta.get("reduced", False)):
+                                st.success(
+                                    f"Applied {reduction_meta.get('reduction_level')} slab reduction: layers "
+                                    f"{reduction_meta.get('original_layer_count')} → {reduction_meta.get('kept_layer_count')}, atoms "
+                                    f"{reduction_meta.get('original_atoms')} → {reduction_meta.get('reduced_atoms')}, thickness "
+                                    f"{reduction_meta.get('original_thickness_A', float('nan')):.2f} → {reduction_meta.get('reduced_thickness_A', float('nan')):.2f} Å."
+                                )
+                            else:
+                                st.info(str(reduction_meta.get("reason", "No reduction was needed.")))
+                            st.session_state["surface_setup_stage"] = 4
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Slab reduction failed: {e}")
+                with r2:
+                    if st.button("Skip to review →", key="btn_skip_to_review"):
+                        st.session_state["surface_setup_stage"] = 4
+                        st.rerun()
+                with r3:
+                    if st.button("← Back to XY supercell", key="btn_back_stage3"):
+                        st.session_state["surface_setup_stage"] = 2
+                        st.rerun()
+
+
         else:
-            colR1, colR2, colR3 = st.columns(3)
-            with colR1:
-                if st.button("2×2×1", key="btn_rep_221"):
-                    a2 = repeat_xy(prepared, 2, 2)
-                    _push_prepared_update(a2, "repeat_xy", {"nx": 2, "ny": 2})
-                    st.success("Applied 2×2×1.")
+            st.markdown("#### 2-5. Review prepared slab")
+            st.success("Surface setup is complete. You can proceed to Step 3.")
+            st.write(f"- Atoms: **{len(prepared)}**")
+            st.write(f"- Vacuum_z: **{float(getattr(rep, 'vacuum_z', 0.0)):.2f} Å**")
+            if mtype == "oxide":
+                surf_meta_review = _annotate_step2_slab_symmetry(_classify_surface_exposure(prepared, z_window=1.8))
+                st.write(f"- Slab symmetry: **{surf_meta_review.get('slab_symmetry', 'unknown')}**")
+                st.caption(str(surf_meta_review.get('slab_symmetry_basis', '')))
+            cdone1, cdone2 = st.columns(2)
+            with cdone1:
+                if st.button("Proceed to Step 3", key="btn_step2_done"):
+                    st.info("Move to Step 3 below.")
+            with cdone2:
+                if st.button("← Back to slab reduction", key="btn_back_stage4"):
+                    st.session_state["surface_setup_stage"] = 3
                     st.rerun()
-            with colR2:
-                if st.button("4×4×1", key="btn_rep_441"):
-                    a2 = repeat_xy(prepared, 4, 4)
-                    _push_prepared_update(a2, "repeat_xy", {"nx": 4, "ny": 4})
-                    st.success("Applied 4×4×1.")
-                    st.rerun()
-            with colR3:
-                if st.button("Use auto recommendation", key="btn_rep_auto"):
-                    rec = getattr(rep, "recommend_repeat", None)
-                    if not rec:
-                        st.warning("No repeat recommendation available.")
-                    else:
-                        nx, ny, _nz = rec
-                        a2 = repeat_xy(prepared, int(nx), int(ny))
-                        _push_prepared_update(a2, "repeat_xy_auto", {"nx": int(nx), "ny": int(ny), "from": "validate_structure"})
-                        st.success(f"Applied {int(nx)}×{int(ny)}×1.")
-                        st.rerun()
 
         if bulk_like and surface_route == "Use current structure":
             if st.button("Temporary workaround: set pbc_z=False", key="btn_pbc_false_tmp"):
@@ -972,99 +1403,8 @@ else:
     _ensure_prepared_uptodate()
     atoms_for_sites = st.session_state.get("atoms_prepared")
 
-    st.markdown("### Structure preview and optional active-region z crop")
-    prev3_col, crop3_col = st.columns([1.45, 0.85])
-    with prev3_col:
-        show_atoms_3d(atoms_for_sites, height=420, width=900, tag="step3_prepared_preview")
-    with crop3_col:
-        rep_step3 = validate_structure(atoms_for_sites, target_area=70.0)
-        vac_z_step3 = float(getattr(rep_step3, "vacuum_z", 0.0))
-        crop_diag_step3 = suggest_active_region_crop(
-            atoms_for_sites,
-            thickness_threshold_A=12.0,
-            atoms_threshold=160,
-            default_window_A=10.0,
-        )
-        slab_thk_step3 = float(crop_diag_step3.get("slab_thickness_A", float("nan")))
-        st.write(f"- Atoms: **{len(atoms_for_sites)}**")
-        st.write(f"- Vacuum_z: **{vac_z_step3:.2f} Å**")
-        st.write(
-            f"- Slab thickness: **{slab_thk_step3:.2f} Å**"
-            if np.isfinite(slab_thk_step3)
-            else "- Slab thickness: **n/a**"
-        )
-
-        if (vac_z_step3 < 10.0) and bool(atoms_for_sites.get_pbc()[2]):
-            st.warning(
-                f"Prepared structure is BULK-like (vacuum_z={vac_z_step3:.2f} Å, pbc_z=True). "
-                "Adsorption sites may collapse and results may be unreliable."
-            )
-
-        auto_crop_default_step3 = bool(crop_diag_step3.get("recommend_crop", False))
-        if auto_crop_default_step3:
-            st.warning(
-                "The current slab is deep along z and may destabilize adsorption relaxation. "
-                "Crop the upper active region before site generation / screening?"
-            )
-        else:
-            st.caption(
-                "You can still crop manually if you only need surface ΔG_H/ΔG_ads rather than deep subsurface effects."
-            )
-
-        use_step3_crop = st.checkbox(
-            "Use active-region z crop",
-            value=auto_crop_default_step3,
-            key="use_step3_active_crop",
-        )
-
-        if use_step3_crop:
-            crop_keep_top_window_step3 = st.number_input(
-                "Keep top active window (Å)",
-                min_value=6.0,
-                max_value=20.0,
-                value=float(crop_diag_step3.get("suggested_window_A", 10.0)),
-                step=0.5,
-                key="crop_keep_top_window_step3_A",
-            )
-            crop_target_vac_step3 = st.number_input(
-                "Target vacuum after crop (Å)",
-                min_value=12.0,
-                max_value=60.0,
-                value=max(20.0, float(vac_z_step3) if np.isfinite(vac_z_step3) else 30.0),
-                step=1.0,
-                key="crop_target_vacuum_step3_A",
-            )
-            crop_min_layers_step3 = st.number_input(
-                "Minimum preserved z-layers",
-                min_value=2,
-                max_value=12,
-                value=4,
-                step=1,
-                key="crop_min_layers_step3",
-            )
-            if st.button("Apply z crop to prepared structure", key="btn_apply_step3_crop"):
-                try:
-                    a2, crop_meta = crop_top_slab_window(
-                        atoms_for_sites,
-                        keep_top_window_A=float(crop_keep_top_window_step3),
-                        target_vacuum_z=float(crop_target_vac_step3),
-                        keep_pbc_z=True,
-                        min_layers=int(crop_min_layers_step3),
-                        min_atoms=16,
-                        layer_tol=0.8,
-                    )
-                    _push_prepared_update(a2, "crop_top_window_step3", crop_meta)
-                    if bool(crop_meta.get("cropped", False)):
-                        st.success(
-                            f"Applied active-region z crop: kept {crop_meta.get('kept_atoms')} atoms, "
-                            f"removed {crop_meta.get('removed_atoms')} atoms, thickness "
-                            f"{crop_meta.get('original_thickness_A', float('nan')):.2f} → {crop_meta.get('cropped_thickness_A', float('nan')):.2f} Å."
-                        )
-                    else:
-                        st.info("No effective z crop was needed. Vacuum was normalized and the prepared structure was refreshed.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Active-region z crop failed: {e}")
+    if int(st.session_state.get("surface_setup_stage", 0)) < 4:
+        st.warning("Step 2 wizard is not fully reviewed yet. Recommended order: slab selection → vacuum → XY supercell → slab reduction.")
 
     # --- Surfactant-class scenario (structural conditioning) ---
     # Placed here (Step 3) because this feature changes the *structure* used for site enumeration / adsorption,
@@ -1195,34 +1535,31 @@ else:
         )
         if slab_prerelax_meta_ui:
             st.caption(f"Surface conditioning applied (class={surfactant_class}, jiggle={cond_jiggle_amp:.2f} Å).")
-    st.markdown("### B. Site generation mode")
+    st.markdown("### A. Site generation mode")
     site_generation_mode = st.radio(
         "Choose how Step 3 should generate candidate sites",
-        ["Manual sites", "Geometry auto-detection", "ML-assisted screening"],
-        index=1,
+        ["Geometry auto-detection", "ML-assisted screening"],
+        index=0,
         horizontal=True,
         key="site_generation_mode",
         help=(
-            "Manual sites uses the sidebar site preset only. "
             "Geometry auto-detection generates representative sites directly from the prepared slab. "
-            "ML-assisted screening first generates geometry candidates, then ranks them with AdsorbML-lite."
+            "ML-assisted screening first generates geometry candidates, then ranks candidates with AdsorbML-lite."
         ),
     )
 
-    use_auto_sites = site_generation_mode != "Manual sites"
+    use_auto_sites = True
     ml_enabled = site_generation_mode == "ML-assisted screening"
-    site_selection_method = "ML screening (AdsorbML-lite)" if ml_enabled else ("Geometry (representative)" if use_auto_sites else "Manual")
+    site_selection_method = "ML screening (AdsorbML-lite)" if ml_enabled else "Geometry (representative)"
     rep_site_map = None
 
-    st.markdown("### C. Site selection details")
-    if site_generation_mode == "Manual sites":
-        st.info("Manual mode selected. Step 4 will use the sidebar 'Sites (Manual mode)' preset without Step 3 auto-generated candidates.")
-    elif site_generation_mode == "Geometry auto-detection":
+    st.markdown("### B. Site selection details")
+    if site_generation_mode == "Geometry auto-detection":
         st.caption("Representative geometry-based sites are generated from the prepared slab below.")
     else:
         st.caption("AdsorbML-lite screening uses geometry-generated seeds first, then ranks candidates with ML.")
 
-    if use_auto_sites and (not ml_enabled):
+    if not ml_enabled:
         st.markdown("### Geometry representative sites")
         max_rep = st.slider("Max representative sites per kind", 1, 3, 2, key="max_sites_kind")
 
@@ -1567,26 +1904,8 @@ else:
     _ensure_prepared_uptodate()
     atoms_for_calc = st.session_state.get("atoms_prepared")
 
-    st.markdown("### Electrochemical conditions")
-    colU, colpH = st.columns(2)
-    with colU:
-        U_input = st.number_input(
-            "Potential U (V)",
-            min_value=-5.0,
-            max_value=5.0,
-            value=0.0,
-            step=0.05,
-            key="U_input",
-        )
-    with colpH:
-        pH_input = st.number_input(
-            "pH",
-            min_value=0.0,
-            max_value=14.0,
-            value=0.0,
-            step=0.1,
-            key="pH_input",
-        )
+    U_input = float(st.session_state.get("U_input", 0.0))
+    pH_input = float(st.session_state.get("pH_input", 0.0))
 
     # HER thermochemistry mode
     thermo_mode = "CHE correction (fast screening)"
@@ -1595,8 +1914,12 @@ else:
     local_zpe_cutoff = 2.5
     local_zpe_max_neighbors = 3
 
+    # Oxide HER relaxation freedom (artifact check / slight freedom release)
+    her_relaxation_scope = "rigid"
+    her_n_fix_layers = 2
+
     if is_her:
-        st.markdown("### HER thermochemistry")
+        st.markdown("### HER thermochemistry / ZPE correction")
         thermo_mode = st.selectbox(
             "HER thermochemistry mode",
             [
@@ -1607,44 +1930,10 @@ else:
             index=0,
             key="her_thermo_mode",
         )
-
-        ctm1, ctm2, ctm3 = st.columns(3)
-        with ctm1:
-            zpe_target_mode = st.selectbox(
-                "Selected structure rule",
-                ["Best-ranked by CHE", "User-selected site label"],
-                index=0,
-                key="zpe_target_mode",
-                disabled=(thermo_mode != "Local ZPE correction (selected structure)"),
-            )
-        with ctm2:
-            local_zpe_cutoff = st.number_input(
-                "Local ZPE neighbor cutoff (Å)",
-                min_value=1.5,
-                max_value=4.0,
-                value=2.5,
-                step=0.1,
-                key="local_zpe_cutoff",
-                disabled=(thermo_mode == "CHE correction (fast screening)"),
-            )
-        with ctm3:
-            local_zpe_max_neighbors = st.number_input(
-                "Max local neighbors",
-                min_value=1,
-                max_value=8,
-                value=3,
-                step=1,
-                key="local_zpe_max_neighbors",
-                disabled=(thermo_mode == "CHE correction (fast screening)"),
-            )
-
-        if thermo_mode == "Local ZPE correction (selected structure)" and zpe_target_mode == "User-selected site label":
-            zpe_target_label = st.text_input(
-                "Target site label",
-                value="",
-                key="zpe_target_label",
-                help="Example: ontop_0, bridge_1",
-            ).strip() or None
+        zpe_target_mode = "Best-ranked by CHE"
+        zpe_target_label = None
+        local_zpe_cutoff = 2.5
+        local_zpe_max_neighbors = 3
 
 
     # Oxide HER descriptor mode
@@ -1652,43 +1941,86 @@ else:
     oxide_descriptor_max_reactive_per_kind = 2
     oxide_descriptor_pair_limit = 6
     if is_her and (mtype == "oxide"):
-        with st.expander("Oxide HER descriptor mode", expanded=False):
-            oxide_descriptor_mode = st.selectbox(
-                "Descriptor mode",
-                [
-                    "D2_Hreact only (reactive H state)",
-                    "Full 2-stage profile (recommended)",
-                ],
-                index=1,
-                key="oxide_descriptor_mode",
-                help=(
-                    "D2 reuses the best reliable basic oxide HER screening row. "
-                    "Full 2-stage profile computes D1 explicit O-hydroxylation plus D2 basic HER screening together."
-                ),
-            )
-            needs_reactive = oxide_descriptor_mode in {
+        st.markdown("### Oxide HER descriptor mode")
+        oxide_descriptor_mode = st.selectbox(
+            "Descriptor mode",
+            [
                 "D2_Hreact only (reactive H state)",
                 "Full 2-stage profile (recommended)",
-                # "D3_pair only (H2 pairing proxy)",
-                # "Full 3-stage profile (experimental)",
-            }
-            needs_pair = False
-            c3a, c3b = st.columns(2)
-            with c3a:
-                oxide_descriptor_max_reactive_per_kind = st.number_input(
-                    "Reactive-H seeds per kind",
-                    min_value=1, max_value=4, value=2, step=1,
-                    key="oxide_descriptor_max_reactive_per_kind",
-                    disabled=(not needs_reactive),
-                )
-            with c3b:
-                oxide_descriptor_pair_limit = st.number_input(
-                    "Pairing seed limit (disabled)",
-                    min_value=2, max_value=12, value=6, step=1,
-                    key="oxide_descriptor_pair_limit",
-                    disabled=True,
-                )
-            st.caption("D3 / H₂ pairing proxy is disabled in the current app build. The code skeleton is retained only as commented legacy logic.")
+            ],
+            index=1,
+            key="oxide_descriptor_mode",
+            help=(
+                "D2 computes only the reactive-H-state descriptor. "
+                "Full 2-stage profile computes D1 and D2 together."
+            ),
+        )
+        needs_reactive = oxide_descriptor_mode in {
+            "D2_Hreact only (reactive H state)",
+            "Full 2-stage profile (recommended)",
+        }
+        oxide_descriptor_max_reactive_per_kind = 2
+        c3a, c3b = st.columns(2)
+        with c3a:
+            st.caption("Reactive-H seed count is fixed to the current app default.")
+        with c3b:
+            oxide_descriptor_pair_limit = st.number_input(
+                "Pairing seed limit (disabled)",
+                min_value=2, max_value=12, value=6, step=1,
+                key="oxide_descriptor_pair_limit",
+                disabled=True,
+            )
+        st.caption("D3 / H₂ pairing proxy is disabled in the current app build. The code skeleton is retained only as commented legacy logic.")
+
+        st.markdown("### Oxide HER relaxation freedom")
+        _oxide_relax_labels = [
+            "rigid (benchmark default)",
+            "partial (optional sensitivity test)",
+            "full (advanced only)",
+        ]
+        _oxide_relax_default = 0
+        her_relaxation_scope = st.selectbox(
+            "Relaxation freedom for oxide HER",
+            _oxide_relax_labels,
+            index=_oxide_relax_default,
+            key="oxide_her_relaxation_scope_ui",
+            help=(
+                "Rigid is the benchmark default for oxide HER validation. "
+                "Partial is an optional sensitivity mode for open-framework oxides. "
+                "Full is an advanced reconstruction stress test."
+            ),
+        )
+        her_relaxation_scope = {
+            "rigid (benchmark default)": "rigid",
+            "partial (optional sensitivity test)": "partial",
+            "full (advanced only)": "full",
+        }.get(str(her_relaxation_scope), "rigid")
+        her_n_fix_layers = 2
+        st.caption(
+            f"Current oxide HER setting: scope={her_relaxation_scope}. "
+            "Rigid is the default benchmark mode; partial is kept as an optional sensitivity test."
+        )
+
+    with st.expander("Advanced electrochemical correction", expanded=False):
+        colU, colpH = st.columns(2)
+        with colU:
+            U_input = st.number_input(
+                "Potential U (V)",
+                min_value=-5.0,
+                max_value=5.0,
+                value=0.0,
+                step=0.05,
+                key="U_input",
+            )
+        with colpH:
+            pH_input = st.number_input(
+                "pH",
+                min_value=0.0,
+                max_value=14.0,
+                value=0.0,
+                step=0.1,
+                key="pH_input",
+            )
 
     if (not is_her):
         st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. ORR additionally writes a step-wise summary file (results_orr_summary.csv) using the entered U for one-electron CHE shifts.")
@@ -1868,6 +2200,8 @@ else:
                         oxide_descriptor_mode=str(oxide_descriptor_mode),
                         oxide_descriptor_max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
                         oxide_descriptor_pair_limit=int(oxide_descriptor_pair_limit),
+                        her_relaxation_scope=str(her_relaxation_scope),
+                        her_n_fix_layers=int(her_n_fix_layers),
                     )
             elif is_orr:
                 # ── ORR branch ─────────────────────────────────────────
@@ -2192,35 +2526,100 @@ if last_run is not None:
                 key="dl_co2rr_candidates_all",
             )
 
-    # --- Oxide HER descriptor profile / summary ---
+    # --- Oxide HER representative sites + selected descriptor profile ---
     if bool(last_run.get("is_her")) and str(last_run.get("mtype", "")) == "oxide" and isinstance(meta, dict) and meta.get("OXIDE_DESCRIPTOR_SUMMARY"):
         _ods = meta.get("OXIDE_DESCRIPTOR_SUMMARY") or {}
         _mode = str(meta.get("OXIDE_DESCRIPTOR_MODE", _ods.get("descriptor_mode", "Basic HER screening")))
-        st.markdown("### Oxide HER descriptor summary")
+        _rep = _pick_oxide_her_representatives(df_rel)
+        _occ = _rep.get("occupied") if isinstance(_rep, dict) else None
+        _opt = _rep.get("her_optimal") if isinstance(_rep, dict) else None
+        _is_d2_only_mode = str(_mode).strip().startswith("D2_Hreact only")
+        _display_ods = dict(_ods)
+
+        if _is_d2_only_mode and _occ:
+            _display_ods["descriptor_mode"] = _mode
+            _display_ods["D2_Hreact (eV)"] = _occ.get("energy", np.nan)
+            _display_ods["D2_site_label"] = _occ.get("site_label", "NA")
+            _display_ods["D2_binding_class"] = _occ.get("binding_class", "")
+            try:
+                _display_ods["D2_structure_cif"] = _occ.get("row", {}).get("structure_cif", _ods.get("D2_structure_cif", ""))
+            except Exception:
+                pass
+            _display_ods["D2_basin_note"] = "representative occupied site (display-aligned in D2-only mode)"
+
+        st.markdown("### Oxide HER representative sites and selected profile")
+        if _occ:
+            st.caption(
+                "Representative occupied site = most stabilized reliable H* site (minimum ΔG_H among reliable, non-duplicate candidates). "
+                "This reflects the site expected to fill first under the occupancy-first interpretation."
+            )
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric("Representative occupied site", str(_occ.get("site_label", "NA")))
+            rc2.metric("Representative occupied ΔG_H (eV)", f"{float(_occ.get('energy', np.nan)):.4f}" if np.isfinite(_safe_float(_occ.get("energy"))) else "n/a")
+            rc3.metric("Relaxed site", str(_occ.get("relaxed_site", "NA")))
+            rc4.metric("Reliable candidate count", str(int(_rep.get("n_candidates", 0))))
+
+            _rep_rows = [{
+                "representative_type": "occupied-first representative",
+                "rule": "minimum reliable ΔG_H",
+                "site_label": _occ.get("site_label", "NA"),
+                "relaxed_site": _occ.get("relaxed_site", "NA"),
+                "ΔG_H (eV)": _occ.get("energy", np.nan),
+                "binding_class": _occ.get("binding_class", ""),
+            }]
+            if _opt:
+                _rep_rows.append({
+                    "representative_type": "HER-optimal reference",
+                    "rule": "minimum |ΔG_H| among reliable sites",
+                    "site_label": _opt.get("site_label", "NA"),
+                    "relaxed_site": _opt.get("relaxed_site", "NA"),
+                    "ΔG_H (eV)": _opt.get("energy", np.nan),
+                    "binding_class": _opt.get("binding_class", ""),
+                })
+            st.dataframe(pd.DataFrame(_rep_rows), use_container_width=True)
+
+        if _is_d2_only_mode:
+            st.markdown("#### Selected D2 descriptor result")
+            st.caption(
+                "In D2-only mode, the displayed D2 value is aligned to the representative occupied site shown above."
+            )
+        else:
+            st.markdown("#### Selected 2-stage descriptor profile")
+            st.caption(
+                "The profile below follows the internally selected 2-stage descriptor path. "
+                "Its D2 value may differ from the representative occupied site shown above."
+            )
         # if _mode in {"D3_pair only (H2 pairing proxy)", "Full 3-stage profile (experimental)"}:
         #     st.warning(str(meta.get("OXIDE_DESCRIPTOR_CAUTION", _ods.get("caution", "The H₂ pairing stage is an approximate release proxy rather than an explicit barrier."))))
 
         summary_cols = [
             "descriptor_mode",
-            "D1_OH (eV)", "D2_Hreact (eV)",
+            "D1_OH (eV)", "D1_clean_OH (eV)", "D1_preOH_OH (eV)", "ΔD1_preOH-clean (eV)", "D2_Hreact (eV)",
             "Δ12 (eV)", "classification",
-            "D1_site_label", "D1_binding_class", "D2_site_label", "D2_binding_class",
+            "D1_site_label", "D1_binding_class", "D1_background_site_label", "D1_model", "D2_site_label", "D2_binding_class",
             "D2_same_basin_as_D1", "D2_basin_note",
             # "D3_pair_proxy (eV)", "Δ23 (eV)",
             # "D3_H2_like_motif", "D3_final_HH_distance(Å)",
             # "D3_pair_label", "D3_status", "D3_pair_seed_count", "D3_valid_pair_count",
         ]
-        _summary_df = pd.DataFrame([{k: _ods.get(k, np.nan) for k in summary_cols}])
+        _summary_df = pd.DataFrame([{k: _display_ods.get(k, np.nan) for k in summary_cols}])
         st.dataframe(_summary_df, use_container_width=True)
 
         _profile_points = []
-        _d1 = _safe_float(_ods.get("D1_OH (eV)"))
-        _d2 = _safe_float(_ods.get("D2_Hreact (eV)"))
+        _d1 = _safe_float(_display_ods.get("D1_OH (eV)"))
+        _d2 = _safe_float(_display_ods.get("D2_Hreact (eV)"))
+        if _occ and np.isfinite(_safe_float(_occ.get("energy"))) and np.isfinite(_d2):
+            _delta_rep = abs(float(_occ.get("energy")) - _d2)
+            if _delta_rep > 1e-8:
+                st.info(
+                    f"Selected profile D2 = {_d2:.4f} eV, while the representative occupied site = {float(_occ.get('energy')):.4f} eV "
+                    f"({_occ.get('site_label', 'NA')})."
+                )
         # _d3 = _safe_float(_ods.get("D3_pair_proxy (eV)"))
         if np.isfinite(_d1):
-            _profile_points.append({"Stage": "O–H formation", "Energy (eV)": _d1})
+            _profile_points.append({"Stage": "Pre-hydroxylated O–H formation", "Energy (eV)": _d1})
         if np.isfinite(_d2):
-            _profile_points.append({"Stage": "Basic HER screening", "Energy (eV)": _d2})
+            _profile_points.append({"Stage": "Reactive H state", "Energy (eV)": _d2})
         # if np.isfinite(_d3):
         #     _profile_points.append({"Stage": "H₂ pairing proxy", "Energy (eV)": _d3})
         if _profile_points:
@@ -2228,28 +2627,28 @@ if last_run is not None:
             st.line_chart(_profile_df.set_index("Stage"))
 
         def _render_descriptor_stage_viewer(stage_key: str, title: str, energy_key: str, label_key: str, extra_items: list[tuple[str, str]] | None = None):
-            stage_path = _ods.get(f"{stage_key}_structure_cif", "")
-            stage_label = str(_ods.get(label_key, "NA"))
-            stage_energy = _safe_float(_ods.get(energy_key, np.nan))
+            stage_path = _display_ods.get(f"{stage_key}_structure_cif", "")
+            stage_label = str(_display_ods.get(label_key, "NA"))
+            stage_energy = _safe_float(_display_ods.get(energy_key, np.nan))
             with st.expander(title, expanded=False):
                 c1, c2, c3 = st.columns(3)
                 c1.metric("label", stage_label)
                 c2.metric("energy (eV)", f"{stage_energy:.4f}" if np.isfinite(stage_energy) else "n/a")
                 if extra_items:
                     extra_key, extra_label = extra_items[0]
-                    extra_val = _ods.get(extra_key, "")
+                    extra_val = _display_ods.get(extra_key, "")
                     c3.metric(extra_label, str(extra_val) if str(extra_val).strip() else "n/a")
                 else:
                     c3.metric("structure", "available" if stage_path and Path(str(stage_path)).is_file() else "missing")
                 if extra_items and len(extra_items) > 1:
-                    extra_df = pd.DataFrame([{lbl: _ods.get(key, np.nan) for key, lbl in extra_items[1:]}])
+                    extra_df = pd.DataFrame([{lbl: _display_ods.get(key, np.nan) for key, lbl in extra_items[1:]}])
                     st.dataframe(extra_df, use_container_width=True)
                 stage_meta_keys = [
                     (f"{stage_key}_relaxation_scope", "scope"),
                     (f"{stage_key}_total_relax_n_steps", "total steps"),
                     (f"{stage_key}_fine_relax_relaxed_atoms", "relaxed atoms"),
                 ]
-                stage_meta_row = {lbl: _ods.get(key, np.nan) for key, lbl in stage_meta_keys if key in _ods}
+                stage_meta_row = {lbl: _display_ods.get(key, np.nan) for key, lbl in stage_meta_keys if key in _display_ods}
                 if stage_meta_row:
                     st.dataframe(pd.DataFrame([stage_meta_row]), use_container_width=True)
                 if stage_path and Path(str(stage_path)).is_file():
@@ -2271,14 +2670,14 @@ if last_run is not None:
         st.markdown("#### Descriptor stage structures")
         _render_descriptor_stage_viewer(
             "D1",
-            "D1 structure — constrained O–H formation",
+            "D1 structure — pre-hydroxylated O–H formation",
             "D1_OH (eV)",
             "D1_site_label",
-            extra_items=[("D1_binding_class", "binding class"), ("D1_seed_quality", "seed quality"), ("D1_seed_disp(Å)", "seed disp (Å)"), ("D1_seed_warning", "seed warning")],
+            extra_items=[("D1_binding_class", "binding class"), ("D1_background_site_label", "background OH site"), ("D1_model", "model"), ("D1_seed_quality", "seed quality"), ("D1_seed_disp(Å)", "seed disp (Å)"), ("D1_seed_warning", "seed warning")],
         )
         _render_descriptor_stage_viewer(
             "D2",
-            "D2 structure — basic HER screening",
+            "D2 structure — reactive H state",
             "D2_Hreact (eV)",
             "D2_site_label",
             extra_items=[("D2_binding_class", "binding class"), ("D2_same_basin_as_D1", "same basin as D1"), ("D2_basin_note", "basin note"), ("D2_seed_disp(Å)", "seed disp (Å)")],
@@ -2292,10 +2691,17 @@ if last_run is not None:
         # )
 
         with st.expander("Show descriptor candidate tables", expanded=False):
-            _d2_csv = _ods.get("D2_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV", "")
+            _d2_csv = _display_ods.get("D2_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV", "")
             # _d3_csv = _ods.get("D3_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV", "")
+            _d1_csv = _display_ods.get("D1_candidates_csv", "")
+            if _d1_csv and Path(str(_d1_csv)).is_file():
+                st.markdown("#### D1 pre-hydroxylated candidates")
+                try:
+                    st.dataframe(pd.read_csv(str(_d1_csv)), use_container_width=True)
+                except Exception as _e:
+                    st.info(f"Could not load D1 candidate table: {_e}")
             if _d2_csv and Path(str(_d2_csv)).is_file():
-                st.markdown("#### D2 basic HER screening rows")
+                st.markdown("#### D2 reactive-H candidates")
                 try:
                     st.dataframe(pd.read_csv(str(_d2_csv)), use_container_width=True)
                 except Exception as _e:
