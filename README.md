@@ -1,34 +1,55 @@
 # Surface Adsorption and Geometry Evaluator (SAGE)
 
-Interactive workflow for slab preparation, geometric quality control, adsorption-site generation, and ML-assisted electrocatalyst screening.
+SAGE is a Streamlit-based application for **surface-based electrocatalyst screening**.
+It integrates slab preparation, geometry quality control, adsorption-site generation,
+ML-assisted candidate screening, thermodynamic post-processing, and result export
+within a **single user-facing workflow**.
 
-SAGE was developed to reduce the fragmentation of conventional script-based surface-screening workflows, where structure preparation, adsorption-site generation, screening, thermodynamic analysis, and result export are often handled separately.  
-It integrates these steps into a single Streamlit-based interface for more consistent, reproducible, and interpretable surface-based electrocatalyst screening.
+The main contribution of SAGE is **workflow integration**, not the introduction of a new atomistic engine.
+Many surface-screening failures arise not from the calculator alone, but from inconsistent slab setup,
+site generation, post-relaxation interpretation, and result handling.
+SAGE was designed to reduce that fragmentation and make the full screening route more reproducible,
+inspectable, and easier to operate.
 
 ---
 
 ## Why SAGE?
 
-Surface-adsorption screening is often carried out through a sequence of loosely connected scripts.  
-In practice, this can lead to inconsistency in:
+Surface-adsorption screening is often performed through loosely connected scripts for:
+
+- structure input and slab generation
+- supercell and vacuum handling
+- adsorption-site generation
+- pre-screening and relaxation
+- thermodynamic correction
+- result ranking and export
+
+In practice, this fragmentation can lead to inconsistency in:
 
 - slab construction
 - adsorption-site definition
-- geometric quality control
-- thermodynamic post-processing
-- metadata tracking and export
+- geometry QC
+- relaxed-site interpretation
+- metadata tracking
+- export formatting
 
-SAGE was designed to address this workflow fragmentation by combining structure input, slab preparation, QC, adsorption-site generation, screening, post-processing, and ranked export in one interface.
+SAGE addresses this by providing a single application that organizes the main screening steps into a
+consistent workflow.
 
-Rather than introducing a completely new atomistic engine, SAGE emphasizes **workflow-level advancement**:
+### Workflow-level contributions
 
-- **single-interface execution** of the main screening steps
-- **built-in geometric QC** before final interpretation
-- **migration-aware result interpretation**
+SAGE emphasizes **workflow-level novelty** rather than a new calculator:
+
+- **single-interface execution** of the main surface-screening steps
+- **state-guided slab preparation** through a stepwise surface-setup wizard
+- **built-in geometry QC** before interpretation
+- **migration-aware output interpretation**
+- **oxide-aware HER handling**
+- **metadata-aware export**
 - **deterministic seed control** for reproducibility
-- **metadata-aware CSV export** for downstream analysis
 
-This positioning is important because many practical failures in catalyst screening do not arise from the calculator alone, but from inconsistency in preprocessing, site generation, post-relaxation interpretation, and result organization.
+This positioning is important because many practical failures in catalyst screening arise from
+inconsistent preprocessing and interpretation rather than from the energy model alone.
 
 ---
 
@@ -41,17 +62,15 @@ This positioning is important because many practical failures in catalyst screen
 ### Supported reaction modes
 - **HER**
 - **CO2RR**
-- **ORR** *(experimental; still under development)*
+- **ORR** *(experimental / limited validation)*
 
-### Current focus
-The current release is designed primarily for **surface-based electrocatalyst screening**, with particular emphasis on adsorption-energy workflows for HER and related surface intermediates.
+### Current practical emphasis
+The current release is focused primarily on **surface-based screening workflows** for HER and related
+adsorption-energy analysis.
 
-For **metallic HER**, SAGE follows a conventional adsorption-energy interpretation based on common CHE-style thermodynamic correction.
-
-For **oxide HER**, SAGE does **not** assume a generic metal-like H adsorption picture.  
-Instead, the current oxide workflow uses an **O-top protonation-oriented seeding rule** so that relaxed structures can better reflect **surface oxygen protonation and OH-like relaxed states** that are frequently observed on oxide surfaces.
-
-Accordingly, oxide HER outputs should be interpreted primarily as **oxide surface protonation / O-top H adsorption descriptors**, rather than as direct one-to-one analogues of close-packed metallic HER benchmark values.
+- **Metal HER** is the most benchmark-friendly mode in the current release.
+- **Oxide HER** is supported as a **structured screening and interpretation workflow**, not as a universal
+  black-box benchmark for all oxide terminations.
 
 ---
 
@@ -69,7 +88,7 @@ cd Surface-Adsorption-and-Geometry-Evaluator-SAGE-
 pip install -r requirements.txt
 ```
 
-### Optional model setup for CHE calculation
+### Optional model setup for CHE evaluation
 
 The CHE evaluation stage uses Meta's UMA model as the default energy calculator.
 
@@ -86,56 +105,86 @@ huggingface-cli login
 
 The model weights will be downloaded automatically on first use.
 
-If other models are preferred, the model selection can be modified in the relevant configuration file before running the application.
-
 ---
 
-## Usage
+## Running the App
 
 ```bash
 streamlit run app/Home.py
 ```
 
-The application will open in your default browser.
+---
+
+## Workflow Overview
+
+The current interface is organized as a stepwise workflow:
+
+### 1. Load structure
+Load a structure from:
+- a Materials Project ID
+- an uploaded CIF file
+
+### 2. Surface setup
+Prepare the working slab through a staged wizard:
+
+- slab selection
+- vacuum setup
+- XY supercell expansion
+- slab-thickness reduction
+- prepared-slab review
+
+This design reduces the chance of skipping critical slab-preparation steps.
+
+### 3. Site selection
+Generate adsorption candidates from the prepared slab.
+
+Depending on the reaction mode, SAGE supports:
+- geometry-based site generation
+- optional ML-assisted pre-screening
+- oxide-specific HER site logic
+
+### 4. Run calculation
+Run the selected thermodynamic workflow:
+- HER
+- CO2RR
+- ORR (experimental)
+
+### 5. Review and export
+Inspect:
+- ranked outputs
+- relaxed structures
+- site migration behavior
+- metadata-rich CSV exports
+- CIF exports for downstream checking
 
 ---
 
 ## Quick Start
 
 ### 1. Load a structure
-Enter a Materials Project ID (e.g., `mp-23` for Ni) or upload a `.cif` file.
+Enter a Materials Project ID (for example, `mp-23` for Ni) or upload a `.cif` file.
 
 <img width="1852" height="1102" alt="Image" src="https://github.com/user-attachments/assets/4de16c09-e084-4c75-9049-283be93e4533" />
 
-### 2. Select the system type and reaction mode
-Choose the material type (**Metal / Oxide**) and target reaction (**HER / CO2RR / ORR**).
+### 2. Choose material type and reaction mode
+Select:
+- **Metal / Oxide**
+- **HER / CO2RR / ORR**
 
 ### 3. Prepare the slab
-Set slab-related parameters such as supercell expansion, vacuum thickness, and composition-related options (+ Miller index for bulk slab).
+Use the surface-setup wizard to define:
+- slab candidate
+- vacuum thickness
+- XY supercell
+- slab thickness reduction
 
-<img width="3731" height="1736" alt="Image" src="https://github.com/user-attachments/assets/2565cae8-11b3-42ef-98cd-e7acbc79be63" />
-<img width="3245" height="1395" alt="Image" src="https://github.com/user-attachments/assets/71780715-28d6-4fdf-81d2-91f9cec5bf15" />
-
-### 4. Generate adsorption sites and evaluate candidates
-Generate candidate sites using geometry-based logic or CHGNet-assisted screening, then run the selected thermodynamic workflow.
-
-- **Metal HER** uses a conventional adsorption-energy workflow with CHE-style correction.
-- **Oxide HER** uses an **O-top protonation-oriented site treatment**, so the relaxed state can better capture protonated surface oxygen / OH-like configurations.
-- **Optional local vibrational refinement** is available for HER:
-  - common CHE correction (fast screening)
-  - local ZPE correction for a selected structure
-  - local ZPE correction for all structures
-- For large or excessively thick slabs, an **active-region z crop** can be applied in the site-selection stage before evaluation to reduce unnecessary deep-slab cost.
+### 4. Generate adsorption candidates and evaluate
+Run site generation and the selected reaction workflow.
 
 <img width="1280" height="634" alt="Image" src="https://github.com/user-attachments/assets/538d0ffa-b14f-47d4-a237-5b21897a14c5" />
 
-### 5. Review ranked outputs and export results
-Inspect ranked candidates, review post-relaxation structure behavior, and export metadata-rich CSV files.
-
-The current interface also supports:
-- **post-run relaxed structure viewing**
-- **migration-aware interpretation**
-- **download of relaxed CIF structures**
+### 5. Review outputs and export
+Inspect ranked candidates, relaxed structures, and exported metadata tables.
 
 <img width="1282" height="502" alt="Image" src="https://github.com/user-attachments/assets/af16bec9-b26e-4b09-9001-6e8c4c0c3c4e" />
 
@@ -143,84 +192,158 @@ The current interface also supports:
 
 ## Supported Reactions
 
-| Reaction | Adsorbates | Thermodynamic framework |
-|----------|------------|-------------------------|
-| HER (metal) | H* | ΔG_H via common CHE correction |
-| HER (oxide) | O-top H / protonated surface O | O-top protonation-oriented ΔG_H descriptor; optional local vibrational refinement |
-| CO2RR | COOH*, CO*, HCOO*, OCHO* | ΔG_ads vs CO2/H2O/H2 |
-| ORR* | OOH*, O*, OH* | 4e- Norskov CHE |
+| Reaction | Adsorbates / descriptors | Current interpretation |
+|----------|---------------------------|------------------------|
+| HER (metal) | H* | Conventional ΔG_H with CHE-style correction |
+| HER (oxide) | O-top H / protonated surface O / reactive-H descriptor states | Oxide-oriented protonation / relaxed-state descriptor workflow |
+| CO2RR | COOH*, CO*, HCOO*, OCHO* | ΔG_ads vs reference states |
+| ORR* | OOH*, O*, OH* | 4e- Nørskov CHE framework |
 
 \* ORR support is currently experimental and should not yet be treated as the primary validated mode of the software.
 
 ---
 
+## How SAGE Treats Metals vs Oxides
+
+### Metallic surfaces
+Metal surfaces are the most direct benchmark target in the current release.
+For metallic HER, SAGE is intended to recover physically reasonable ΔG_H trends on representative
+close-packed surfaces.
+
+### Oxide surfaces
+Oxide surfaces are more complex because their behavior depends strongly on:
+
+- surface termination
+- cation/anion exposure
+- local stoichiometry
+- slab polarity
+- post-relaxation migration
+- protonated / OH-like final states
+
+For this reason, SAGE does **not** treat oxide HER as a generic metal-like adsorption problem.
+
+Instead, the current oxide HER workflow is designed as an **oxide-oriented screening route** in which:
+- hydrogen is preferentially seeded using an **O-top protonation-oriented rule**
+- relaxed structures are interpreted with attention to **surface protonation and OH-like states**
+- outputs are meant to support **case-study-style oxide analysis**, not universal oxide benchmarking
+
+### Practical implication
+- **Metals** → benchmark-friendly
+- **Oxides** → termination-sensitive, case-study-oriented, interpretation-heavy
+
+---
+
+## Oxide HER Output Interpretation
+
+For oxide HER mode, the most useful interpretation is usually not a direct metallic-style volcano comparison.
+
+Instead, the current implementation is better viewed as a descriptor of:
+
+- how readily surface oxygen accepts hydrogen
+- whether the relaxed structure tends toward an OH-like protonated state
+- how strongly that protonated / reactive-H state is stabilized after relaxation
+
+### Representative display logic in oxide HER
+SAGE distinguishes between different user-facing values for oxide HER outputs.
+
+- **Representative occupied site**  
+  The most stabilized reliable H* site among reliable candidates  
+  (`minimum ΔG_H`)
+
+- **HER-optimal reference**  
+  The reliable site closest to `0 eV`  
+  (`minimum |ΔG_H|`)
+
+- **Selected descriptor profile**  
+  The profile-linked descriptor view used for multi-stage interpretation
+
+### D2-only mode
+When **`D2_Hreact only (reactive H state)`** is selected, the displayed `D2_Hreact` result is aligned to the
+**representative occupied site** among reliable candidates.
+This avoids confusion between:
+- the best reliable occupied site
+- a profile-linked internal descriptor value
+
+This distinction is especially important for oxide surfaces where descriptor profiles and relaxed final states
+do not always collapse to a single obvious representative number.
+
+---
+
 ## Key Features
 
-- **Structure input**  
-  `.cif` upload or Materials Project retrieval
+- **Structure input**
+  - Materials Project retrieval
+  - CIF upload
 
-- **Surface preparation**  
-  supercell expansion, composition tuning, slabify workflow, and vacuum control
+- **Surface setup wizard**
+  - slab selection
+  - vacuum control
+  - XY expansion
+  - slab-thickness reduction
+  - prepared-slab review
 
-- **Geometric quality control**  
-  pairwise distance check, isolated-atom detection, and vacuum validation
+- **Geometry QC**
+  - pairwise distance checks
+  - isolated-atom detection
+  - vacuum validation
 
-- **Adsorption-site generation**  
-  metallic ontop / bridge / hollow site treatment plus **oxide-specific O-top protonation-oriented HER site treatment**
+- **Adsorption-site generation**
+  - metallic ontop / bridge / hollow logic
+  - oxide-oriented HER site treatment
 
-- **ML pre-screening**  
-  optional CHGNet-based candidate filtering
+- **ML pre-screening**
+  - optional CHGNet-assisted filtering
 
-- **CHE evaluation**  
-  common CHE correction, pH/potential adjustment, and migration-aware interpretation
+- **Thermodynamic workflows**
+  - HER
+  - CO2RR
+  - ORR (experimental)
 
-- **Local vibrational refinement (HER)**  
-  optional local ZPE / entropy-inspired correction based on a cutoff-selected local region around relaxed H*
+- **Migration-aware interpretation**
+  - initial vs relaxed site behavior
+  - reliable vs unreliable output separation
 
-- **Active-region slab reduction**  
-  optional z-direction crop applied during site-selection preview to remove unnecessary deep-slab regions before expensive evaluation
+- **Relaxed-structure inspection**
+  - post-run structure viewing
+  - CIF download
 
-- **Post-run relaxed structure viewer**  
-  interactive inspection of relaxed slab + adsorbate structures after calculation
+- **Metadata-rich export**
+  - ranked CSV outputs
+  - reproducible result tracking
 
-- **Reproducibility support**  
-  deterministic seed control for `numpy`, `random`, and `torch`
-
-- **Result management**  
-  session history, metadata export, CIF export, and CSV download
-
-- **LLM-ready interpretation support**  
-  optional structured summarization of ranked outputs
+- **LLM-ready reporting support**
+  - optional structured summarization of ranked outputs
 
 ---
 
 ## What Is Novel in SAGE?
 
-The main contribution of SAGE is not simply that it performs adsorption-energy screening, but that it **organizes the full user-facing screening workflow into a reproducible and interpretable sequence**.
+The novelty of SAGE is not that it introduces a completely new atomistic calculator.
+Its main novelty is that it **turns fragmented script-level tools into an executable research application**.
 
-Its novelty lies in the integration of:
+In practical terms, SAGE integrates:
 
-1. **structure retrieval or upload**
-2. **slab preparation**
-3. **surface QC**
-4. **adsorption-site generation**
-5. **ML-assisted pre-screening**
-6. **CHE-based post-processing**
-7. **migration-aware interpretation**
-8. **ranked export with metadata**
-9. **oxide-specific protonation-oriented HER treatment**
-10. **optional local vibrational refinement and post-run relaxed-structure inspection**
+1. structure retrieval or upload
+2. slab preparation
+3. geometry QC
+4. adsorption-site generation
+5. ML-assisted pre-screening
+6. CHE-based post-processing
+7. relaxed-site interpretation
+8. ranked export with metadata
+9. oxide-oriented HER treatment
+10. user-facing review within one interface
 
-This matters because adsorption screening is often limited not only by the underlying calculator, but also by poor consistency between the intermediate workflow steps.  
-SAGE aims to reduce that inconsistency by enforcing a more unified workflow.
-
-In this sense, SAGE should be viewed as a **workflow-level application for surface-screening standardization**, rather than merely a thin wrapper around an energy model.
+This matters because adsorption screening is often limited not only by the underlying calculator,
+but by inconsistency between intermediate workflow steps.
+SAGE is intended to reduce that inconsistency through a more structured interface.
 
 ---
 
 ## Benchmarking on Metallic Surfaces
 
-To test whether the workflow yields physically reasonable adsorption trends on well-known metal surfaces, SAGE-calculated ΔG_H values were compared against representative literature values from the Norskov framework.
+To test whether the workflow reproduces physically reasonable adsorption trends on representative metal surfaces,
+SAGE-calculated ΔG_H values were compared against literature reference values in the Nørskov framework.
 
 | Metal surface | Calculated ΔG_H (eV) | Norskov θ = 0.25 (eV) | Difference (eV) | mp-number |
 |---------------|----------------------|------------------------|-----------------|----------|
@@ -232,101 +355,59 @@ To test whether the workflow yields physically reasonable adsorption trends on w
 | Cu(111) | +0.178 | +0.19 | -0.012 | mp-30 |
 | Ag(111) | +0.555 | +0.51 | +0.045 | mp-124 |
 
-Across these benchmark surfaces, the mean absolute deviation is approximately **0.018 eV**.  
-This level of agreement suggests that the SAGE workflow can recover the expected relative adsorption trends for common metallic HER benchmarks while keeping the entire structure-to-ranking pipeline within one interface.
+Across these surfaces, the mean absolute deviation is approximately **0.018 eV**.
 
-This benchmark is not intended to claim a new state-of-the-art calculator.  
-Instead, it supports the more practical claim that **SAGE can reproduce well-established metallic screening trends within an integrated and reproducible workflow**.
+This benchmark is not intended to claim a new state-of-the-art calculator.
+Instead, it supports the practical claim that **SAGE can recover established metallic screening trends within an integrated workflow**.
 
 ---
 
 ## How SAGE Approaches Metal-Oxide Surfaces
 
-Metal-oxide surfaces are intrinsically more difficult than close-packed metals because their adsorption energetics are more sensitive to:
+Metal-oxide surfaces are intrinsically harder than close-packed metals because adsorption energetics are more
+sensitive to:
 
-- surface termination
+- termination
 - local stoichiometry
 - cation/anion exposure
-- slab polarity
-- post-relaxation migration of adsorbates
+- polarity
+- relaxed-state migration
+- protonated oxygen / OH-like final states
 
-For this reason, SAGE does **not** position oxide screening as a fully black-box problem.
+For this reason, SAGE does **not** position oxide outputs as universal benchmark values.
 
-Instead, the current oxide workflow is designed as a **structured and inspectable screening route**, where the user can:
+Instead, oxide calculations in the current release should be viewed as:
 
-- explicitly choose oxide mode
-- construct oxide slabs under user-controlled settings
-- generate adsorption candidates on oxide surfaces within the same interface
-- apply geometric QC before interpretation
-- inspect final relaxed-site behavior rather than relying only on the initial site label
-- export ranked outputs for further verification
+- **structured screening workflows**
+- **inspectable case-study outputs**
+- **termination-sensitive results requiring user judgment**
 
-This is an important distinction.
+This distinction is intentional.
 
-For metals, SAGE benchmarking can be discussed in terms of agreement with established ΔG_H trends.  
-For oxides, the main contribution at the current stage is **workflow support for controlled screening and interpretation**, especially in systems where termination and post-relaxation behavior strongly affect the final result.
-
-### Oxide HER treatment in the current release
-
-For oxide HER calculations, SAGE does **not** simply reuse a generic metallic top / bridge / hollow H-adsorption picture.
-
-Instead, hydrogen is preferentially seeded using an **O-top protonation-oriented rule**.  
-This design choice was introduced because hydrogen on oxide surfaces is often stabilized through **surface oxygen protonation and OH-like relaxed states**, rather than through a purely metal-centered adsorption picture.
-
-Accordingly:
-
-- the oxide HER workflow should be interpreted primarily as a **surface oxygen protonation / O-top H adsorption workflow**
-- relaxed oxide HER outputs are intended to capture **OH-like final stabilization tendencies**
-- oxide HER values should **not** be interpreted as direct one-to-one analogues of close-packed metallic ΔG_H benchmarks
-
-This rule is therefore intended to improve the physical realism of oxide HER relaxed states within the present workflow, not to claim a universal black-box descriptor for every oxide termination.
+- **Metals** are used as the main benchmark set.
+- **Oxides** are better treated as case studies or workflow demonstrations.
 
 ---
 
-## Recommended Interpretation Strategy
+## Example Interpretation Strategy
 
-A practical way to interpret SAGE outputs is:
+A practical interpretation strategy is:
 
-- **metal surfaces**  
-  use benchmarked adsorption trends as a reference for workflow validity
+### For metals
+Use ΔG_H trends to judge whether the workflow reproduces physically reasonable screening behavior.
 
-- **oxide surfaces**  
-  use SAGE as a structured workflow for candidate generation, QC, ranking, protonation-oriented relaxed-state inspection, and post-relaxation interpretation, while retaining explicit user judgment on termination validity
+### For oxides
+Use SAGE to:
+- generate candidate surfaces
+- perform geometry QC
+- inspect relaxed-site behavior
+- compare relative site or facet trends
+- export structures and ranked outputs for further validation
 
-This distinction is intentional and reflects the physical complexity of oxide surfaces.
-
----
-
-## Oxide HER Interpretation
-
-For oxide HER mode, the most useful interpretation is usually **not** “metal-style H adsorption strength” in the narrow sense.
-
-Instead, the current implementation is better interpreted as a descriptor of:
-
-- how readily surface oxygen accepts hydrogen
-- whether the relaxed structure tends toward an **OH-like protonated surface state**
-- how strongly that protonated state is stabilized after relaxation
-
-This means that strongly negative oxide HER values can be physically meaningful within the present workflow, especially when they correspond to stable protonated oxygen / OH-like final states.
-
-At the same time, those values should be discussed as **oxide protonation descriptors** rather than as direct replacements for metallic volcano-style ΔG_H benchmarks.
-
----
-
-## Example Workflow
-
-A typical HER workflow in SAGE is:
-
-1. load a metallic structure from Materials Project or from a CIF file
-2. prepare the slab with selected supercell and vacuum settings
-3. run geometric QC
-4. generate adsorption sites
-5. run CHE-based evaluation
-6. optionally apply local vibrational refinement
-7. inspect relaxed post-run structures
-8. review ranked results and export CSV data
-
-For oxide systems, the same workflow can be applied, but the final interpretation should be made with explicit attention to surface oxygen protonation, OH-like relaxed states, and termination validity.
+In oxide mode, final interpretation should always retain explicit user judgment about:
+- termination validity
+- protonation realism
+- whether the relaxed state is chemically meaningful
 
 ---
 
@@ -349,12 +430,11 @@ See `requirements.txt` for the full dependency list.
 ## Limitations
 
 - ORR support is still experimental
-- oxide results remain more termination-sensitive than metallic benchmarks
-- oxide HER values in the current release are **O-top protonation-oriented descriptors** and should not be interpreted as direct one-to-one analogues of metal-surface ΔG_H values
-- the optional local vibrational correction is a **local refinement mode**, not a full phonon / full DFT free-energy treatment
-- active-region z crop is a runtime-reduction option and may omit deeper subsurface effects
-- some oxide systems may still require additional user validation after slab construction and relaxation
-- certain energy calculators may require separate external access approval
+- oxide outputs remain more termination-sensitive than metallic benchmarks
+- oxide HER values should not be interpreted as one-to-one replacements for close-packed metallic ΔG_H benchmarks
+- D2-only oxide results are user-facing representative values, not universal oxide benchmarks
+- optional local vibrational refinement is a local correction mode, not a full phonon treatment
+- some oxide systems still require additional user validation after slab construction and relaxation
 - runtime can increase significantly for large supercells
 
 ---
