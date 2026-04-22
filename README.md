@@ -430,6 +430,7 @@ See `requirements.txt` for the full dependency list.
 ## Limitations
 
 - ORR support is still experimental
+- CO2RR support is still experimental
 - oxide outputs remain more termination-sensitive than metallic benchmarks
 - oxide HER values should not be interpreted as one-to-one replacements for close-packed metallic ΔG_H benchmarks
 - D2-only oxide results are user-facing representative values, not universal oxide benchmarks
