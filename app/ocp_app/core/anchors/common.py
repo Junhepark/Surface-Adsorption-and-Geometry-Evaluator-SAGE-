@@ -25,7 +25,7 @@ calc = FAIRChemCalculator(_predictor, task_name="oc20")
 # ---- Thermochemistry (298 K) ----
 ZPE_CORR = 0.04
 TDS_CORR = 0.20
-NET_CORR = ZPE_CORR - TDS_CORR   # approx -0.16 eV (used only for absolute dG export)
+NET_CORR = ZPE_CORR + TDS_CORR   # approx 0.24 eV (used only for absolute dG export)
 
 # ---- Thresholds / parameters (shared) ----
 H0S = (1.0, 1.2, 1.4)   # Initial H height scan values (Angstrom)
