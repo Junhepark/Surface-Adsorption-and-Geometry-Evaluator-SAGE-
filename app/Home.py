@@ -602,6 +602,81 @@ def _annotate_step2_slab_symmetry(meta: Optional[dict], *, frac_tol_strict: floa
     return md
 
 
+def _oxide_plausibility_rank_key(meta: Optional[dict]):
+    """Rank oxide slab candidates by plausibility for Step 2 slab screening.
+
+    Goal:
+      - prefer slabs that are usable / reference-like
+      - prefer symmetric terminations over quasi-symmetric / asymmetric
+      - use the existing oxide_rank_key only as a late tie-breaker
+
+    This is intentionally different from activity-oriented ranking.
+    """
+    md = dict(meta or {})
+
+    usability = str(md.get("slab_usability", "") or "").strip().lower()
+    symmetry = str(md.get("slab_symmetry", "") or "").strip().lower()
+    validity = str(md.get("rule_validity", "") or "").strip().lower()
+    role = str(md.get("rule_role", "") or "").strip().lower()
+    diagnostics = str(md.get("surface_diagnostics_status", "") or "").strip().lower()
+
+    def _usability_rank(x: str) -> int:
+        if any(tok in x for tok in ("reference_ready", "reference", "usable")) and "exploratory" not in x:
+            return 0
+        if "usable" in x:
+            return 1
+        if "exploratory" in x:
+            return 2
+        if any(tok in x for tok in ("invalid", "unusable", "reject", "fail")):
+            return 3
+        return 4
+
+    def _symmetry_rank(x: str) -> int:
+        if x == "symmetric":
+            return 0
+        if x == "quasi-symmetric":
+            return 1
+        if x == "asymmetric":
+            return 2
+        return 3
+
+    def _validity_rank(x: str) -> int:
+        if x in {"ok", "valid", "pass"}:
+            return 0
+        if x in {"warn", "warning"}:
+            return 1
+        if x in {"fail", "invalid", "reject"}:
+            return 2
+        return 3
+
+    def _role_rank(x: str) -> int:
+        if "reference" in x:
+            return 0
+        if any(tok in x for tok in ("secondary", "support", "supplementary")):
+            return 1
+        if any(tok in x for tok in ("exploratory", "advanced", "polar")):
+            return 2
+        return 3
+
+    def _diag_rank(x: str) -> int:
+        if x in {"ok", "pass", "good"}:
+            return 0
+        if x in {"warn", "warning"}:
+            return 1
+        if x in {"fail", "bad", "invalid"}:
+            return 2
+        return 3
+
+    return (
+        _usability_rank(usability),
+        _symmetry_rank(symmetry),
+        _validity_rank(validity),
+        _role_rank(role),
+        _diag_rank(diagnostics),
+        md.get("oxide_rank_key", (999, 999, 999, 999)),
+    )
+
+
 
 # ---------------- Sidebar: global options ----------------
 with st.sidebar:
@@ -955,7 +1030,9 @@ else:
                                     m_n["hydroxylation_mode"] = "Clean only"
                                     keep = _oxide_mode_keep_candidate(m_n, mode_pref)
                                     if keep:
+                                        m_n = _annotate_step2_slab_symmetry(m_n)
                                         m_n["oxide_rank_key"] = _oxide_candidate_rank_key(m_n)
+                                        m_n["oxide_plausibility_rank_key"] = _oxide_plausibility_rank_key(m_n)
                                         norm_atoms.append(a_n)
                                         norm_meta.append(m_n)
                                     else:
@@ -965,6 +1042,12 @@ else:
                                     st.info(f"Filtered out {rejected} oxide candidate(s) that failed the current clean-surface selection mode.")
                                 if not cand_atoms:
                                     raise ValueError("No oxide slab candidates remained after family-aware clean-surface filtering. Try another facet or switch to a less restrictive clean-surface mode.")
+                                paired_ranked = sorted(
+                                    zip(cand_atoms, cand_meta),
+                                    key=lambda x: x[1].get("oxide_plausibility_rank_key", (999, 999, 999, 999, 999, (999, 999, 999, 999))),
+                                )
+                                cand_atoms = [a for a, _m in paired_ranked]
+                                cand_meta = [dict(_m) for _a, _m in paired_ranked]
                             st.session_state["slabify_candidates_atoms"] = cand_atoms
                             st.session_state["slabify_candidates_meta"] = cand_meta
                             st.success(
@@ -1000,9 +1083,8 @@ else:
                                 "vacuum_z", "recommend_repeat", "slab_usability_reason", "oxide_rule_notes", "surface_diagnostics_notes", "issues"
                             ] if c in df_cands.columns]
                             st.dataframe(df_cands[detail_cols], use_container_width=True)
-                        auto_atoms, auto_meta = _pick_best_oxide_slab_candidate(cand_atoms, cand_meta)
-                        auto_meta = _annotate_step2_slab_symmetry(auto_meta)
-                        auto_idx = next((i for i, m in enumerate(cand_meta) if m.get("idx") == auto_meta.get("idx")), 0)
+                        auto_idx = 0
+                        auto_meta = _annotate_step2_slab_symmetry(cand_meta[auto_idx])
                         st.caption(
                             f"Auto-selected oxide candidate: #{auto_idx} | symmetry={auto_meta.get('slab_symmetry')} | usability={auto_meta.get('slab_usability')} | "
                             f"rule={auto_meta.get('rule_validity')}/{auto_meta.get('rule_role')} | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
@@ -1302,21 +1384,41 @@ else:
                 st.write(f"- Reduction base z-layers: **{base_layers}**")
                 reduction_presets = get_slab_reduction_presets()
                 reduction_label_to_level = {
+                    "None (keep current thickness)": "None",
                     "Medium (recommended)": "Medium",
                     "Large": "Large",
                     "Small (aggressive)": "Small",
                     "Custom": "Custom",
                 }
+                if mtype == "metal":
+                    reduction_options = [
+                        "None (keep current thickness)",
+                        "Medium (recommended)",
+                        "Large",
+                        "Small (aggressive)",
+                        "Custom",
+                    ]
+                    reduction_default_index = 0
+                else:
+                    reduction_options = [
+                        "Medium (recommended)",
+                        "Large",
+                        "Small (aggressive)",
+                        "Custom",
+                    ]
+                    reduction_default_index = 0
                 reduction_mode_label = st.selectbox(
                     "Slab reduction preset",
-                    ["Medium (recommended)", "Large", "Small (aggressive)", "Custom"],
-                    index=0,
+                    reduction_options,
+                    index=reduction_default_index,
                     key="step2_slab_reduction_level",
                     help="The reduction target is defined by preserved z-layer count on the XY-expanded base slab.",
                 )
                 reduction_mode = reduction_label_to_level.get(str(reduction_mode_label), "Medium")
                 target_preserved_layers = None
-                if reduction_mode in reduction_presets:
+                if reduction_mode == "None":
+                    st.caption("Keep the current XY-expanded slab thickness without z-layer reduction.")
+                elif reduction_mode in reduction_presets:
                     preset_meta = reduction_presets.get(reduction_mode, {})
                     st.caption(str(preset_meta.get("description", "")))
                     target_preserved_layers = int(preset_meta.get("target_preserved_layers", 4))
@@ -1338,22 +1440,38 @@ else:
                 with r1:
                     if st.button("Apply slab reduction", key="btn_apply_slab_reduction"):
                         try:
-                            a2, reduction_meta = reduce_slab_symmetrically(
-                                reduction_base,
-                                level=(None if reduction_mode == "Custom" else str(reduction_mode)),
-                                target_preserved_layers=int(target_preserved_layers) if target_preserved_layers is not None else None,
-                                keep_pbc_z=True,
-                            )
-                            _push_prepared_update(a2, "slab_reduction", reduction_meta)
-                            if bool(reduction_meta.get("reduced", False)):
-                                st.success(
-                                    f"Applied {reduction_meta.get('reduction_level')} slab reduction: layers "
-                                    f"{reduction_meta.get('original_layer_count')} → {reduction_meta.get('kept_layer_count')}, atoms "
-                                    f"{reduction_meta.get('original_atoms')} → {reduction_meta.get('reduced_atoms')}, thickness "
-                                    f"{reduction_meta.get('original_thickness_A', float('nan')):.2f} → {reduction_meta.get('reduced_thickness_A', float('nan')):.2f} Å."
-                                )
+                            if reduction_mode == "None":
+                                a2 = reduction_base.copy()
+                                reduction_meta = {
+                                    "reduced": False,
+                                    "reduction_level": "None",
+                                    "reason": "Metal preset selected: keep current slab thickness.",
+                                    "original_layer_count": int(base_layers),
+                                    "kept_layer_count": int(base_layers),
+                                    "original_atoms": int(len(reduction_base)),
+                                    "reduced_atoms": int(len(reduction_base)),
+                                    "original_thickness_A": float(slab_thickness_z(reduction_base)),
+                                    "reduced_thickness_A": float(slab_thickness_z(reduction_base)),
+                                }
+                                _push_prepared_update(a2, "slab_reduction_none", reduction_meta)
+                                st.info("No slab reduction applied. Current thickness was preserved.")
                             else:
-                                st.info(str(reduction_meta.get("reason", "No reduction was needed.")))
+                                a2, reduction_meta = reduce_slab_symmetrically(
+                                    reduction_base,
+                                    level=(None if reduction_mode == "Custom" else str(reduction_mode)),
+                                    target_preserved_layers=int(target_preserved_layers) if target_preserved_layers is not None else None,
+                                    keep_pbc_z=True,
+                                )
+                                _push_prepared_update(a2, "slab_reduction", reduction_meta)
+                                if bool(reduction_meta.get("reduced", False)):
+                                    st.success(
+                                        f"Applied {reduction_meta.get('reduction_level')} slab reduction: layers "
+                                        f"{reduction_meta.get('original_layer_count')} → {reduction_meta.get('kept_layer_count')}, atoms "
+                                        f"{reduction_meta.get('original_atoms')} → {reduction_meta.get('reduced_atoms')}, thickness "
+                                        f"{reduction_meta.get('original_thickness_A', float('nan')):.2f} → {reduction_meta.get('reduced_thickness_A', float('nan')):.2f} Å."
+                                    )
+                                else:
+                                    st.info(str(reduction_meta.get("reason", "No reduction was needed.")))
                             st.session_state["surface_setup_stage"] = 4
                             st.rerun()
                         except Exception as e:
@@ -1914,11 +2032,13 @@ else:
     local_zpe_cutoff = 2.5
     local_zpe_max_neighbors = 3
 
-    # Oxide HER relaxation freedom (artifact check / slight freedom release)
-    her_relaxation_scope = "rigid"
+    # HER relaxation freedom defaults
+    # Metal benchmark path uses partial freedom by default.
+    # Oxide benchmark path keeps the explicit oxide control below.
+    her_relaxation_scope = "partial" if (is_her and mtype == "metal") else "rigid"
     her_n_fix_layers = 2
 
-    if is_her:
+    if is_her and (mtype == "oxide"):
         st.markdown("### HER thermochemistry / ZPE correction")
         thermo_mode = st.selectbox(
             "HER thermochemistry mode",
@@ -2184,6 +2304,7 @@ else:
                         zpe_target_label=zpe_target_label,
                         local_zpe_cutoff=float(local_zpe_cutoff),
                         local_zpe_max_neighbors=int(local_zpe_max_neighbors),
+                        her_relaxation_scope="partial",
                     )
                 else:
                     csv_path, meta = run_oxide_che(
