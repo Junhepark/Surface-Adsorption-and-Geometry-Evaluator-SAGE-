@@ -25,7 +25,7 @@ calc = FAIRChemCalculator(_predictor, task_name="oc20")
 # ---- Thermochemistry (298 K) ----
 ZPE_CORR = 0.04
 TDS_CORR = 0.20
-NET_CORR = ZPE_CORR + TDS_CORR   # approx 0.24 eV (used only for absolute dG export)
+NET_CORR = ZPE_CORR + TDS_CORR 
 
 # ---- Thresholds / parameters (shared) ----
 H0S = (1.0, 1.2, 1.4)   # Initial H height scan values (Angstrom)
@@ -56,35 +56,49 @@ def layer_indices(at, n=3, tol=0.25):
     return layers  # [top, second, third, ...] (up to n)
 
 
-def first_layer_min_distance(a):
-    """Minimum distance between H and the top-layer non-H atoms."""
+def first_layer_min_distance(a, *, include_h_in_top_layer: bool = False):
+    """Minimum distance between H and the top-layer atoms.
+
+    Parameters
+    ----------
+    include_h_in_top_layer
+        When True, use the legacy metal-benchmark behavior and measure against
+        the raw top-layer indices returned by ``layer_indices``. When False,
+        ignore top-layer H atoms and fall back to the highest non-H atoms.
+    """
     pos = a.get_positions()
     h_idx = [i for i, _ in enumerate(a) if a[i].symbol == "H"]
     if not h_idx:
         return None
     hpos = pos[h_idx[0]]
-    top_idx = [int(i) for i in layer_indices(a, n=1)[0] if a[int(i)].symbol != "H"]
-    if not top_idx:
-        non_h = [i for i, atom in enumerate(a) if atom.symbol != "H"]
-        if not non_h:
-            return None
-        z = pos[non_h, 2]
-        zmax = float(np.max(z))
-        top_idx = [int(non_h[k]) for k, zv in enumerate(z) if abs(float(zv) - zmax) <= 0.35]
+    if bool(include_h_in_top_layer):
+        top_idx = layer_indices(a, n=1)[0]
+    else:
+        top_idx = [int(i) for i in layer_indices(a, n=1)[0] if a[int(i)].symbol != "H"]
         if not top_idx:
-            return None
+            non_h = [i for i, atom in enumerate(a) if atom.symbol != "H"]
+            if not non_h:
+                return None
+            z = pos[non_h, 2]
+            zmax = float(np.max(z))
+            top_idx = [int(non_h[k]) for k, zv in enumerate(z) if abs(float(zv) - zmax) <= 0.35]
+            if not top_idx:
+                return None
     dxyz = np.linalg.norm(pos[top_idx] - hpos, axis=1)
     return float(dxyz.min())
 
 
-def put_H(at, xy, height=1.20, min_clearance=0.9, base_z=None):
+def put_H(at, xy, height=1.20, min_clearance=0.9, base_z=None, *, mtype: str | None = None):
     """Place an H adsorbate on the slab at the given xy position.
 
-    When ``base_z`` is supplied, H is placed explicitly at ``base_z + height``.
-    This is useful for rigid oxide O-top seeds where the intended anchor height
-    should be referenced to the selected surface oxygen rather than to a generic
-    slab-top placement rule.
+    Metal surfaces keep the exact legacy benchmark placement rule so that
+    historical metal HER values are reproduced. Oxides retain the newer
+    anchor-z placement and non-H top-layer clearance logic.
     """
+    mtype_s = str(mtype or "").strip().lower()
+    if mtype_s == "metal":
+        return _put_H_metal_legacy(at, xy, height=height, min_clearance=min_clearance)
+
     a = ensure_pbc3(at)
     if base_z is None or not np.isfinite(float(base_z)):
         add_adsorbate(
@@ -102,7 +116,7 @@ def put_H(at, xy, height=1.20, min_clearance=0.9, base_z=None):
         )
         a += h
     a = ensure_pbc3(a)
-    md = first_layer_min_distance(a)
+    md = first_layer_min_distance(a, include_h_in_top_layer=False)
     if md is not None and md < float(min_clearance):
         for i, atom in enumerate(a):
             if atom.symbol == "H":
@@ -340,6 +354,117 @@ def _run_bfgs_with_meta(at, *, fmax: float, steps: int):
     return n_steps, conv, elapsed, err
 
 
+def _put_H_metal_legacy(at, xy, height=1.20, min_clearance=0.9):
+    """Legacy metal H placement used by historical benchmark tables."""
+    a = ensure_pbc3(at)
+    add_adsorbate(
+        a,
+        "H",
+        height=float(height),
+        position=(float(xy[0]), float(xy[1])),
+    )
+    a = ensure_pbc3(a)
+    md = first_layer_min_distance(a, include_h_in_top_layer=True)
+    if md is not None and md < min_clearance:
+        for i, atom in enumerate(a):
+            if atom.symbol == "H":
+                p = atom.position
+                p[2] += (min_clearance - md) + 0.2
+                atom.position = p
+                break
+    return a
+
+
+def _relax_zonly_metal_legacy(atoms, steps=None, fmax=0.05, return_meta: bool = False):
+    """Exact legacy metal z-only relaxation."""
+    a = ensure_pbc3(atoms)
+    a.calc = calc
+    cons = [FixAtoms(mask=make_bottom_fix_mask(a, n_fix_layers=2))]
+    for i, atom in enumerate(a):
+        if atom.symbol == "H":
+            cons.append(FixCartesian(i, [True, True, False]))
+    a.set_constraint(cons)
+    nsteps = 0 if steps is None else int(steps)
+    if nsteps > 0:
+        BFGS(a, logfile=None).run(fmax=fmax, steps=nsteps)
+    E = a.get_potential_energy()
+    meta = {
+        "relaxation_scope": "metal_legacy_zonly",
+        "n_fix_layers": 2,
+        "fixed_atom_count": int(np.count_nonzero(make_bottom_fix_mask(a, n_fix_layers=2))),
+        "relaxed_atom_count": int(len(a) - np.count_nonzero(make_bottom_fix_mask(a, n_fix_layers=2))),
+        "n_steps": int(nsteps),
+        "converged": None,
+        "elapsed_s": 0.0,
+        "error": "",
+    }
+    if return_meta:
+        return a, E, meta
+    return a, E
+
+
+def _relax_freeH_metal_legacy(atoms, steps=None, fmax=0.03, return_meta: bool = False):
+    """Exact legacy metal partial relaxation (bottom layers fixed only)."""
+    a = ensure_pbc3(atoms)
+    a.calc = calc
+    a.set_constraint([FixAtoms(mask=make_bottom_fix_mask(a, n_fix_layers=2))])
+    nsteps = 0 if steps is None else int(steps)
+    if nsteps > 0:
+        BFGS(a, logfile=None).run(fmax=fmax, steps=nsteps)
+    E = a.get_potential_energy()
+    meta = {
+        "relaxation_scope": "metal_legacy_partial",
+        "n_fix_layers": 2,
+        "fixed_atom_count": int(np.count_nonzero(make_bottom_fix_mask(a, n_fix_layers=2))),
+        "relaxed_atom_count": int(len(a) - np.count_nonzero(make_bottom_fix_mask(a, n_fix_layers=2))),
+        "n_steps": int(nsteps),
+        "converged": None,
+        "elapsed_s": 0.0,
+        "error": "",
+    }
+    if return_meta:
+        return a, E, meta
+    return a, E
+
+
+def _site_energy_two_stage_metal_legacy(at_relaxed, xy, h0s=H0S, z_steps=None, free_steps=None, return_meta: bool = False):
+    """Exact legacy metal two-stage relaxation path."""
+    if z_steps is None or free_steps is None:
+        raise ValueError("site_energy_two_stage: z_steps and free_steps must be specified.")
+
+    best = {"E": None, "atoms": None, "disp_xy": None, "meta": None}
+    xy = np.array(xy, float)
+    for h0 in h0s:
+        A0 = _put_H_metal_legacy(at_relaxed, xy, height=h0)
+        Az, _, z_meta = _relax_zonly_metal_legacy(A0, steps=z_steps, fmax=0.05, return_meta=True)
+        Af, Ef, free_meta = _relax_freeH_metal_legacy(Az, steps=free_steps, fmax=0.03, return_meta=True)
+        hi = [i for i, atom in enumerate(Af) if atom.symbol == "H"][0]
+        disp_xy = float(np.linalg.norm(Af[hi].position[:2] - xy))
+        trial_meta = {
+            "selected_h0": float(h0),
+            "h0_candidates": ";".join(f"{float(v):.2f}" for v in np.asarray(h0s, dtype=float).reshape(-1)),
+            "placement_mode": "slab_top",
+            "z_relax_n_steps": int((z_meta or {}).get("n_steps", 0)),
+            "z_relax_converged": (z_meta or {}).get("converged", None),
+            "z_relax_elapsed_s": float((z_meta or {}).get("elapsed_s", 0.0)),
+            "z_relax_relaxed_atoms": int((z_meta or {}).get("relaxed_atom_count", 0)),
+            "z_relax_fixed_atoms": int((z_meta or {}).get("fixed_atom_count", 0)),
+            "fine_relax_scope": "metal_legacy_partial",
+            "fine_n_fix_layers": 2,
+            "fine_relax_n_steps": int((free_meta or {}).get("n_steps", 0)),
+            "fine_relax_converged": (free_meta or {}).get("converged", None),
+            "fine_relax_elapsed_s": float((free_meta or {}).get("elapsed_s", 0.0)),
+            "fine_relax_relaxed_atoms": int((free_meta or {}).get("relaxed_atom_count", 0)),
+            "fine_relax_fixed_atoms": int((free_meta or {}).get("fixed_atom_count", 0)),
+            "total_relax_n_steps": int((z_meta or {}).get("n_steps", 0)) + int((free_meta or {}).get("n_steps", 0)),
+        }
+        if best["E"] is None or Ef < best["E"]:
+            best.update({"E": Ef, "atoms": Af, "disp_xy": disp_xy, "meta": trial_meta})
+    if return_meta:
+        return best["atoms"], best["E"], best["disp_xy"], (best["meta"] or {})
+    return best["atoms"], best["E"], best["disp_xy"]
+
+
 def relax_zonly(atoms, steps=None, fmax=0.05, return_meta: bool = False):
     """
     Relax H in z-direction only while fixing all slab atoms.
@@ -423,14 +548,18 @@ def site_energy_two_stage(
 ):
     """
     Two-stage relaxation: z-only (coarse) then scope-controlled fine relax.
-    Scans multiple initial heights and selects the lowest energy.
-
-    Returns
-    -------
-    (final_atoms, final_energy, H_lateral_displacement)
-    or, when return_meta=True,
-    (final_atoms, final_energy, H_lateral_displacement, meta)
+    For metal surfaces, the exact legacy benchmark path is preserved.
     """
+    if str(mtype or "").strip().lower() == "metal":
+        return _site_energy_two_stage_metal_legacy(
+            at_relaxed,
+            xy,
+            h0s=tuple(float(x) for x in np.asarray(h0s, dtype=float).reshape(-1)),
+            z_steps=z_steps,
+            free_steps=free_steps,
+            return_meta=return_meta,
+        )
+
     if z_steps is None or free_steps is None:
         raise ValueError("site_energy_two_stage: z_steps and free_steps must be specified.")
 
@@ -449,7 +578,7 @@ def site_energy_two_stage(
         except Exception:
             base_z = None
     for h0 in h0s_eff:
-        A0 = put_H(at_relaxed, xy, height=h0, min_clearance=float(min_clearance), base_z=base_z if scope == "rigid" else None)
+        A0 = put_H(at_relaxed, xy, height=h0, min_clearance=float(min_clearance), base_z=base_z if scope == "rigid" else None, mtype=mtype)
         Az, _, z_meta = relax_zonly(A0, steps=z_steps, fmax=0.05, return_meta=True)
         Af, Ef, free_meta = relax_freeH(
             Az,

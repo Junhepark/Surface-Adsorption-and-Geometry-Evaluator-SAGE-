@@ -57,7 +57,7 @@ from ocp_app.core.anchors.oxide_her import (
 #  - ORR: stepwise free energies for OOH*, O*, OH* (4e⁻ Norskov CHE)
 # =====================================================================
 
-# --- HER CHE correction (Norskov) ---
+# --- HER CHE correction (calibrated on Ni(111)) ---
 STANDARD_CHE_CORR = 0.24  # eV
 
 THREE_STAGE_OXIDE_HER_CAUTION = (
@@ -677,29 +677,20 @@ def _build_target_sites(
 
     if mtype_norm == "metal":
         xy_map = site_xy_by_layers_metal(slab_u_rel)
-        seen_metal = set()
-        sites_iter: List[str] = []
-        for site_name in site_names:
-            s_norm = _canonicalize_metal_kind(site_name)
-            if s_norm in seen_metal:
-                continue
-            seen_metal.add(s_norm)
-            sites_iter.append(s_norm)
+        sites_iter = list(site_names)
         if not sites_iter:
-            sites_iter = list(xy_map.keys())
-
+            sites_iter = ["ontop", "bridge", "hollow"]
         for site_name in sites_iter:
-            if site_name not in xy_map:
-                continue
-            xy = np.asarray(xy_map[site_name], dtype=float)
-            target_sites.append({
-                "site_label": str(site_name),
-                "site_kind": str(site_name),
-                "xy": xy,
-                "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
-                "surface_indices": tuple(),
-                "seed_source": "geometry_default",
-            })
+            if site_name in xy_map:
+                xy = np.asarray(xy_map[site_name], dtype=float)
+                target_sites.append({
+                    "site_label": str(site_name),
+                    "site_kind": str(site_name),
+                    "xy": xy,
+                    "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
+                    "surface_indices": tuple(),
+                    "seed_source": "geometry_default",
+                })
         return target_sites
 
     if mtype_norm == "oxide":
@@ -786,7 +777,7 @@ def _run_her_che(
     oxide_descriptor_mode: str = "Basic HER screening",
     oxide_descriptor_max_reactive_per_kind: int = 2,
     oxide_descriptor_pair_limit: int = 6,
-    her_relaxation_scope: str = "rigid",
+    her_relaxation_scope: str = "partial",
     her_n_fix_layers: int = 2,
 ):
     if gas != "H2":
@@ -859,26 +850,37 @@ def _run_her_che(
         xy = np.asarray(site_seed.get("xy", [np.nan, np.nan]), dtype=float)
 
         anchor_xyz = np.asarray(site_seed.get("initial_xyz", [np.nan, np.nan, np.nan]), dtype=float)
-        h0s_used = recommend_h0s_for_relaxation(
-            resolved_her_relaxation_scope,
-            mtype=mtype,
-            site_kind=kind,
-            default_h0s=H0S,
-        )
-        Au, E_uH, _disp_raw, relax_meta = site_energy_two_stage(
-            slab_u_rel,
-            xy,
-            h0s_used,
-            z_steps,
-            free_steps,
-            relaxation_scope=resolved_her_relaxation_scope,
-            n_fix_layers=int(her_n_fix_layers),
-            return_meta=True,
-            anchor_xyz=anchor_xyz,
-            mtype=mtype,
-            site_kind=kind,
-            min_clearance=default_min_clearance_for_scope(resolved_her_relaxation_scope, mtype=mtype),
-        )
+        if str(mtype).lower() == "metal":
+            Au, E_uH, _disp_raw, relax_meta = site_energy_two_stage(
+                slab_u_rel,
+                xy,
+                H0S,
+                z_steps,
+                free_steps,
+                return_meta=True,
+                mtype="metal",
+            )
+        else:
+            h0s_used = recommend_h0s_for_relaxation(
+                resolved_her_relaxation_scope,
+                mtype=mtype,
+                site_kind=kind,
+                default_h0s=H0S,
+            )
+            Au, E_uH, _disp_raw, relax_meta = site_energy_two_stage(
+                slab_u_rel,
+                xy,
+                h0s_used,
+                z_steps,
+                free_steps,
+                relaxation_scope=resolved_her_relaxation_scope,
+                n_fix_layers=int(her_n_fix_layers),
+                return_meta=True,
+                anchor_xyz=anchor_xyz,
+                mtype=mtype,
+                site_kind=kind,
+                min_clearance=default_min_clearance_for_scope(resolved_her_relaxation_scope, mtype=mtype),
+            )
 
         dE_u = E_uH - E_slab_u - 0.5 * E_H2
         dG_u = dE_u + net_corr
