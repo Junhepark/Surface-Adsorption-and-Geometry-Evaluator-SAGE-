@@ -57,7 +57,7 @@ from ocp_app.core.anchors.oxide_her import (
 #  - ORR: stepwise free energies for OOH*, O*, OH* (4e⁻ Norskov CHE)
 # =====================================================================
 
-# --- HER CHE correction (calibrated on Ni(111)) ---
+# --- HER CHE correction (Norskov) ---
 STANDARD_CHE_CORR = 0.24  # eV
 
 THREE_STAGE_OXIDE_HER_CAUTION = (
