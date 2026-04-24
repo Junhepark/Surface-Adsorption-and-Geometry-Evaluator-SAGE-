@@ -675,7 +675,7 @@ def site_energy_oh_anchoronly(
         Af, E, local_meta = relax_anchor_oh(
             Az,
             anchor_index=int(anchor_index),
-            steps=free_steps,
+            steps=min(int(free_steps), 100),
             fmax=0.03,
             return_meta=True,
             shell_margin=float(shell_margin),
