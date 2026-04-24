@@ -2655,9 +2655,13 @@ if last_run is not None:
         _occ = _rep.get("occupied") if isinstance(_rep, dict) else None
         _opt = _rep.get("her_optimal") if isinstance(_rep, dict) else None
         _is_d2_only_mode = str(_mode).strip().startswith("D2_Hreact only")
+        _align_d2_to_representative = bool(_occ) and str(_mode).strip() in {
+            "D2_Hreact only (reactive H state)",
+            "Full 2-stage profile (recommended)",
+        }
         _display_ods = dict(_ods)
 
-        if _is_d2_only_mode and _occ:
+        if _align_d2_to_representative:
             _display_ods["descriptor_mode"] = _mode
             _display_ods["D2_Hreact (eV)"] = _occ.get("energy", np.nan)
             _display_ods["D2_site_label"] = _occ.get("site_label", "NA")
@@ -2666,7 +2670,11 @@ if last_run is not None:
                 _display_ods["D2_structure_cif"] = _occ.get("row", {}).get("structure_cif", _ods.get("D2_structure_cif", ""))
             except Exception:
                 pass
-            _display_ods["D2_basin_note"] = "representative occupied site (display-aligned in D2-only mode)"
+            _display_ods["D2_basin_note"] = (
+                "representative occupied site (display-aligned in D2-only mode)"
+                if _is_d2_only_mode else
+                "representative occupied site (display-aligned in full 2-stage mode)"
+            )
 
         st.markdown("### Oxide HER representative sites and selected profile")
         if _occ:
@@ -2707,8 +2715,7 @@ if last_run is not None:
         else:
             st.markdown("#### Selected 2-stage descriptor profile")
             st.caption(
-                "The profile below follows the internally selected 2-stage descriptor path. "
-                "Its D2 value may differ from the representative occupied site shown above."
+                "In full 2-stage mode, the displayed D2 value is aligned to the representative occupied site shown above."
             )
         # if _mode in {"D3_pair only (H2 pairing proxy)", "Full 3-stage profile (experimental)"}:
         #     st.warning(str(meta.get("OXIDE_DESCRIPTOR_CAUTION", _ods.get("caution", "The H₂ pairing stage is an approximate release proxy rather than an explicit barrier."))))
@@ -2729,7 +2736,7 @@ if last_run is not None:
         _profile_points = []
         _d1 = _safe_float(_display_ods.get("D1_OH (eV)"))
         _d2 = _safe_float(_display_ods.get("D2_Hreact (eV)"))
-        if _occ and np.isfinite(_safe_float(_occ.get("energy"))) and np.isfinite(_d2):
+        if (not _align_d2_to_representative) and _occ and np.isfinite(_safe_float(_occ.get("energy"))) and np.isfinite(_d2):
             _delta_rep = abs(float(_occ.get("energy")) - _d2)
             if _delta_rep > 1e-8:
                 st.info(
