@@ -72,6 +72,12 @@ THREE_STAGE_OXIDE_HER_CAUTION = (
 DESCRIPTOR_D1_DISP_THRESH_A = 1.20
 DESCRIPTOR_D2_DISP_THRESH_A = 1.00
 
+# Descriptor-level relaxation policy. This is intentionally handled above
+# the low-level relax_freeH() engine: D2_react_only is not a fourth physical
+# relaxation engine; it means D1 stays constrained while D2_Hreact uses the
+# partial relaxation engine.
+D2_REACT_ONLY_SCOPE = "D2_react_only"
+
 # --- CO2RR adsorbate-specific constant shifts (ZPE + TΔS lumped) ---
 # Defaults used when thermo_CO2RR.json is missing or cannot be parsed
 DEFAULT_ADS_CORR: Dict[str, float] = {
@@ -806,10 +812,23 @@ def _run_her_che(
     if not target_sites:
         raise RuntimeError(f"No target adsorption sites were built for mtype='{mtype}'.")
 
-    if str(her_relaxation_scope).strip().lower() == "auto":
+    raw_her_relaxation_scope = str(her_relaxation_scope).strip()
+    if raw_her_relaxation_scope == D2_REACT_ONLY_SCOPE:
+        if str(mtype).lower() != "oxide":
+            raise ValueError("D2_react_only is valid only for oxide HER descriptor mode.")
+        resolved_her_relaxation_scope = D2_REACT_ONLY_SCOPE
+    elif raw_her_relaxation_scope.lower() == "auto":
         resolved_her_relaxation_scope = "rigid" if str(mtype).lower() == "oxide" else "partial"
     else:
-        resolved_her_relaxation_scope = normalize_relaxation_scope(her_relaxation_scope)
+        resolved_her_relaxation_scope = normalize_relaxation_scope(raw_her_relaxation_scope)
+
+    # D2_react_only is a descriptor policy, not a low-level relaxation engine.
+    # Any legacy/guardrail calculation that still requires a physical engine
+    # receives a normal scope. Descriptor calculations receive the policy itself
+    # and interpret it in oxide_descriptor.py.
+    physical_her_relaxation_scope = (
+        "rigid" if resolved_her_relaxation_scope == D2_REACT_ONLY_SCOPE else resolved_her_relaxation_scope
+    )
 
     # --- Optional HER guardrail (single-site; cheap) ---
     her_guard = None
@@ -828,7 +847,7 @@ def _run_her_che(
                 site_preference=str(her_site_preference),
                 use_net_corr=bool(her_use_net_corr),
                 out_cif=out_cif_g,
-                relaxation_scope=resolved_her_relaxation_scope,
+                relaxation_scope=physical_her_relaxation_scope,
                 n_fix_layers=int(her_n_fix_layers),
             )
             if her_guard is not None:
@@ -844,6 +863,112 @@ def _run_her_che(
                     pass
         except Exception as e:
             her_guard = {"mode": "HER_GUARDRAIL", "error": str(e)}
+    descriptor_primary_results = (
+        str(mtype).lower() == "oxide"
+        and str(oxide_descriptor_mode) != "Basic HER screening"
+    )
+
+    if resolved_her_relaxation_scope == D2_REACT_ONLY_SCOPE and not descriptor_primary_results:
+        raise ValueError(
+            "D2_react_only is only valid for oxide HER descriptor-primary mode; "
+            "use rigid/partial/full for basic HER screening."
+        )
+
+    if descriptor_primary_results:
+        # Oxide descriptor mode is now D2-primary.  The legacy O-anchor HER
+        # candidate loop is intentionally skipped, so anion_ontop rows do not
+        # appear in the primary results table.  D1 is still evaluated inside
+        # run_oxide_descriptor_profile() when Full 2-stage mode is selected.
+        try:
+            oxide_descriptor_summary = run_oxide_descriptor_profile(
+                slab_u_rel=slab_u_rel,
+                E_slab_u=float(E_slab_u),
+                E_H2=float(E_H2),
+                d1_rows_df=pd.DataFrame(),
+                d1_targets=target_sites,
+                out_root=out_root,
+                z_steps=int(z_steps),
+                free_steps=int(free_steps),
+                use_net_corr=bool(use_net_corr),
+                descriptor_mode=str(oxide_descriptor_mode),
+                max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
+                pair_limit=int(oxide_descriptor_pair_limit),
+                # Descriptor-level policy with the same top-level status as
+                # rigid/partial/full. oxide_descriptor.py interprets this as:
+                #   D1 = constrained/rigid O-site OH descriptor
+                #   D2_Hreact = partial metal-cation-centered H* descriptor
+                relaxation_scope=D2_REACT_ONLY_SCOPE,
+                n_fix_layers=int(her_n_fix_layers),
+            )
+        except Exception as e:
+            oxide_descriptor_summary = {
+                "error": str(e),
+                "descriptor_mode": str(oxide_descriptor_mode),
+                "D2_seed_quality": "failed",
+                "D2_seed_warning": str(e),
+            }
+
+        df = _oxide_d2_summary_to_primary_results_df(
+            oxide_descriptor_summary,
+            net_corr=float(net_corr),
+        )
+        if df.empty:
+            df = pd.DataFrame([{
+                "mode": "HER",
+                "result_role": "oxide_D2_primary",
+                "descriptor": "D2",
+                "site_label": "D2_unresolved",
+                "requested_site": "metal_cation_Hstar",
+                "initial_geom_site": "metal_cation_Hstar",
+                "relaxed_site": "unresolved",
+                "final_site_kind": "unresolved",
+                "binding_class": "unresolved",
+                "D2_descriptor_valid": False,
+                "D2_selection_rule": "min_abs_deltaG_among_valid_metal_centered_Hstar",
+                "ΔG_H_CHE (eV)": np.nan,
+                "ΔG_H (eV)": np.nan,
+                "ΔE_H_user (eV)": np.nan,
+                "H_lateral_disp(Å)": np.nan,
+                "is_duplicate": False,
+                "qc_flags": str((oxide_descriptor_summary or {}).get("error", "D2_primary_result_unavailable")),
+            }])
+
+        out_csv = out_root / "results_sites_her.csv"
+        df.to_csv(out_csv, index=False, float_format="%.6f")
+
+        meta = {
+            "mode": "HER",
+            "user_slab": str(Path(user_slab_cif).resolve()),
+            "relax_mode": relax_mode,
+            "steps": {"slab": slab_steps, "H": z_steps, "H2": h2_steps},
+            "HER_RELAXATION_SCOPE": str(resolved_her_relaxation_scope),
+            "HER_PHYSICAL_RELAXATION_SCOPE": str(physical_her_relaxation_scope),
+            "HER_N_FIX_LAYERS": int(her_n_fix_layers),
+            "thermo": {"NET_CORR": net_corr, "standard": f"{STANDARD_CHE_CORR:.2f} eV"},
+            "E_H2": E_H2,
+            "HER_GUARDRAIL": her_guard,
+            "thermo_mode": str(thermo_mode),
+            "zpe_target_mode": str(zpe_target_mode),
+            "zpe_target_label": zpe_target_label,
+            "local_zpe_cutoff": float(local_zpe_cutoff),
+            "local_zpe_max_neighbors": int(local_zpe_max_neighbors),
+            "OXIDE_DESCRIPTOR_MODE": str(oxide_descriptor_mode),
+            "OXIDE_DESCRIPTOR_PRIMARY_RESULTS": True,
+            "OXIDE_DESCRIPTOR_LEGACY_OANCHOR_SKIPPED": True,
+            "OXIDE_DESCRIPTOR_SUMMARY": oxide_descriptor_summary,
+            "OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV": (oxide_descriptor_summary or {}).get("D2_candidates_csv", ""),
+            "OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV": (oxide_descriptor_summary or {}).get("D3_candidates_csv", ""),
+            "OXIDE_DESCRIPTOR_CAUTION": (oxide_descriptor_summary or {}).get("caution", ""),
+            "Model": MODEL_NAME,
+            "Device": DEVICE,
+            "warnings": {
+                "slab_relax_drop": meta_flags["slab_relax_drop"],
+                "vac_warning": meta_flags["vac_warning"],
+            },
+        }
+        (out_root / "meta_her.json").write_text(json.dumps(meta, indent=2))
+        return str(out_csv), meta
+
     for site_seed in target_sites:
         label = str(site_seed.get("site_label", "unknown"))
         kind = str(site_seed.get("site_kind", "unknown"))
@@ -1071,6 +1196,8 @@ def _run_her_che(
         "steps": {"slab": slab_steps, "H": z_steps, "H2": h2_steps},
         "HER_RELAXATION_SCOPE": str(resolved_her_relaxation_scope),
         "HER_N_FIX_LAYERS": int(her_n_fix_layers),
+        "OXIDE_DESCRIPTOR_RELAXATION_POLICY": "D2_react_only",
+        "OXIDE_DESCRIPTOR_POLICY_DETAILS": "D1=constrained/rigid O-site OH; D2_Hreact=partial metal-cation-centered H*",
         "thermo": {"NET_CORR": net_corr, "standard": f"{STANDARD_CHE_CORR:.2f} eV"},
         "E_H2": E_H2,
         "HER_GUARDRAIL": her_guard,
@@ -1521,6 +1648,117 @@ def _fmt_surface_indices(indices: object) -> str:
     except Exception:
         vals = tuple()
     return ",".join(str(i) for i in vals)
+
+
+def _oxide_d2_summary_to_primary_results_df(summary: Optional[dict], *, net_corr: float = STANDARD_CHE_CORR) -> pd.DataFrame:
+    """Build the user-facing oxide HER result table from the selected D2 descriptor.
+
+    This is intentionally used only for oxide descriptor modes. It prevents the
+    legacy O-anchor/anion_ontop HER rows from becoming the primary oxide result
+    table when the requested workflow is the metal-cation-centered D2 descriptor.
+
+    The full D2 candidate audit table remains available through
+    ``summary['D2_candidates_csv']``. The returned DataFrame contains only the
+    selected D2 representative row.
+    """
+    if not isinstance(summary, dict) or not summary:
+        return pd.DataFrame()
+
+    label = str(summary.get("D2_site_label", "NA"))
+    d2_csv = str(summary.get("D2_candidates_csv", "") or "").strip()
+    selected: dict[str, object] = {}
+
+    if d2_csv:
+        try:
+            p = Path(d2_csv).expanduser()
+            if p.is_file():
+                cand = pd.read_csv(str(p))
+                if isinstance(cand, pd.DataFrame) and not cand.empty:
+                    if "site_label" in cand.columns and label not in {"", "NA", "nan", "None"}:
+                        hit = cand[cand["site_label"].astype(str) == label]
+                        if not hit.empty:
+                            selected = dict(hit.iloc[0])
+                    if not selected:
+                        # fallback: reproduce the D2 selection rule directly
+                        work = cand.copy()
+                        valid_col = "D2_descriptor_valid" if "D2_descriptor_valid" in work.columns else "descriptor_valid"
+                        if valid_col in work.columns:
+                            valid = work[work[valid_col].astype(str).str.lower().isin(["true", "1", "yes"])]
+                            if not valid.empty:
+                                work = valid
+                        e_col = "ΔG_H (eV)" if "ΔG_H (eV)" in work.columns else ("ΔG (eV)" if "ΔG (eV)" in work.columns else None)
+                        if e_col is not None:
+                            vals = pd.to_numeric(work[e_col], errors="coerce")
+                            work = work.loc[vals[np.isfinite(vals)].index].copy()
+                            if not work.empty:
+                                work["_abs_e"] = pd.to_numeric(work[e_col], errors="coerce").abs()
+                                selected = dict(work.loc[work["_abs_e"].idxmin()].drop(labels=["_abs_e"], errors="ignore"))
+        except Exception:
+            selected = {}
+
+    def _get(key: str, fallback=np.nan):
+        if key in selected:
+            return selected.get(key)
+        return summary.get(key, fallback)
+
+    dG = _safe_float(_get("ΔG_H (eV)", summary.get("D2_Hreact (eV)", np.nan)))
+    dE = _safe_float(_get("ΔE_H_user (eV)", np.nan))
+    if not np.isfinite(dE) and np.isfinite(dG):
+        dE = float(dG) - float(net_corr)
+
+    site_kind = str(_get("site_kind", summary.get("D2_binding_class", "metal_centered_Hstar")) or "metal_centered_Hstar")
+    final_kind = str(_get("final_site_kind", summary.get("D2_final_site_kind", site_kind)) or site_kind)
+    binding_class = str(_get("D2_binding_class", _get("binding_class", summary.get("D2_binding_class", final_kind))) or final_kind)
+    disp = _safe_float(_get("H_lateral_disp(Å)", summary.get("D2_seed_disp(Å)", np.nan)))
+    cif = str(_get("structure_cif", summary.get("D2_structure_cif", "")) or "")
+    qc_flags = str(_get("qc_flags", summary.get("D2_qc_flags", "")) or "")
+
+    if label in {"", "NA", "nan", "None"}:
+        label = str(_get("site_label", "D2_selected") or "D2_selected")
+
+    row = {
+        "mode": "HER",
+        "result_role": "oxide_D2_primary",
+        "descriptor": "D2",
+        "D2_policy": "surface_metal_cation_centered_Hstar",
+        "oxide_descriptor_relaxation_policy": str(summary.get("descriptor_relaxation_policy", "D2_react_only")),
+        "D1_relaxation_policy": str(summary.get("D1_fixed_relaxation_policy", "anchor_oh_hookean_preOH")),
+        "D2_relaxation_policy": str(summary.get("D2_fixed_relaxation_policy", "D2_react_only")),
+        "D2_underlying_relaxation_scope": str(summary.get("D2_underlying_relaxation_scope", "partial")),
+        "D2_relaxation_scope": str(summary.get("D2_relaxation_scope", summary.get("D2_fixed_relaxation_scope", "partial"))),
+        "site": site_kind,
+        "site_label": label,
+        "requested_site": site_kind,
+        "initial_geom_site": site_kind,
+        "relaxed_site": final_kind,
+        "final_site_kind": final_kind,
+        "binding_class": binding_class,
+        "D2_binding_class": binding_class,
+        "D2_descriptor_valid": True if np.isfinite(dG) else False,
+        "D2_selection_rule": str(summary.get("D2_selection_rule", "min_abs_deltaG_among_valid_metal_centered_Hstar")),
+        "placement_mismatch": False,
+        "migrated_actual": bool(np.isfinite(disp) and disp > MIGRATE_THR),
+        "migrated": bool(np.isfinite(disp) and disp > MIGRATE_THR),
+        "migration_destination": final_kind,
+        "migration_path": f"{site_kind} -> {final_kind}",
+        "actual_migration_path": f"{site_kind} -> {final_kind}",
+        "site_transition_type": "stable" if (np.isfinite(disp) and disp <= MIGRATE_THR) else "relaxed_D2_state",
+        "structure_cif": cif,
+        "thermo_mode": "CHE correction (fast screening)",
+        "ΔG_H_CHE (eV)": dG,
+        "ΔG_H (eV)": dG,
+        "ΔE_H_user (eV)": dE,
+        "ΔE_H (eV)": dE,
+        "abs_ΔG_H (eV)": abs(dG) if np.isfinite(dG) else np.nan,
+        "H_lateral_disp(Å)": disp,
+        "is_duplicate": False,
+        "qc_flags": qc_flags,
+        "nearest_metal_symbol": str(summary.get("D2_nearest_metal_symbol", _get("nearest_metal_symbol", "NA"))),
+        "nearest_metal_distance(Å)": _safe_float(summary.get("D2_nearest_metal_distance(Å)", _get("nearest_metal_distance(Å)", np.nan))),
+        "nearest_anion_symbol": str(summary.get("D2_nearest_anion_symbol", _get("nearest_anion_symbol", "NA"))),
+        "nearest_anion_distance(Å)": _safe_float(summary.get("D2_nearest_anion_distance(Å)", _get("nearest_anion_distance(Å)", np.nan))),
+    }
+    return pd.DataFrame([row])
 
 
 def _mic_xy_delta(cell, pbc, xy0: np.ndarray, xy1: np.ndarray) -> tuple[np.ndarray, float]:

@@ -34,6 +34,13 @@ MIGRATE_THR = 0.30       # Lateral displacement flag threshold (Angstrom)
 VAC_WARN_MIN = 20.0      # Vacuum warning threshold (Angstrom)
 UNUSUAL_DDELTA = 1.00    # |dE_user - dE_anchor(site)| warning threshold (eV)
 
+# Descriptor-level relaxation engine for oxide D2.
+# It has the same constraint behavior as 'partial', but is kept as a
+# distinct scope so result tables and metadata can distinguish D2_react
+# from generic partial HER calculations.
+D2_REACT_ONLY_SCOPE = "D2_react_only"
+
+
 
 # ---------------- Shared utilities ----------------
 def ensure_pbc3(a, vac_z=None):
@@ -171,8 +178,16 @@ def default_min_clearance_for_scope(relaxation_scope: str | None, *, mtype: str 
 
 
 def normalize_relaxation_scope(scope: str | None, *, default: str = "partial") -> str:
-    """Normalize relaxation scope labels."""
-    s = str(scope or default).strip().lower()
+    """Normalize relaxation scope labels.
+
+    Supported physical scopes are ``rigid``, ``partial``, and ``full``.
+    ``D2_react_only`` is also accepted as a D2-specific relaxation engine
+    scope. It uses the same constraints as ``partial`` but remains a distinct
+    metadata value so oxide D2 calculations are not confused with generic
+    partial HER calculations.
+    """
+    s_raw = str(scope or default).strip()
+    s = s_raw.lower()
     aliases = {
         "freeze": "rigid",
         "fixed": "rigid",
@@ -184,20 +199,33 @@ def normalize_relaxation_scope(scope: str | None, *, default: str = "partial") -
         "bottom_fixed": "partial",
         "all": "full",
         "free": "full",
+        "d2_react_only": D2_REACT_ONLY_SCOPE,
+        "d2-react-only": D2_REACT_ONLY_SCOPE,
+        "d2 react only": D2_REACT_ONLY_SCOPE,
+        "d2_react": D2_REACT_ONLY_SCOPE,
     }
     s = aliases.get(s, s)
-    if s not in {"rigid", "partial", "full"}:
+    if s not in {"rigid", "partial", "full", D2_REACT_ONLY_SCOPE}:
         raise ValueError(f"Unknown relaxation_scope='{scope}'")
     return s
 
 
+def relaxation_constraint_equivalent_scope(scope: str | None, *, default: str = "partial") -> str:
+    """Return the physical constraint scope used by a named relaxation engine."""
+    norm = normalize_relaxation_scope(scope, default=default)
+    if norm == D2_REACT_ONLY_SCOPE:
+        return "partial"
+    return norm
+
+
 def build_relax_constraints(at, relaxation_scope: str = "partial", n_fix_layers: int = 2):
-    """Build slab constraints for rigid / partial / full relaxation scopes."""
+    """Build slab constraints for rigid / partial / full / D2_react_only scopes."""
     scope = normalize_relaxation_scope(relaxation_scope)
-    if scope == "rigid":
+    constraint_scope = relaxation_constraint_equivalent_scope(scope)
+    if constraint_scope == "rigid":
         mask = make_non_h_fix_mask(at)
         return [FixAtoms(mask=mask)] if mask.any() else []
-    if scope == "partial":
+    if constraint_scope == "partial":
         mask = make_bottom_fix_mask(at, n_fix_layers=int(n_fix_layers))
         return [FixAtoms(mask=mask)] if mask.any() else []
     return []
@@ -311,12 +339,15 @@ def _constraint_atom_dof_status(at):
     return fully_fixed
 
 
-def _relaxation_meta(at, *, relaxation_scope: str, n_fix_layers: int, elapsed_s: float, n_steps: int, converged, error=None):
+def _relaxation_meta(at, *, relaxation_scope: str, n_fix_layers: int, elapsed_s: float, n_steps: int, converged, error=None, constraint_equivalent_scope: str | None = None):
     fully_fixed = _constraint_atom_dof_status(at)
     fixed_atom_count = int(np.count_nonzero(fully_fixed))
     relaxed_atom_count = int(len(at) - fixed_atom_count)
+    scope = normalize_relaxation_scope(relaxation_scope)
+    constraint_scope = str(constraint_equivalent_scope or relaxation_constraint_equivalent_scope(scope))
     return {
-        "relaxation_scope": str(relaxation_scope),
+        "relaxation_scope": str(scope),
+        "constraint_equivalent_scope": constraint_scope,
         "n_fix_layers": int(n_fix_layers),
         "fixed_atom_count": fixed_atom_count,
         "relaxed_atom_count": relaxed_atom_count,
@@ -503,16 +534,18 @@ def relax_freeH(atoms, steps=None, fmax=0.03, relaxation_scope: str = "partial",
 
     Parameters
     ----------
-    relaxation_scope : {'rigid', 'partial', 'full'}
-        rigid   -> fix all non-H slab atoms; relax H only
-        partial -> fix bottom n_fix_layers layers; relax upper slab + H
-        full    -> relax all atoms freely
+    relaxation_scope : {'rigid', 'partial', 'full', 'D2_react_only'}
+        rigid         -> fix all non-H slab atoms; relax H only
+        partial       -> fix bottom n_fix_layers layers; relax upper slab + H
+        full          -> relax all atoms freely
+        D2_react_only -> D2-specific scope with partial-equivalent constraints
     n_fix_layers : int
         Number of bottom layers fixed when relaxation_scope='partial'.
     """
     a = ensure_pbc3(atoms)
     a.calc = calc
     scope = normalize_relaxation_scope(relaxation_scope)
+    constraint_scope = relaxation_constraint_equivalent_scope(scope)
     cons = build_relax_constraints(a, relaxation_scope=scope, n_fix_layers=int(n_fix_layers))
     a.set_constraint(cons)
     nsteps = 0 if steps is None else int(steps)
@@ -526,6 +559,7 @@ def relax_freeH(atoms, steps=None, fmax=0.03, relaxation_scope: str = "partial",
         n_steps=n_done,
         converged=conv,
         error=err,
+        constraint_equivalent_scope=constraint_scope,
     )
     if return_meta:
         return a, E, meta
@@ -772,7 +806,7 @@ __all__ = [
     "calc",
     "ensure_pbc3", "layer_indices", "first_layer_min_distance",
     "put_H", "make_bottom_fix_mask", "make_non_h_fix_mask",
-    "normalize_relaxation_scope", "build_relax_constraints",
+    "D2_REACT_ONLY_SCOPE", "normalize_relaxation_scope", "relaxation_constraint_equivalent_scope", "build_relax_constraints",
     "relax_zonly", "relax_freeH",
     "site_energy_two_stage", "relax_anchor_oh", "site_energy_oh_anchoronly", "site_energy_oh_constrained", "factor_near_square",
 ]
