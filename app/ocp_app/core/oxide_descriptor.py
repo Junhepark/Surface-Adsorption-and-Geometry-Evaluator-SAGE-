@@ -31,15 +31,24 @@ from ocp_app.core.anchors.common import (
 
 THREE_STAGE_OXIDE_HER_CAUTION = (
     "Caution: In the current oxide workflow, D1 is treated as a contextual O-top protonation probe, "
-    "whereas D2 is the primary reactive-H screening output. D2 follows the main oxide HER (including rigid-initialization handling and seed-height selection) "
-    "relaxation setting selected upstream, so changes in relaxation freedom can shift the final "
+    "whereas D2 is an independently generated surface-metal-cation-centered H* stabilization descriptor. "
+    "D2 follows metal-cation anchor seeding and the relaxation setting selected upstream, so changes in relaxation freedom can shift the final "
     "screening value. Both values should be interpreted as screening indicators rather than "
     "quantitatively validated absolute thermodynamic metrics."
 )
 
 DESCRIPTOR_D1_DISP_THRESH_A = 1.60
-DESCRIPTOR_D2_DISP_THRESH_A = 1.20
+# D2 is intentionally less site-constrained than D1.  The final state is
+# judged by metal-cation-centered H* binding, not by preserving the initial xy seed.
+DESCRIPTOR_D2_DISP_THRESH_A = 3.00
 DESCRIPTOR_ABS_DE_THRESH_EV = 3.0
+
+# Oxide D2: surface-metal-cation-centered H* stabilization policy.
+D2_METAL_H0S = (0.85, 1.05, 1.25, 1.50)
+D2_METAL_BIND_MAX_A = 2.45
+D2_OH_BIND_MAX_A = 1.40
+D2_DESORB_NEAREST_MIN_A = 3.20
+D2_SURFACE_BASIN_WARN_A = 3.00
 
 D1_CLEAN_HOOK_K = 18.0
 D1_PREOH_HOOK_K = 12.0
@@ -51,6 +60,15 @@ D1_ANCHOR_METAL_DIST_ABS_MAX_A = 2.80
 D1_ANCHOR_METAL_DIST_RATIO_MAX = 1.35
 D1_ANCHOR_METAL_DIST_BUFFER_A = 0.35
 D1_RETAINED_NEIGHBORS_MIN = 1
+
+# Descriptor-level relaxation policies. D2_react_only is intentionally a
+# first-class oxide-descriptor policy, alongside the user-facing rigid/partial/full
+# concepts at the CHE workflow level. It is not passed directly to relax_freeH();
+# D2_Hreact uses the underlying partial relaxation engine.
+D2_REACT_ONLY_SCOPE = 'D2_react_only'
+D1_FIXED_RELAXATION_POLICY = 'anchor_oh_hookean_preOH'
+D2_UNDERLYING_RELAXATION_SCOPE = D2_REACT_ONLY_SCOPE
+D2_CONSTRAINT_EQUIVALENT_SCOPE = 'partial'
 
 
 def _safe_float(x, default=np.nan) -> float:
@@ -250,7 +268,7 @@ def _rows_same_basin(d1_row: dict[str, object] | None, d2_row: dict[str, object]
     return bool(np.isfinite(dxy) and dxy <= float(xy_tol) and same_binding and (same_index or same_symbol))
 
 
-def _quality_rank(df: pd.DataFrame) -> pd.DataFrame:
+def _quality_rank(df: pd.DataFrame, *, prefer_abs_energy: bool = False) -> pd.DataFrame:
     work = df.copy()
     stable_s = _series_or_default(work, "site_transition_type", "unknown")
     work["_stable"] = stable_s.astype(str).str.strip().str.lower().eq("stable").astype(int)
@@ -267,17 +285,27 @@ def _quality_rank(df: pd.DataFrame) -> pd.DataFrame:
     de_s = _series_or_default(work, "ΔE_H_user (eV)", np.nan)
     work["_abs_dE"] = np.abs(pd.to_numeric(de_s, errors="coerce"))
 
-    e_col = "ΔG_H (eV)" if "ΔG_H (eV)" in work.columns else ("ΔE_H_user (eV)" if "ΔE_H_user (eV)" in work.columns else None)
+    e_col = "ΔG_H (eV)" if "ΔG_H (eV)" in work.columns else (
+        "ΔG (eV)" if "ΔG (eV)" in work.columns else (
+            "ΔE_H_user (eV)" if "ΔE_H_user (eV)" in work.columns else None
+        )
+    )
     if e_col is None:
         work["_energy"] = np.nan
     else:
         work["_energy"] = pd.to_numeric(work[e_col], errors="coerce")
 
+    # D1 keeps the legacy raw-energy ordering.  D2 calls this function with
+    # prefer_abs_energy=True so that the HER-facing representative is the
+    # valid metal-centered H* state closest to thermoneutrality.
+    work["_energy_rank"] = np.abs(work["_energy"]) if bool(prefer_abs_energy) else work["_energy"]
+
     return work.sort_values(
-        ["_stable", "_mismatch", "_disp", "_abs_dE", "_energy"],
+        ["_stable", "_mismatch", "_energy_rank", "_disp", "_abs_dE"],
         ascending=[False, True, True, True, True],
         na_position="last",
     )
+
 
 
 def _pick_descriptor_seed_row(
@@ -285,6 +313,8 @@ def _pick_descriptor_seed_row(
     *,
     energy_col: str,
     disp_thresh: float,
+    prefer_abs_energy: bool = False,
+    require_metal_centered: bool = False,
 ) -> tuple[dict[str, object] | None, str, str]:
     if df is None or df.empty or energy_col not in df.columns:
         return None, "missing", "no candidates"
@@ -305,56 +335,295 @@ def _pick_descriptor_seed_row(
     flags_s = _series_or_default(work, "qc_flags", "")
     work["_flags"] = flags_s.astype(str)
 
+    # D1 retains its legacy displacement-constrained selection.  D2 uses a
+    # larger basin threshold and then ranks by |ΔG|.  This keeps D2 as a
+    # state-seeking metal-H* descriptor rather than an O-site/protonation probe.
     base = work[
         work["_energy"].notna()
         & work["_disp"].notna()
         & (work["_disp"] <= float(disp_thresh))
         & (work["_valid"])
-        & (~work["_flags"].str.contains(r"detached_oh|surface_atom_extraction|water_like_fragment", case=False, na=False))
+        & (~work["_flags"].str.contains(
+            r"detached_oh|surface_atom_extraction|water_like_fragment|o_h_migrated|oxygen_bound|desorbed|subsurface|slab_collapsed",
+            case=False,
+            na=False,
+        ))
         & (
             work["_abs_dE"].isna()
             | (work["_abs_dE"] <= float(DESCRIPTOR_ABS_DE_THRESH_EV))
         )
-    ]
-    ranked = _quality_rank(base)
+    ].copy()
+
+    if require_metal_centered and not base.empty:
+        if "D2_descriptor_valid" in base.columns:
+            d2_valid = base["D2_descriptor_valid"]
+            if getattr(d2_valid, "dtype", None) == bool:
+                base = base[d2_valid.fillna(False)]
+            else:
+                base = base[d2_valid.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])]
+        class_col = "D2_binding_class" if "D2_binding_class" in base.columns else "binding_class"
+        if class_col in base.columns:
+            base = base[base[class_col].astype(str).str.contains(r"metal_", case=False, na=False)]
+
+    ranked = _quality_rank(base, prefer_abs_energy=prefer_abs_energy)
     if not ranked.empty:
         return ranked.iloc[0].to_dict(), "reliable", ""
 
     finite_valid = work[work["_energy"].notna() & work["_valid"]].copy()
-    ranked = _quality_rank(finite_valid)
+    if require_metal_centered and not finite_valid.empty:
+        finite_valid = finite_valid[~finite_valid["_flags"].str.contains(
+            r"o_h_migrated|oxygen_bound|desorbed|subsurface|slab_collapsed",
+            case=False,
+            na=False,
+        )]
+        if "D2_descriptor_valid" in finite_valid.columns:
+            d2_valid = finite_valid["D2_descriptor_valid"]
+            if getattr(d2_valid, "dtype", None) == bool:
+                finite_valid = finite_valid[d2_valid.fillna(False)]
+            else:
+                finite_valid = finite_valid[d2_valid.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])]
+    ranked = _quality_rank(finite_valid, prefer_abs_energy=prefer_abs_energy)
     if not ranked.empty:
         disp_val = _safe_float(ranked.iloc[0].get("H_lateral_disp(Å)"))
         warning = f"Using low-confidence fallback seed (disp={disp_val:.3f} Å)."
         return ranked.iloc[0].to_dict(), "fallback_unreliable", warning
 
     if work[work["_energy"].notna()].shape[0] > 0:
-        return None, "missing", "No descriptor-valid candidates remained after D1 QC."
+        msg = "No descriptor-valid metal-centered D2 candidates remained after QC." if require_metal_centered else "No descriptor-valid candidates remained after D1 QC."
+        return None, "missing", msg
 
     return None, "missing", "descriptor seed selection failed"
 
 
+
 def _build_reactive_h_targets_oxide(slab_u_rel, max_per_kind: int = 2) -> list[dict[str, object]]:
+    """Build oxide-D2 targets on exposed surface metal cations.
+
+    D2 is deliberately separated from D1.  D1 uses O-top/OH anchoring, while
+    D2 samples metal-cation-centered H* basins.  The AdsSite objects are still
+    generated from the existing oxide top-cation layer detector, but the seed
+    labels and anchor coordinates are converted to D2-specific metadata here.
+    """
     try:
         auto_sites = detect_oxide_surface_sites(slab_u_rel, max_sites_per_kind=200, z_tol=1.2)
         rep_sites = select_representative_sites(auto_sites, per_kind=max(1, int(max_per_kind)))
     except Exception:
         rep_sites = []
+
+    pos_all = np.asarray(slab_u_rel.get_positions(), dtype=float)
+    syms = np.asarray(slab_u_rel.get_chemical_symbols(), dtype=object)
+
+    def _anchor_xyz_for_site(site) -> np.ndarray:
+        surf_idx = tuple(int(j) for j in (getattr(site, 'surface_indices', ()) or ()))
+        metal_idx = [int(j) for j in surf_idx if 0 <= int(j) < len(syms) and str(syms[int(j)]) not in ANION_SYMBOLS]
+        if metal_idx:
+            return np.mean(pos_all[np.asarray(metal_idx, dtype=int), :3], axis=0)
+        p = np.asarray(getattr(site, 'position', [np.nan, np.nan, np.nan]), dtype=float).reshape(-1)
+        if p.size >= 3 and np.isfinite(p[:3]).all():
+            # site.position includes the display/seed height.  For D2 anchoring, use
+            # the nearest top cation z instead when possible.
+            xy = p[:2]
+            metals = _metal_indices(slab_u_rel)
+            if len(metals) > 0:
+                d2 = np.sum((pos_all[metals, :2] - xy[None, :]) ** 2, axis=1)
+                im = int(metals[int(np.argmin(d2))])
+                return np.asarray([xy[0], xy[1], pos_all[im, 2]], dtype=float)
+            return p[:3]
+        return np.asarray([np.nan, np.nan, np.nan], dtype=float)
+
     targets: list[dict[str, object]] = []
+    seen = set()
     for i, site in enumerate(rep_sites):
+        raw_kind = str(getattr(site, 'kind', 'unknown')).strip().lower()
+        if raw_kind in {'fcc', 'hcp'}:
+            d2_kind = 'metal_hollow'
+        elif raw_kind == 'hollow':
+            d2_kind = 'metal_hollow'
+        elif raw_kind == 'bridge':
+            d2_kind = 'metal_bridge'
+        elif raw_kind in {'ontop', 'top'}:
+            d2_kind = 'metal_top'
+        else:
+            d2_kind = f'metal_{raw_kind}' if raw_kind else 'metal_site'
+
         pos = np.asarray(getattr(site, 'position', []), dtype=float)
         if pos.shape[0] < 2:
             continue
         xy = np.asarray(pos[:2], dtype=float)
-        xyz = np.asarray(pos[:3], dtype=float) if pos.shape[0] >= 3 else np.asarray([xy[0], xy[1], np.nan], dtype=float)
+        if not np.isfinite(xy).all():
+            continue
+        anchor_xyz = _anchor_xyz_for_site(site)
+        if not np.isfinite(anchor_xyz[:2]).all():
+            continue
+        surf_idx = tuple(int(j) for j in (getattr(site, 'surface_indices', ()) or ()))
+        key = (d2_kind, tuple(round(float(v), 3) for v in xy.tolist()), surf_idx)
+        if key in seen:
+            continue
+        seen.add(key)
+        metal_symbols = [str(syms[int(j)]) for j in surf_idx if 0 <= int(j) < len(syms) and str(syms[int(j)]) not in ANION_SYMBOLS]
         targets.append({
-            'site_label': f"reactive_{getattr(site, 'kind', 'site')}_{i}",
-            'site_kind': str(getattr(site, 'kind', 'unknown')),
+            'site_label': f"D2_{d2_kind}_{i}",
+            'site_kind': d2_kind,
+            'raw_site_kind': raw_kind,
             'xy': xy,
-            'initial_xyz': xyz,
-            'surface_indices': tuple(int(j) for j in (getattr(site, 'surface_indices', ()) or ())),
-            'seed_source': 'oxide_reactive_geom',
+            'initial_xyz': np.asarray([anchor_xyz[0], anchor_xyz[1], anchor_xyz[2]], dtype=float),
+            'surface_indices': surf_idx,
+            'surface_metal_symbols': ','.join(metal_symbols),
+            'seed_source': 'oxide_D2_surface_metal_cation',
+            'D2_policy': 'surface_metal_cation_centered_Hstar',
         })
     return targets
+
+
+def _add_d2_h_seed_at_anchor(slab_u_rel, xy: np.ndarray, anchor_xyz: np.ndarray, height: float, min_clearance: float = 0.75):
+    A = ensure_pbc3(slab_u_rel)
+    anchor = np.asarray(anchor_xyz, dtype=float).reshape(-1)
+    xy = np.asarray(xy, dtype=float).reshape(2)
+    if anchor.size >= 3 and np.isfinite(anchor[2]):
+        base_z = float(anchor[2])
+    else:
+        base_z = float(np.max(A.get_positions()[:, 2]))
+    H = Atoms('H', positions=[[float(xy[0]), float(xy[1]), base_z + float(height)]], cell=A.get_cell(), pbc=A.get_pbc())
+    A += H
+    # Prevent pathological overlap without forcing the H into an O-top basin.
+    try:
+        h_idx = len(A) - 1
+        hpos = np.asarray(A.get_positions()[h_idx], dtype=float)
+        best = float('inf')
+        for i, atom in enumerate(A[:-1]):
+            _vec, dist = find_mic(np.asarray(A.get_positions()[i], dtype=float) - hpos, A.get_cell(), A.get_pbc())
+            if float(dist) < best:
+                best = float(dist)
+        if np.isfinite(best) and best < float(min_clearance):
+            p = A.positions[h_idx].copy()
+            p[2] += (float(min_clearance) - best) + 0.05
+            A.positions[h_idx] = p
+    except Exception:
+        pass
+    return ensure_pbc3(A)
+
+
+def _site_energy_two_stage_d2_metal_anchor(
+    slab_u_rel,
+    xy: np.ndarray,
+    anchor_xyz: np.ndarray,
+    z_steps: int,
+    free_steps: int,
+    relaxation_scope: str = 'partial',
+    n_fix_layers: int = 2,
+):
+    """D2-only H* relaxation from a metal-cation anchor height.
+
+    This avoids changing the shared site_energy_two_stage() routine used by the
+    metal workflow and by the main oxide HER/D1-adjacent paths.
+    """
+    scope = normalize_relaxation_scope(relaxation_scope)
+    best = {'E': None, 'atoms': None, 'disp_xy': None, 'meta': None}
+    xy = np.asarray(xy, dtype=float).reshape(2)
+    anchor_xyz = np.asarray(anchor_xyz, dtype=float).reshape(-1)
+    for h0 in D2_METAL_H0S:
+        A0 = _add_d2_h_seed_at_anchor(slab_u_rel, xy, anchor_xyz, float(h0), min_clearance=0.75)
+        Az, _, z_meta = relax_zonly(A0, steps=int(z_steps), fmax=0.05, return_meta=True)
+        Af, Ef, free_meta = relax_freeH(
+            Az,
+            steps=int(free_steps),
+            fmax=0.03,
+            relaxation_scope=scope,
+            n_fix_layers=int(n_fix_layers),
+            return_meta=True,
+        )
+        hpos = np.asarray(Af.get_positions()[-1], dtype=float)
+        _, disp_xy = _mic_xy_delta(slab_u_rel.get_cell(), slab_u_rel.get_pbc(), xy, hpos[:2])
+        trial_meta = {
+            'selected_h0': float(h0),
+            'h0_candidates': ';'.join(f'{float(v):.2f}' for v in D2_METAL_H0S),
+            'placement_mode': 'D2_metal_anchor_z',
+            'z_relax_n_steps': int((z_meta or {}).get('n_steps', 0)),
+            'z_relax_converged': (z_meta or {}).get('converged', None),
+            'z_relax_elapsed_s': float((z_meta or {}).get('elapsed_s', 0.0)),
+            'z_relax_relaxed_atoms': int((z_meta or {}).get('relaxed_atom_count', 0)),
+            'z_relax_fixed_atoms': int((z_meta or {}).get('fixed_atom_count', 0)),
+            'fine_relax_scope': str((free_meta or {}).get('relaxation_scope', scope)),
+            'fine_constraint_equivalent_scope': str((free_meta or {}).get('constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE)),
+            'constraint_equivalent_scope': str((free_meta or {}).get('constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE)),
+            'fine_n_fix_layers': int((free_meta or {}).get('n_fix_layers', int(n_fix_layers))),
+            'fine_relax_n_steps': int((free_meta or {}).get('n_steps', 0)),
+            'fine_relax_converged': (free_meta or {}).get('converged', None),
+            'fine_relax_elapsed_s': float((free_meta or {}).get('elapsed_s', 0.0)),
+            'fine_relax_relaxed_atoms': int((free_meta or {}).get('relaxed_atom_count', 0)),
+            'fine_relax_fixed_atoms': int((free_meta or {}).get('fixed_atom_count', 0)),
+            'total_relax_n_steps': int((z_meta or {}).get('n_steps', 0)) + int((free_meta or {}).get('n_steps', 0)),
+        }
+        if best['E'] is None or float(Ef) < float(best['E']):
+            best.update({'E': float(Ef), 'atoms': Af, 'disp_xy': float(disp_xy), 'meta': trial_meta})
+    return best['atoms'], float(best['E']), float(best['disp_xy']), (best['meta'] or {})
+
+
+def _classify_d2_metal_centered_state(relaxed_atoms, h_index: int = -1) -> dict[str, object]:
+    if h_index < 0:
+        h_index = len(relaxed_atoms) + int(h_index)
+    pos = np.asarray(relaxed_atoms.get_positions(), dtype=float)
+    syms = np.asarray(relaxed_atoms.get_chemical_symbols(), dtype=object)
+    hpos = np.asarray(pos[int(h_index)], dtype=float)
+
+    metal_rows = []
+    anion_rows = []
+    for i, sym in enumerate(syms):
+        if i == int(h_index) or str(sym).upper() == 'H':
+            continue
+        _vec, dist = find_mic(np.asarray(pos[int(i)], dtype=float) - hpos, relaxed_atoms.get_cell(), relaxed_atoms.get_pbc())
+        rec = {'index': int(i), 'symbol': str(sym), 'distance': float(dist)}
+        if str(sym) in ANION_SYMBOLS:
+            anion_rows.append(rec)
+        else:
+            metal_rows.append(rec)
+    metal_rows.sort(key=lambda r: (r['distance'], r['index']))
+    anion_rows.sort(key=lambda r: (r['distance'], r['index']))
+    nearest_m = metal_rows[0] if metal_rows else {'index': -1, 'symbol': 'unknown', 'distance': float('nan')}
+    nearest_a = anion_rows[0] if anion_rows else {'index': -1, 'symbol': 'unknown', 'distance': float('nan')}
+    dm = float(nearest_m.get('distance', float('nan')))
+    da = float(nearest_a.get('distance', float('nan')))
+
+    qc_flags = []
+    descriptor_valid = False
+    if np.isfinite(da) and da <= float(D2_OH_BIND_MAX_A) and (not np.isfinite(dm) or da <= dm + 0.20):
+        binding_class = 'o_bound'
+        final_site_kind = 'O-H_migrated'
+        qc_flags.append('o_h_migrated')
+    elif np.isfinite(dm) and dm <= float(D2_METAL_BIND_MAX_A):
+        close_metals = [r for r in metal_rows if np.isfinite(float(r.get('distance', np.nan))) and float(r.get('distance')) <= max(float(D2_METAL_BIND_MAX_A), dm + 0.35)]
+        n_close = len(close_metals)
+        if n_close >= 3:
+            final_site_kind = 'metal_hollow'
+        elif n_close == 2:
+            final_site_kind = 'metal_bridge'
+        else:
+            final_site_kind = 'metal_top'
+        binding_class = final_site_kind
+        descriptor_valid = True
+    elif np.isfinite(min(dm if np.isfinite(dm) else np.inf, da if np.isfinite(da) else np.inf)) and min(dm if np.isfinite(dm) else np.inf, da if np.isfinite(da) else np.inf) >= float(D2_DESORB_NEAREST_MIN_A):
+        binding_class = 'desorbed'
+        final_site_kind = 'desorbed'
+        qc_flags.append('desorbed')
+    else:
+        binding_class = 'unresolved'
+        final_site_kind = 'unresolved'
+        qc_flags.append('unresolved_final_state')
+
+    return {
+        'binding_class': binding_class,
+        'final_site_kind': final_site_kind,
+        'descriptor_valid': bool(descriptor_valid),
+        'qc_flags': ';'.join(qc_flags),
+        'nearest_metal_index': int(nearest_m.get('index', -1)),
+        'nearest_metal_symbol': str(nearest_m.get('symbol', 'unknown')),
+        'nearest_metal_distance(Å)': float(dm),
+        'nearest_anion_index': int(nearest_a.get('index', -1)),
+        'nearest_anion_symbol': str(nearest_a.get('symbol', 'unknown')),
+        'nearest_anion_distance(Å)': float(da),
+        'metal_neighbor_count': int(len([r for r in metal_rows if np.isfinite(float(r.get('distance', np.nan))) and float(r.get('distance')) <= float(D2_METAL_BIND_MAX_A)])),
+    }
+
 
 
 def _evaluate_constrained_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, site_seed: dict[str, object],
@@ -623,19 +892,26 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
                                   out_cif: Path | None = None,
                                   relaxation_scope: str = "partial",
                                   n_fix_layers: int = 2) -> dict[str, object]:
+    """Evaluate the oxide-D2 metal-cation-centered H* descriptor.
+
+    This function is D2-specific.  D1 does not call it.  Metal surfaces do not
+    call it.  H is seeded relative to the exposed metal-cation anchor and then
+    allowed to relax under the D2 relaxation scope.  The row is valid only if
+    the final H state remains metal-centered.
+    """
     label = str(site_seed.get('site_label', 'unknown'))
     kind = str(site_seed.get('site_kind', 'unknown'))
-    xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float)
+    xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float).reshape(2)
+    anchor_xyz = np.asarray(site_seed.get('initial_xyz', [np.nan, np.nan, np.nan]), dtype=float).reshape(-1)
 
-    Au, E_uH, _disp_raw, relax_meta = site_energy_two_stage(
+    Au, E_uH, _disp_raw, relax_meta = _site_energy_two_stage_d2_metal_anchor(
         slab_u_rel,
         xy,
-        H0S,
-        int(z_steps),
-        int(free_steps),
-        relaxation_scope=normalize_relaxation_scope(relaxation_scope),
+        anchor_xyz,
+        z_steps=int(z_steps),
+        free_steps=int(free_steps),
+        relaxation_scope=relaxation_scope,
         n_fix_layers=int(n_fix_layers),
-        return_meta=True,
     )
     dE_u = float(E_uH) - float(E_slab_u) - 0.5 * float(E_H2)
     dG_u = float(dE_u + (0.24 if use_net_corr else 0.0))
@@ -643,33 +919,72 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
     h_pos_final = np.asarray(Au.get_positions()[-1], dtype=float)
     _, disp_mic = _mic_xy_delta(slab_u_rel.get_cell(), slab_u_rel.get_pbc(), xy, h_pos_final[:2])
 
-    binding_class, near = _classify_h_binding_state(Au, h_index=len(Au)-1)
+    d2_state = _classify_d2_metal_centered_state(Au, h_index=len(Au)-1)
+    qc_flags = [x for x in str(d2_state.get('qc_flags', '')).split(';') if x]
+    if np.isfinite(disp_mic) and disp_mic > float(D2_SURFACE_BASIN_WARN_A):
+        qc_flags.append('large_surface_basin_migration')
+
     if out_cif is not None:
         out_cif.parent.mkdir(parents=True, exist_ok=True)
         write(out_cif, Au)
 
+    descriptor_valid = bool(d2_state.get('descriptor_valid', False))
+    binding_class = str(d2_state.get('binding_class', 'unresolved'))
+    final_site_kind = str(d2_state.get('final_site_kind', binding_class))
+
     row = {
+        'stage': 'D2_metal_cation_Hstar',
+        'D2_policy': str(site_seed.get('D2_policy', 'surface_metal_cation_centered_Hstar')),
+        'descriptor_relaxation_policy': D2_REACT_ONLY_SCOPE,
+        'D2_relaxation_policy': D2_REACT_ONLY_SCOPE,
+        'D2_underlying_relaxation_scope': str(normalize_relaxation_scope(relaxation_scope)),
+        'D2_constraint_equivalent_scope': str((relax_meta or {}).get('constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE)),
         'site_label': label,
         'site_kind': kind,
+        'raw_site_kind': str(site_seed.get('raw_site_kind', kind)),
+        'seed_source': str(site_seed.get('seed_source', 'oxide_D2_surface_metal_cation')),
         'seed_x': float(xy[0]),
         'seed_y': float(xy[1]),
+        'anchor_x(Å)': float(anchor_xyz[0]) if anchor_xyz.size >= 1 and np.isfinite(anchor_xyz[0]) else float('nan'),
+        'anchor_y(Å)': float(anchor_xyz[1]) if anchor_xyz.size >= 2 and np.isfinite(anchor_xyz[1]) else float('nan'),
+        'anchor_z(Å)': float(anchor_xyz[2]) if anchor_xyz.size >= 3 and np.isfinite(anchor_xyz[2]) else float('nan'),
+        'surface_indices': ','.join(str(i) for i in (site_seed.get('surface_indices') or ())),
+        'surface_metal_symbols': str(site_seed.get('surface_metal_symbols', '')),
         'ΔE (eV)': float(dE_u),
         'ΔG (eV)': float(dG_u),
+        'ΔE_H_user (eV)': float(dE_u),
+        'ΔG_H (eV)': float(dG_u),
+        'abs_ΔG_H (eV)': float(abs(dG_u)),
+        'D2_selection_metric': float(abs(dG_u)),
         'H_lateral_disp(Å)': float(disp_mic),
-        'binding_class': str(binding_class),
-        'nearest_symbol': str(near.get('symbol', 'unknown')),
-        'nearest_index': int(near.get('index', -1)),
-        'nearest_distance(Å)': float(near.get('distance', float('nan'))),
+        'binding_class': binding_class,
+        'D2_binding_class': binding_class,
+        'final_site_kind': final_site_kind,
+        'descriptor_valid': descriptor_valid,
+        'D2_descriptor_valid': descriptor_valid,
+        'qc_flags': ';'.join(qc_flags),
+        'nearest_symbol': str(d2_state.get('nearest_metal_symbol', 'unknown') if descriptor_valid else d2_state.get('nearest_anion_symbol', 'unknown')),
+        'nearest_index': int(d2_state.get('nearest_metal_index', -1) if descriptor_valid else d2_state.get('nearest_anion_index', -1)),
+        'nearest_distance(Å)': float(d2_state.get('nearest_metal_distance(Å)', float('nan')) if descriptor_valid else d2_state.get('nearest_anion_distance(Å)', float('nan'))),
+        'nearest_metal_symbol': str(d2_state.get('nearest_metal_symbol', 'unknown')),
+        'nearest_metal_index': int(d2_state.get('nearest_metal_index', -1)),
+        'nearest_metal_distance(Å)': float(d2_state.get('nearest_metal_distance(Å)', float('nan'))),
+        'nearest_anion_symbol': str(d2_state.get('nearest_anion_symbol', 'unknown')),
+        'nearest_anion_index': int(d2_state.get('nearest_anion_index', -1)),
+        'nearest_anion_distance(Å)': float(d2_state.get('nearest_anion_distance(Å)', float('nan'))),
+        'metal_neighbor_count': int(d2_state.get('metal_neighbor_count', 0)),
         'final_h_x(Å)': float(h_pos_final[0]),
         'final_h_y(Å)': float(h_pos_final[1]),
         'final_h_z(Å)': float(h_pos_final[2]),
-        'site_transition_type': 'stable' if np.isfinite(disp_mic) and disp_mic <= MIGRATE_THR else 'displaced_same_site',
+        'site_transition_type': 'stable' if descriptor_valid else final_site_kind,
         'placement_mismatch': False,
         'migrated': bool(np.isfinite(disp_mic) and disp_mic > MIGRATE_THR),
         'structure_cif': str(out_cif.resolve()) if out_cif is not None and out_cif.exists() else '',
         'relaxation_scope': str(normalize_relaxation_scope(relaxation_scope)),
         'n_fix_layers': int(n_fix_layers),
         'selected_h0': _safe_float((relax_meta or {}).get('selected_h0')),
+        'h0_candidates': str((relax_meta or {}).get('h0_candidates', '')),
+        'placement_mode': str((relax_meta or {}).get('placement_mode', 'D2_metal_anchor_z')),
         'z_relax_n_steps': int((relax_meta or {}).get('z_relax_n_steps', 0)),
         'z_relax_converged': (relax_meta or {}).get('z_relax_converged', None),
         'z_relax_relaxed_atoms': int((relax_meta or {}).get('z_relax_relaxed_atoms', 0)),
@@ -679,6 +994,7 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
         'total_relax_n_steps': int((relax_meta or {}).get('total_relax_n_steps', 0)),
     }
     return row
+
 
 
 def _build_two_h_initial(
@@ -861,11 +1177,30 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
     mode = str(descriptor_mode)
     if mode not in {'D2_Hreact only (reactive H state)', 'Full 2-stage profile (recommended)'}:
         mode = 'Full 2-stage profile (recommended)'
-    resolved_scope = normalize_relaxation_scope(relaxation_scope)
+    raw_scope = str(relaxation_scope).strip()
+    if raw_scope == D2_REACT_ONLY_SCOPE:
+        resolved_scope = D2_REACT_ONLY_SCOPE
+    else:
+        resolved_scope = normalize_relaxation_scope(raw_scope)
+
+    # Fixed oxide-descriptor policy:
+    #   D1 is a constrained/rigid O-site OH descriptor.
+    #   D2_Hreact uses the underlying partial relaxation engine.
+    # D2_react_only is stored as the descriptor-level policy so outputs do not
+    # look like a generic partial HER calculation.
+    D2_FIXED_RELAXATION_POLICY = D2_REACT_ONLY_SCOPE
+    D2_FIXED_RELAXATION_SCOPE = D2_UNDERLYING_RELAXATION_SCOPE
     summary: dict[str, object] = {
         'descriptor_mode': mode,
         'caution': THREE_STAGE_OXIDE_HER_CAUTION,
         'relaxation_scope': resolved_scope,
+        'upstream_relaxation_scope': raw_scope,
+        'descriptor_relaxation_policy': D2_REACT_ONLY_SCOPE,
+        'D1_fixed_relaxation_policy': D1_FIXED_RELAXATION_POLICY,
+        'D2_fixed_relaxation_policy': D2_FIXED_RELAXATION_POLICY,
+        'D2_fixed_relaxation_scope': D2_FIXED_RELAXATION_SCOPE,
+        'D2_underlying_relaxation_scope': D2_UNDERLYING_RELAXATION_SCOPE,
+        'D2_constraint_equivalent_scope': D2_CONSTRAINT_EQUIVALENT_SCOPE,
         'n_fix_layers': int(n_fix_layers),
     }
 
@@ -877,9 +1212,12 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
         'D1_background_site_label': 'NA', 'D1_background_structure_cif': '', 'D1_model': 'NA',
         'D2_Hreact (eV)': np.nan, 'D2_site_label': 'NA', 'D2_binding_class': 'NA',
         'D2_structure_cif': '', 'D2_seed_quality': 'missing', 'D2_seed_warning': '', 'D2_seed_disp(Å)': np.nan,
+        'D2_relaxation_policy': '', 'D2_underlying_relaxation_scope': '', 'D2_constraint_equivalent_scope': '',
         'D2_relaxation_scope': '', 'D2_total_relax_n_steps': 0, 'D2_fine_relax_relaxed_atoms': 0,
         'D2_same_basin_as_D1': False, 'D2_basin_note': '',
-        'D2_candidates_csv': '',
+        'D2_candidates_csv': '', 'D2_target_count': 0, 'D2_abs_Hreact (eV)': np.nan, 'D2_selection_rule': '',
+        'D2_final_site_kind': 'NA', 'D2_nearest_metal_symbol': 'NA', 'D2_nearest_metal_distance(Å)': np.nan,
+        'D2_nearest_anion_symbol': 'NA', 'D2_nearest_anion_distance(Å)': np.nan, 'D2_qc_flags': '',
         'D3_pair_proxy (eV)': np.nan, 'D3_pair_label': 'NA',
         'D3_H2_like_motif': False, 'D3_final_HH_distance(Å)': np.nan, 'D3_structure_cif': '',
         'D3_relaxation_scope': '', 'D3_total_relax_n_steps': 0, 'D3_fine_relax_relaxed_atoms': 0,
@@ -904,8 +1242,9 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
     d1_best = None
     d2_best = None
     d2_targets: list[dict[str, object]] = []
-    d1_scope = 'anchor_oh_hookean_preOH'
-    d2_scope = 'partial' if resolved_scope == 'rigid' else resolved_scope
+    d1_scope = D1_FIXED_RELAXATION_POLICY
+    d2_policy = D2_FIXED_RELAXATION_POLICY
+    d2_scope = D2_UNDERLYING_RELAXATION_SCOPE
     d3_scope = d2_scope
 
     if need_d1:
@@ -988,33 +1327,96 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
 
     if need_d2:
         try:
-            # Reuse the main oxide HER screening results as the D2/basic-H descriptor.
-            d2_df = (d1_rows_df.copy() if isinstance(d1_rows_df, pd.DataFrame) else pd.DataFrame())
+            # D2 is now evaluated independently from the main oxide HER rows.
+            # It no longer reuses O-top/anionic HER candidates as the D2 descriptor.
+            d2_targets = _build_reactive_h_targets_oxide(
+                slab_u_rel,
+                max_per_kind=max(1, int(max_reactive_per_kind)),
+            )
+            summary['D2_target_count'] = int(len(d2_targets))
+            d2_rows = []
+            for i, site_seed in enumerate(d2_targets):
+                d2_cif = stage_dir / f"D2_{i}_{_safe_label_token(site_seed.get('site_label','site'))}.cif"
+                try:
+                    row = _evaluate_single_h_descriptor(
+                        slab_u_rel=slab_u_rel,
+                        E_slab_u=E_slab_u,
+                        E_H2=E_H2,
+                        site_seed=site_seed,
+                        z_steps=z_steps,
+                        free_steps=free_steps,
+                        use_net_corr=use_net_corr,
+                        out_cif=d2_cif,
+                        relaxation_scope=d2_scope,
+                        n_fix_layers=int(n_fix_layers),
+                    )
+                    d2_rows.append(row)
+                except Exception as row_e:
+                    d2_rows.append({
+                        'stage': 'D2_metal_cation_Hstar',
+                        'D2_policy': 'surface_metal_cation_centered_Hstar',
+                        'site_label': str(site_seed.get('site_label', f'D2_failed_{i}')),
+                        'site_kind': str(site_seed.get('site_kind', 'unknown')),
+                        'seed_source': str(site_seed.get('seed_source', 'oxide_D2_surface_metal_cation')),
+                        'descriptor_valid': False,
+                        'D2_descriptor_valid': False,
+                        'binding_class': 'failed',
+                        'D2_binding_class': 'failed',
+                        'final_site_kind': 'failed',
+                        'qc_flags': f'evaluation_failed:{row_e}',
+                        'ΔG_H (eV)': np.nan,
+                        'ΔE_H_user (eV)': np.nan,
+                        'abs_ΔG_H (eV)': np.nan,
+                        'H_lateral_disp(Å)': np.nan,
+                    })
+
+            d2_df = pd.DataFrame(d2_rows)
             d2_csv = stage_dir / 'D2_candidates.csv'
             if not d2_df.empty:
                 d2_df.to_csv(d2_csv, index=False)
                 summary['D2_candidates_csv'] = str(d2_csv.resolve())
 
-            energy_col = 'ΔG_H (eV)' if 'ΔG_H (eV)' in d2_df.columns else ('ΔE_H_user (eV)' if 'ΔE_H_user (eV)' in d2_df.columns else None)
+            energy_col = 'ΔG_H (eV)' if 'ΔG_H (eV)' in d2_df.columns else ('ΔG (eV)' if 'ΔG (eV)' in d2_df.columns else None)
             if not d2_df.empty and energy_col is not None:
-                d2_best, q, w = _pick_descriptor_seed_row(d2_df, energy_col=energy_col, disp_thresh=DESCRIPTOR_D2_DISP_THRESH_A)
+                d2_best, q, w = _pick_descriptor_seed_row(
+                    d2_df,
+                    energy_col=energy_col,
+                    disp_thresh=DESCRIPTOR_D2_DISP_THRESH_A,
+                    prefer_abs_energy=True,
+                    require_metal_centered=True,
+                )
                 summary['D2_seed_quality'] = q
                 summary['D2_seed_warning'] = w
                 if d2_best is not None:
+                    d2_best = dict(d2_best)
                     summary['D2_Hreact (eV)'] = _safe_float(d2_best.get(energy_col))
+                    summary['D2_abs_Hreact (eV)'] = abs(_safe_float(d2_best.get(energy_col)))
+                    summary['D2_selection_rule'] = 'min_abs_deltaG_among_valid_metal_centered_Hstar'
                     summary['D2_site_label'] = str(d2_best.get('site_label', d2_best.get('site', 'unknown')))
-                    summary['D2_binding_class'] = str(d2_best.get('final_site_kind', d2_best.get('binding_class', d2_best.get('site_kind', 'unknown'))))
+                    summary['D2_binding_class'] = str(d2_best.get('D2_binding_class', d2_best.get('binding_class', d2_best.get('site_kind', 'unknown'))))
+                    summary['D2_final_site_kind'] = str(d2_best.get('final_site_kind', summary['D2_binding_class']))
                     summary['D2_structure_cif'] = str(d2_best.get('structure_cif', ''))
                     summary['D2_seed_disp(Å)'] = _safe_float(d2_best.get('H_lateral_disp(Å)'))
-                    summary['D2_relaxation_scope'] = str(d2_best.get('relaxation_scope', d2_best.get('site_tracking_mode', resolved_scope)))
+                    summary['D2_relaxation_policy'] = str(d2_best.get('D2_relaxation_policy', d2_policy))
+                    summary['D2_underlying_relaxation_scope'] = str(d2_best.get('D2_underlying_relaxation_scope', d2_scope))
+                    summary['D2_constraint_equivalent_scope'] = str(d2_best.get('D2_constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE))
+                    summary['D2_relaxation_scope'] = str(d2_best.get('relaxation_scope', d2_scope))
                     summary['D2_total_relax_n_steps'] = int(_safe_float(d2_best.get('total_relax_n_steps', d2_best.get('z_relax_n_steps', 0.0)), 0.0))
                     summary['D2_fine_relax_relaxed_atoms'] = int(_safe_float(d2_best.get('fine_relax_relaxed_atoms', 0.0), 0.0))
+                    summary['D2_nearest_metal_symbol'] = str(d2_best.get('nearest_metal_symbol', 'unknown'))
+                    summary['D2_nearest_metal_distance(Å)'] = _safe_float(d2_best.get('nearest_metal_distance(Å)'))
+                    summary['D2_nearest_anion_symbol'] = str(d2_best.get('nearest_anion_symbol', 'unknown'))
+                    summary['D2_nearest_anion_distance(Å)'] = _safe_float(d2_best.get('nearest_anion_distance(Å)'))
+                    summary['D2_qc_flags'] = str(d2_best.get('qc_flags', ''))
                     if _rows_same_basin(d1_best, d2_best, slab_u_rel=slab_u_rel):
                         summary['D2_same_basin_as_D1'] = True
-                        summary['D2_basin_note'] = 'D2 main HER row matches the same final basin as D1.'
+                        summary['D2_basin_note'] = 'D2 selected metal-centered H* basin overlaps the D1 OH basin; inspect final-state classification.'
             elif energy_col is None:
                 summary['D2_seed_quality'] = 'missing'
-                summary['D2_seed_warning'] = 'Main HER screening rows did not contain a usable energy column.'
+                summary['D2_seed_warning'] = 'D2 metal-centered candidates did not contain a usable energy column.'
+            elif d2_df.empty:
+                summary['D2_seed_quality'] = 'missing'
+                summary['D2_seed_warning'] = 'No D2 surface-metal-cation candidates were generated.'
         except Exception as e:
             summary['D2_error'] = str(e)
 
