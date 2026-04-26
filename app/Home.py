@@ -245,6 +245,80 @@ def _safe_float(val, default=np.nan):
         return float(default)
 
 
+def _coerce_bool_series(s: pd.Series, default: bool = False) -> pd.Series:
+    """Coerce mixed bool/string/numeric Series to boolean values."""
+    if s is None:
+        return pd.Series(dtype=bool)
+
+    def _one(x):
+        if isinstance(x, (bool, np.bool_)):
+            return bool(x)
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return bool(default)
+        xs = str(x).strip().lower()
+        if xs in {"true", "1", "yes", "y", "valid", "ok"}:
+            return True
+        if xs in {"false", "0", "no", "n", "invalid", "bad", "nan", "none", ""}:
+            return False
+        try:
+            return bool(int(float(xs)))
+        except Exception:
+            return bool(default)
+
+    return s.map(_one).astype(bool)
+
+
+def _split_oxide_d2_primary_reliability(df: pd.DataFrame):
+    """Reliability split for oxide D2-primary HER rows.
+
+    D2 intentionally allows lateral relaxation within the local metal-cation
+    basin. Therefore H_lateral_disp(Å) is retained as audit metadata but is not
+    used as an automatic rejection criterion here. The reliable/unreliable split
+    is based on the D2 final-state validity produced by oxide_descriptor.py.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df, df
+
+    out = df.copy()
+    valid_mask = pd.Series(False, index=out.index)
+
+    # Preferred source: explicit descriptor validity from oxide_descriptor.py.
+    if "D2_descriptor_valid" in out.columns:
+        valid_mask = _coerce_bool_series(out["D2_descriptor_valid"], default=False)
+        valid_mask.index = out.index
+    else:
+        # Fallback for older result files: infer from final metal-centered state.
+        valid_labels = {
+            "metal_top", "metal_bridge", "metal_hollow", "metal_adjacent",
+            "top", "bridge", "hollow", "fcc", "hcp",
+        }
+        for col in ("D2_binding_class", "binding_class", "final_site_kind", "relaxed_site"):
+            if col in out.columns:
+                vals = out[col].astype(str).str.strip().str.lower()
+                valid_mask |= vals.isin(valid_labels)
+
+    # Hard invalid labels stay invalid even if a fallback label is ambiguous.
+    invalid_labels = {
+        "o_bound", "o-h_migrated", "oh_migrated", "anion", "anion_ontop",
+        "desorbed", "subsurface", "slab_collapsed", "unresolved", "other",
+    }
+    for col in ("D2_binding_class", "binding_class", "final_site_kind", "relaxed_site", "migration_destination"):
+        if col in out.columns:
+            vals = out[col].astype(str).str.strip().str.lower()
+            valid_mask &= ~vals.isin(invalid_labels)
+
+    # Keep extreme-energy blowups out of the reliable table, but do not reject
+    # merely because H_lateral_disp exceeds the legacy HER displacement cutoff.
+    for ecol in ("ΔE_H_user (eV)", "ΔG_H (eV)"):
+        if ecol in out.columns:
+            ev = pd.to_numeric(out[ecol], errors="coerce")
+            valid_mask &= ~(ev.abs() > 10.0)
+
+    df_rel = out[valid_mask].copy()
+    df_unrel = out[~valid_mask].copy()
+    return df_rel, df_unrel
+
+
 def _pick_oxide_her_representatives(df_rel: pd.DataFrame):
     """Return representative oxide-HER sites from reliable rows.
 
@@ -2032,9 +2106,11 @@ else:
     local_zpe_cutoff = 2.5
     local_zpe_max_neighbors = 3
 
-    # HER relaxation freedom defaults
-    # Metal benchmark path uses partial freedom by default.
-    # Oxide benchmark path keeps the explicit oxide control below.
+    # HER relaxation policy defaults.
+    # Metal HER path is preserved as-is.
+    # Oxide descriptor mode is routed through a descriptor-level policy,
+    # D2_react_only, which has the same top-level status as rigid/partial/full
+    # in CHE_mode.py but is interpreted only by the oxide descriptor workflow.
     her_relaxation_scope = "partial" if (is_her and mtype == "metal") else "rigid"
     her_n_fix_layers = 2
 
@@ -2092,33 +2168,20 @@ else:
             )
         st.caption("D3 / H₂ pairing proxy is disabled in the current app build. The code skeleton is retained only as commented legacy logic.")
 
-        st.markdown("### Oxide HER relaxation freedom")
-        _oxide_relax_labels = [
-            "rigid (benchmark default)",
-            "partial (optional sensitivity test)",
-            "full (advanced only)",
-        ]
-        _oxide_relax_default = 0
-        her_relaxation_scope = st.selectbox(
-            "Relaxation freedom for oxide HER",
-            _oxide_relax_labels,
-            index=_oxide_relax_default,
-            key="oxide_her_relaxation_scope_ui",
-            help=(
-                "Rigid is the benchmark default for oxide HER validation. "
-                "Partial is an optional sensitivity mode for open-framework oxides. "
-                "Full is an advanced reconstruction stress test."
-            ),
-        )
-        her_relaxation_scope = {
-            "rigid (benchmark default)": "rigid",
-            "partial (optional sensitivity test)": "partial",
-            "full (advanced only)": "full",
-        }.get(str(her_relaxation_scope), "rigid")
+        # Oxide HER descriptor relaxation is intentionally not user-selectable.
+        # A single UI-level relaxation control cannot describe both descriptor stages.
+        # D2_react_only is a descriptor-level policy with the same top-level status
+        # as rigid/partial/full, but it is valid only for oxide HER descriptor mode:
+        #   D1 = constrained/rigid O-site OH descriptor handling
+        #   D2_Hreact = partial metal-cation-centered H* relaxation
+        # Metal HER behavior is handled by the metal branch and is not changed here.
+        her_relaxation_scope = "D2_react_only"
         her_n_fix_layers = 2
         st.caption(
-            f"Current oxide HER setting: scope={her_relaxation_scope}. "
-            "Rigid is the default benchmark mode; partial is kept as an optional sensitivity test."
+            "Oxide HER descriptor relaxation policy is fixed to D2_react_only: "
+            "D1 uses constrained/rigid O-site OH handling; "
+            "D2_Hreact uses partial metal-cation-centered H* relaxation. "
+            "The metal HER workflow is unchanged."
         )
 
     with st.expander("Advanced electrochemical correction", expanded=False):
@@ -2390,9 +2453,22 @@ else:
 
 
         if is_her:
-            # HER: keep legacy reliability split, but also annotate site transitions for UI/debugging.
+            # HER: annotate site transitions for UI/debugging.
             df = annotate_site_transitions(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
-            df_rel, df_unrel = split_reliable_unreliable(df)
+
+            if (
+                str(mtype).strip().lower() == "oxide"
+                and isinstance(meta, dict)
+                and bool(meta.get("OXIDE_DESCRIPTOR_PRIMARY_RESULTS", False))
+            ):
+                # Oxide D2-primary mode: D2 is allowed to relax within the
+                # metal-cation basin. Do not demote a valid D2 row solely due
+                # to the legacy H_lateral_disp cutoff.
+                df_rel, df_unrel = _split_oxide_d2_primary_reliability(df)
+            else:
+                # Legacy HER reliability split for metals and non-D2 HER modes.
+                df_rel, df_unrel = split_reliable_unreliable(df)
+
             df["reliability"] = "unreliable"
             if df_rel is not None:
                 df.loc[df_rel.index, "reliability"] = "reliable"
@@ -2572,7 +2648,11 @@ if last_run is not None:
 
     # --- Main results tables (ALWAYS) ---
     if bool(last_run.get("is_her")):
-        st.markdown("### Results (Reliable)")
+        if str(last_run.get("mtype", "")) == "oxide" and isinstance(meta, dict) and bool(meta.get("OXIDE_DESCRIPTOR_PRIMARY_RESULTS", False)):
+            st.markdown("### Results (Reliable) — Oxide D2 primary")
+            st.caption("This table shows the selected metal-cation-centered D2 H* representative. Legacy O-anchor / anion-ontop HER rows are not displayed or written as primary results in this mode.")
+        else:
+            st.markdown("### Results (Reliable)")
         if isinstance(df_rel, pd.DataFrame):
             st.dataframe(build_compact_table(df_rel, mode_label), use_container_width=True)
         if isinstance(df_unrel, pd.DataFrame) and (not df_unrel.empty):
@@ -2655,29 +2735,24 @@ if last_run is not None:
         _occ = _rep.get("occupied") if isinstance(_rep, dict) else None
         _opt = _rep.get("her_optimal") if isinstance(_rep, dict) else None
         _is_d2_only_mode = str(_mode).strip().startswith("D2_Hreact only")
-        _align_d2_to_representative = bool(_occ) and str(_mode).strip() in {
-            "D2_Hreact only (reactive H state)",
-            "Full 2-stage profile (recommended)",
-        }
+        # D2 is now selected inside oxide_descriptor.py from independently
+        # generated surface-metal-cation-centered H* candidates.  Do not overwrite
+        # it with the main HER representative row, because the main HER table can
+        # still contain O-top/anionic candidates used for basic screening.
+        _align_d2_to_representative = False
         _display_ods = dict(_ods)
+        _display_ods["descriptor_mode"] = _mode
+        _d2_primary_results = bool(meta.get("OXIDE_DESCRIPTOR_PRIMARY_RESULTS", False))
 
-        if _align_d2_to_representative:
-            _display_ods["descriptor_mode"] = _mode
-            _display_ods["D2_Hreact (eV)"] = _occ.get("energy", np.nan)
-            _display_ods["D2_site_label"] = _occ.get("site_label", "NA")
-            _display_ods["D2_binding_class"] = _occ.get("binding_class", "")
-            try:
-                _display_ods["D2_structure_cif"] = _occ.get("row", {}).get("structure_cif", _ods.get("D2_structure_cif", ""))
-            except Exception:
-                pass
-            _display_ods["D2_basin_note"] = (
-                "representative occupied site (display-aligned in D2-only mode)"
-                if _is_d2_only_mode else
-                "representative occupied site (display-aligned in full 2-stage mode)"
+        if _d2_primary_results:
+            st.markdown("### Oxide D2 primary descriptor and selected profile")
+            st.caption(
+                "The primary HER result table above is now the selected D2 metal-cation-centered H* representative. "
+                "Legacy O-anchor / anion-ontop HER rows are skipped in this mode."
             )
-
-        st.markdown("### Oxide HER representative sites and selected profile")
-        if _occ:
+        else:
+            st.markdown("### Oxide HER representative sites and selected profile")
+        if _occ and not _d2_primary_results:
             st.caption(
                 "Representative occupied site = most stabilized reliable H* site (minimum ΔG_H among reliable, non-duplicate candidates). "
                 "This reflects the site expected to fill first under the occupancy-first interpretation."
@@ -2710,12 +2785,12 @@ if last_run is not None:
         if _is_d2_only_mode:
             st.markdown("#### Selected D2 descriptor result")
             st.caption(
-                "In D2-only mode, the displayed D2 value is aligned to the representative occupied site shown above."
+                "In D2-only mode, the displayed D2 value is selected from valid surface-metal-cation-centered H* candidates using min(|ΔG_H|)."
             )
         else:
             st.markdown("#### Selected 2-stage descriptor profile")
             st.caption(
-                "In full 2-stage mode, the displayed D2 value is aligned to the representative occupied site shown above."
+                "In full 2-stage mode, D1 remains the O-site protonation descriptor, while D2 is selected independently from valid surface-metal-cation-centered H* candidates using min(|ΔG_H|)."
             )
         # if _mode in {"D3_pair only (H2 pairing proxy)", "Full 3-stage profile (experimental)"}:
         #     st.warning(str(meta.get("OXIDE_DESCRIPTOR_CAUTION", _ods.get("caution", "The H₂ pairing stage is an approximate release proxy rather than an explicit barrier."))))
@@ -2724,7 +2799,10 @@ if last_run is not None:
             "descriptor_mode",
             "D1_OH (eV)", "D1_clean_OH (eV)", "D1_preOH_OH (eV)", "ΔD1_preOH-clean (eV)", "D2_Hreact (eV)",
             "Δ12 (eV)", "classification",
-            "D1_site_label", "D1_binding_class", "D1_background_site_label", "D1_model", "D2_site_label", "D2_binding_class",
+            "D1_site_label", "D1_binding_class", "D1_background_site_label", "D1_model",
+            "D2_site_label", "D2_binding_class", "D2_final_site_kind", "D2_abs_Hreact (eV)", "D2_selection_rule",
+            "D2_target_count", "D2_nearest_metal_symbol", "D2_nearest_metal_distance(Å)",
+            "D2_nearest_anion_symbol", "D2_nearest_anion_distance(Å)", "D2_qc_flags",
             "D2_same_basin_as_D1", "D2_basin_note",
             # "D3_pair_proxy (eV)", "Δ23 (eV)",
             # "D3_H2_like_motif", "D3_final_HH_distance(Å)",
@@ -2736,7 +2814,7 @@ if last_run is not None:
         _profile_points = []
         _d1 = _safe_float(_display_ods.get("D1_OH (eV)"))
         _d2 = _safe_float(_display_ods.get("D2_Hreact (eV)"))
-        if (not _align_d2_to_representative) and _occ and np.isfinite(_safe_float(_occ.get("energy"))) and np.isfinite(_d2):
+        if (not _d2_primary_results) and (not _align_d2_to_representative) and _occ and np.isfinite(_safe_float(_occ.get("energy"))) and np.isfinite(_d2):
             _delta_rep = abs(float(_occ.get("energy")) - _d2)
             if _delta_rep > 1e-8:
                 st.info(
@@ -2808,7 +2886,17 @@ if last_run is not None:
             "D2 structure — reactive H state",
             "D2_Hreact (eV)",
             "D2_site_label",
-            extra_items=[("D2_binding_class", "binding class"), ("D2_same_basin_as_D1", "same basin as D1"), ("D2_basin_note", "basin note"), ("D2_seed_disp(Å)", "seed disp (Å)")],
+            extra_items=[
+                ("D2_binding_class", "binding class"),
+                ("D2_final_site_kind", "final site kind"),
+                ("D2_selection_rule", "selection rule"),
+                ("D2_nearest_metal_symbol", "nearest metal"),
+                ("D2_nearest_metal_distance(Å)", "nearest metal dist (Å)"),
+                ("D2_qc_flags", "QC flags"),
+                ("D2_same_basin_as_D1", "same basin as D1"),
+                ("D2_basin_note", "basin note"),
+                ("D2_seed_disp(Å)", "seed disp (Å)"),
+            ],
         )
         # _render_descriptor_stage_viewer(
         #     "D3",
