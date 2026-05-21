@@ -29,6 +29,8 @@ from ocp_app.core.anchors.common import (
     site_energy_oh_anchoronly, 
 )
 
+from ocp_app.core.anchors.local_zpe import compute_local_h_thermo_correction
+
 THREE_STAGE_OXIDE_HER_CAUTION = (
     "Caution: In the current oxide workflow, D1 is treated as a contextual O-top protonation probe, "
     "whereas D2 is an independently generated surface-metal-cation-centered H* stabilization descriptor. "
@@ -61,14 +63,101 @@ D1_ANCHOR_METAL_DIST_RATIO_MAX = 1.35
 D1_ANCHOR_METAL_DIST_BUFFER_A = 0.35
 D1_RETAINED_NEIGHBORS_MIN = 1
 
-# Descriptor-level relaxation policies. D2_react_only is intentionally a
-# first-class oxide-descriptor policy, alongside the user-facing rigid/partial/full
-# concepts at the CHE workflow level. It is not passed directly to relax_freeH();
-# D2_Hreact uses the underlying partial relaxation engine.
-D2_REACT_ONLY_SCOPE = 'D2_react_only'
-D1_FIXED_RELAXATION_POLICY = 'anchor_oh_hookean_preOH'
-D2_UNDERLYING_RELAXATION_SCOPE = D2_REACT_ONLY_SCOPE
-D2_CONSTRAINT_EQUIVALENT_SCOPE = 'partial'
+STANDARD_HER_CHE_CORR = 0.24
+FAST_CHE_MODE_LABEL = "CHE correction (fast screening)"
+
+
+def _is_local_zpe_mode(thermo_mode: str) -> bool:
+    return str(thermo_mode).strip() != FAST_CHE_MODE_LABEL
+
+
+def _apply_her_thermo_to_descriptor_row(
+    row: dict[str, object],
+    atoms_with_h,
+    *,
+    n_slab_atoms: int,
+    thermo_mode: str = FAST_CHE_MODE_LABEL,
+    local_zpe_cutoff: float = 2.5,
+    local_zpe_max_neighbors: int = 3,
+    standard_che_corr: float = STANDARD_HER_CHE_CORR,
+    use_net_corr: bool = True,
+) -> dict[str, object]:
+    """Apply HER thermodynamic correction to oxide D1/D2 descriptor rows.
+
+    The oxide descriptor module generates D1/D2 rows independently from the
+    normal HER candidate table.  This helper keeps those rows on the same
+    thermodynamic policy as CHE_mode.py:
+
+      - always retain the standard-CHE value as ΔG_H_CHE / ΔG_CHE
+      - when local ZPE mode is requested, try local vibrational correction
+      - if local ZPE succeeds, make ΔG/ΔG_H use the local-corrected value
+      - if local ZPE fails, fall back to standard CHE and record the error
+    """
+    out = dict(row)
+
+    dE = _safe_float(out.get('ΔE_H_user (eV)', out.get('ΔE (eV)', np.nan)))
+    if not np.isfinite(dE):
+        out.setdefault('local_zpe_status', 'skipped_no_delta_e')
+        return out
+
+    che_corr = float(standard_che_corr) if bool(use_net_corr) else 0.0
+    dG_che = float(dE + che_corr)
+
+    out['standard_che_corr (eV)'] = che_corr
+    out['ΔG_CHE (eV)'] = dG_che
+    out['ΔG_H_CHE (eV)'] = dG_che
+    out.setdefault('local_thermo_corr (eV)', np.nan)
+    out.setdefault('local_delta_zpe_eV', np.nan)
+    out.setdefault('local_delta_ts_eV', np.nan)
+    out.setdefault('local_zpe_n_vib_atoms', 0)
+    out.setdefault('local_zpe_selected_indices', '')
+    out.setdefault('local_zpe_neighbor_indices', '')
+    out.setdefault('local_zpe_warnings', '')
+    out.setdefault('local_zpe_error', '')
+
+    if not _is_local_zpe_mode(thermo_mode):
+        out['thermo_mode'] = FAST_CHE_MODE_LABEL
+        out['local_zpe_status'] = 'not_requested'
+        out['ΔG (eV)'] = dG_che
+        out['ΔG_H (eV)'] = dG_che
+    else:
+        out['thermo_mode'] = str(thermo_mode)
+        try:
+            zpe = compute_local_h_thermo_correction(
+                atoms_with_h,
+                n_slab_atoms=int(n_slab_atoms),
+                cutoff=float(local_zpe_cutoff),
+                max_neighbors=int(local_zpe_max_neighbors),
+            )
+            local_corr = float(zpe['local_corr_eV'])
+            dG_local = float(dE + local_corr)
+
+            out['local_thermo_corr (eV)'] = local_corr
+            out['local_delta_zpe_eV'] = float(zpe.get('delta_zpe_eV', np.nan))
+            out['local_delta_ts_eV'] = float(zpe.get('delta_ts_eV', np.nan))
+            out['local_zpe_n_vib_atoms'] = int(zpe.get('n_vib_atoms', 0))
+            out['local_zpe_selected_indices'] = ','.join(str(i) for i in zpe.get('selected_indices', []))
+            out['local_zpe_neighbor_indices'] = ','.join(str(i) for i in zpe.get('neighbor_indices', []))
+            out['local_zpe_warnings'] = ';'.join(str(w) for w in zpe.get('warnings', []))
+            out['local_zpe_status'] = 'ok'
+            out['ΔG_local (eV)'] = dG_local
+            out['ΔG_H_local (eV)'] = dG_local
+            out['ΔG (eV)'] = dG_local
+            out['ΔG_H (eV)'] = dG_local
+        except Exception as e:
+            out['local_zpe_status'] = 'failed'
+            out['local_zpe_error'] = str(e)
+            out['ΔG_local (eV)'] = np.nan
+            out['ΔG_H_local (eV)'] = np.nan
+            out['ΔG (eV)'] = dG_che
+            out['ΔG_H (eV)'] = dG_che
+
+    if 'ΔG_H (eV)' in out:
+        val = _safe_float(out.get('ΔG_H (eV)'))
+        out['abs_ΔG_H (eV)'] = abs(val) if np.isfinite(val) else np.nan
+        out['D2_selection_metric'] = abs(val) if np.isfinite(val) else np.nan
+
+    return out
 
 
 def _safe_float(x, default=np.nan) -> float:
@@ -544,8 +633,8 @@ def _site_energy_two_stage_d2_metal_anchor(
             'z_relax_relaxed_atoms': int((z_meta or {}).get('relaxed_atom_count', 0)),
             'z_relax_fixed_atoms': int((z_meta or {}).get('fixed_atom_count', 0)),
             'fine_relax_scope': str((free_meta or {}).get('relaxation_scope', scope)),
-            'fine_constraint_equivalent_scope': str((free_meta or {}).get('constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE)),
-            'constraint_equivalent_scope': str((free_meta or {}).get('constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE)),
+            'constraint_equivalent_scope': str((free_meta or {}).get('constraint_equivalent_scope', scope)),
+            'fine_constraint_equivalent_scope': str((free_meta or {}).get('constraint_equivalent_scope', scope)),
             'fine_n_fix_layers': int((free_meta or {}).get('n_fix_layers', int(n_fix_layers))),
             'fine_relax_n_steps': int((free_meta or {}).get('n_steps', 0)),
             'fine_relax_converged': (free_meta or {}).get('converged', None),
@@ -628,7 +717,11 @@ def _classify_d2_metal_centered_state(relaxed_atoms, h_index: int = -1) -> dict[
 
 def _evaluate_constrained_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, site_seed: dict[str, object],
                                       z_steps: int, free_steps: int, use_net_corr: bool,
-                                      out_cif: Path | None = None) -> dict[str, object]:
+                                      out_cif: Path | None = None,
+                                      thermo_mode: str = FAST_CHE_MODE_LABEL,
+                                      local_zpe_cutoff: float = 2.5,
+                                      local_zpe_max_neighbors: int = 3,
+                                      standard_che_corr: float = STANDARD_HER_CHE_CORR) -> dict[str, object]:
     label = str(site_seed.get('site_label', 'unknown'))
     kind = str(site_seed.get('site_kind', 'unknown'))
     xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float)
@@ -702,15 +795,29 @@ def _evaluate_constrained_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: fl
         'z_relax_n_steps': int((relax_meta or {}).get('z_relax_n_steps', 0)),
         'z_relax_converged': (relax_meta or {}).get('z_relax_converged', None),
         'z_relax_relaxed_atoms': int((relax_meta or {}).get('z_relax_relaxed_atoms', 0)),
+        'z_relax_fixed_atoms': int((relax_meta or {}).get('z_relax_fixed_atoms', 0)),
         'fine_relax_n_steps': int((relax_meta or {}).get('fine_relax_n_steps', 0)),
         'fine_relax_converged': (relax_meta or {}).get('fine_relax_converged', None),
         'fine_relax_relaxed_atoms': int((relax_meta or {}).get('fine_relax_relaxed_atoms', 0)),
+        'fine_relax_fixed_atoms': int((relax_meta or {}).get('fine_relax_fixed_atoms', 0)),
+        'D2_fixed_atom_count': int((relax_meta or {}).get('fine_relax_fixed_atoms', 0)),
+        'D2_relaxed_atom_count': int((relax_meta or {}).get('fine_relax_relaxed_atoms', 0)),
         'total_relax_n_steps': int((relax_meta or {}).get('total_relax_n_steps', 0)),
         'local_free_count': int((relax_meta or {}).get('local_free_count', 0)),
         'shell_count': int((relax_meta or {}).get('shell_count', 0)),
         'hook_k': _safe_float((relax_meta or {}).get('hook_k', D1_CLEAN_HOOK_K)),
         'hook_extra': _safe_float((relax_meta or {}).get('hook_extra', D1_HOOK_EXTRA_A)),
     }
+    row = _apply_her_thermo_to_descriptor_row(
+        row,
+        Au,
+        n_slab_atoms=len(slab_u_rel),
+        thermo_mode=thermo_mode,
+        local_zpe_cutoff=local_zpe_cutoff,
+        local_zpe_max_neighbors=local_zpe_max_neighbors,
+        standard_che_corr=standard_che_corr,
+        use_net_corr=use_net_corr,
+    )
     return row
 
 
@@ -770,7 +877,11 @@ def _select_background_oh_site(anchor_seed: dict[str, object], d1_targets: list[
 
 def _evaluate_prehydroxylated_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, site_seed: dict[str, object],
                                            d1_targets: list[dict[str, object]], z_steps: int, free_steps: int, use_net_corr: bool,
-                                           out_cif: Path | None = None, bg_out_cif: Path | None = None) -> dict[str, object]:
+                                           out_cif: Path | None = None, bg_out_cif: Path | None = None,
+                                           thermo_mode: str = FAST_CHE_MODE_LABEL,
+                                           local_zpe_cutoff: float = 2.5,
+                                           local_zpe_max_neighbors: int = 3,
+                                           standard_che_corr: float = STANDARD_HER_CHE_CORR) -> dict[str, object]:
     label = str(site_seed.get('site_label', 'unknown'))
     kind = str(site_seed.get('site_kind', 'unknown'))
     xy = np.asarray(site_seed.get('xy', [np.nan, np.nan]), dtype=float)
@@ -786,6 +897,10 @@ def _evaluate_prehydroxylated_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2
             z_steps=z_steps, free_steps=free_steps,
             use_net_corr=use_net_corr,
             out_cif=out_cif,
+            thermo_mode=thermo_mode,
+            local_zpe_cutoff=local_zpe_cutoff,
+            local_zpe_max_neighbors=local_zpe_max_neighbors,
+            standard_che_corr=standard_che_corr,
         )
         row['D1_model'] = 'clean_fallback'
         row['background_site_label'] = 'NA'
@@ -884,6 +999,16 @@ def _evaluate_prehydroxylated_oh_descriptor(*, slab_u_rel, E_slab_u: float, E_H2
         'background_total_relax_n_steps': int((bg_meta or {}).get('total_relax_n_steps', 0)),
         'D1_model': 'prehydroxylated',
     }
+    row = _apply_her_thermo_to_descriptor_row(
+        row,
+        Au,
+        n_slab_atoms=len(slab_u_rel),
+        thermo_mode=thermo_mode,
+        local_zpe_cutoff=local_zpe_cutoff,
+        local_zpe_max_neighbors=local_zpe_max_neighbors,
+        standard_che_corr=standard_che_corr,
+        use_net_corr=use_net_corr,
+    )
     return row
 
 
@@ -891,7 +1016,11 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
                                   z_steps: int, free_steps: int, use_net_corr: bool,
                                   out_cif: Path | None = None,
                                   relaxation_scope: str = "partial",
-                                  n_fix_layers: int = 2) -> dict[str, object]:
+                                  n_fix_layers: int = 2,
+                                  thermo_mode: str = FAST_CHE_MODE_LABEL,
+                                  local_zpe_cutoff: float = 2.5,
+                                  local_zpe_max_neighbors: int = 3,
+                                  standard_che_corr: float = STANDARD_HER_CHE_CORR) -> dict[str, object]:
     """Evaluate the oxide-D2 metal-cation-centered H* descriptor.
 
     This function is D2-specific.  D1 does not call it.  Metal surfaces do not
@@ -910,7 +1039,7 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
         anchor_xyz,
         z_steps=int(z_steps),
         free_steps=int(free_steps),
-        relaxation_scope=relaxation_scope,
+        relaxation_scope=normalize_relaxation_scope(relaxation_scope),
         n_fix_layers=int(n_fix_layers),
     )
     dE_u = float(E_uH) - float(E_slab_u) - 0.5 * float(E_H2)
@@ -935,10 +1064,6 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
     row = {
         'stage': 'D2_metal_cation_Hstar',
         'D2_policy': str(site_seed.get('D2_policy', 'surface_metal_cation_centered_Hstar')),
-        'descriptor_relaxation_policy': D2_REACT_ONLY_SCOPE,
-        'D2_relaxation_policy': D2_REACT_ONLY_SCOPE,
-        'D2_underlying_relaxation_scope': str(normalize_relaxation_scope(relaxation_scope)),
-        'D2_constraint_equivalent_scope': str((relax_meta or {}).get('constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE)),
         'site_label': label,
         'site_kind': kind,
         'raw_site_kind': str(site_seed.get('raw_site_kind', kind)),
@@ -981,6 +1106,10 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
         'migrated': bool(np.isfinite(disp_mic) and disp_mic > MIGRATE_THR),
         'structure_cif': str(out_cif.resolve()) if out_cif is not None and out_cif.exists() else '',
         'relaxation_scope': str(normalize_relaxation_scope(relaxation_scope)),
+        'constraint_equivalent_scope': str((relax_meta or {}).get('constraint_equivalent_scope', normalize_relaxation_scope(relaxation_scope))),
+        'D2_fixed_relaxation_scope': str(normalize_relaxation_scope(relaxation_scope)),
+        'D2_constraint_policy': 'bottom_n_layers_fixed; upper_slab_and_H_relaxed',
+        'D2_n_fix_layers': int(n_fix_layers),
         'n_fix_layers': int(n_fix_layers),
         'selected_h0': _safe_float((relax_meta or {}).get('selected_h0')),
         'h0_candidates': str((relax_meta or {}).get('h0_candidates', '')),
@@ -993,6 +1122,16 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
         'fine_relax_relaxed_atoms': int((relax_meta or {}).get('fine_relax_relaxed_atoms', 0)),
         'total_relax_n_steps': int((relax_meta or {}).get('total_relax_n_steps', 0)),
     }
+    row = _apply_her_thermo_to_descriptor_row(
+        row,
+        Au,
+        n_slab_atoms=len(slab_u_rel),
+        thermo_mode=thermo_mode,
+        local_zpe_cutoff=local_zpe_cutoff,
+        local_zpe_max_neighbors=local_zpe_max_neighbors,
+        standard_che_corr=standard_che_corr,
+        use_net_corr=use_net_corr,
+    )
     return row
 
 
@@ -1170,38 +1309,37 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                                  out_root: Path, z_steps: int, free_steps: int,
                                  use_net_corr: bool, descriptor_mode: str = 'Full 2-stage profile (recommended)',
                                  max_reactive_per_kind: int = 2, pair_limit: int = 6,
-                                 relaxation_scope: str = 'rigid', n_fix_layers: int = 2) -> dict[str, object]:
+                                 relaxation_scope: str = 'rigid', n_fix_layers: int = 2,
+                                 thermo_mode: str = FAST_CHE_MODE_LABEL,
+                                 local_zpe_cutoff: float = 2.5,
+                                 local_zpe_max_neighbors: int = 3,
+                                 standard_che_corr: float = STANDARD_HER_CHE_CORR) -> dict[str, object]:
     stage_dir = Path(out_root) / 'three_stage'
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     mode = str(descriptor_mode)
     if mode not in {'D2_Hreact only (reactive H state)', 'Full 2-stage profile (recommended)'}:
         mode = 'Full 2-stage profile (recommended)'
-    raw_scope = str(relaxation_scope).strip()
-    if raw_scope == D2_REACT_ONLY_SCOPE:
-        resolved_scope = D2_REACT_ONLY_SCOPE
-    else:
-        resolved_scope = normalize_relaxation_scope(raw_scope)
-
+    resolved_scope = normalize_relaxation_scope(relaxation_scope)
     # Fixed oxide-descriptor policy:
     #   D1 is a constrained/rigid O-site OH descriptor.
-    #   D2_Hreact uses the underlying partial relaxation engine.
-    # D2_react_only is stored as the descriptor-level policy so outputs do not
-    # look like a generic partial HER calculation.
-    D2_FIXED_RELAXATION_POLICY = D2_REACT_ONLY_SCOPE
-    D2_FIXED_RELAXATION_SCOPE = D2_UNDERLYING_RELAXATION_SCOPE
+    #   D2_Hreact is always evaluated with partial relaxation.
+    # The input relaxation_scope is retained only as upstream metadata.
+    D1_FIXED_RELAXATION_POLICY = 'anchor_oh_hookean_preOH'
+    D2_FIXED_RELAXATION_SCOPE = 'partial'
     summary: dict[str, object] = {
         'descriptor_mode': mode,
         'caution': THREE_STAGE_OXIDE_HER_CAUTION,
         'relaxation_scope': resolved_scope,
-        'upstream_relaxation_scope': raw_scope,
-        'descriptor_relaxation_policy': D2_REACT_ONLY_SCOPE,
+        'upstream_relaxation_scope': resolved_scope,
         'D1_fixed_relaxation_policy': D1_FIXED_RELAXATION_POLICY,
-        'D2_fixed_relaxation_policy': D2_FIXED_RELAXATION_POLICY,
         'D2_fixed_relaxation_scope': D2_FIXED_RELAXATION_SCOPE,
-        'D2_underlying_relaxation_scope': D2_UNDERLYING_RELAXATION_SCOPE,
-        'D2_constraint_equivalent_scope': D2_CONSTRAINT_EQUIVALENT_SCOPE,
         'n_fix_layers': int(n_fix_layers),
+        'thermo_mode': str(thermo_mode),
+        'standard_che_corr (eV)': float(standard_che_corr if use_net_corr else 0.0),
+        'local_zpe_requested': bool(_is_local_zpe_mode(thermo_mode)),
+        'local_zpe_cutoff': float(local_zpe_cutoff),
+        'local_zpe_max_neighbors': int(local_zpe_max_neighbors),
     }
 
     defaults = {
@@ -1212,7 +1350,6 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
         'D1_background_site_label': 'NA', 'D1_background_structure_cif': '', 'D1_model': 'NA',
         'D2_Hreact (eV)': np.nan, 'D2_site_label': 'NA', 'D2_binding_class': 'NA',
         'D2_structure_cif': '', 'D2_seed_quality': 'missing', 'D2_seed_warning': '', 'D2_seed_disp(Å)': np.nan,
-        'D2_relaxation_policy': '', 'D2_underlying_relaxation_scope': '', 'D2_constraint_equivalent_scope': '',
         'D2_relaxation_scope': '', 'D2_total_relax_n_steps': 0, 'D2_fine_relax_relaxed_atoms': 0,
         'D2_same_basin_as_D1': False, 'D2_basin_note': '',
         'D2_candidates_csv': '', 'D2_target_count': 0, 'D2_abs_Hreact (eV)': np.nan, 'D2_selection_rule': '',
@@ -1220,6 +1357,8 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
         'D2_nearest_anion_symbol': 'NA', 'D2_nearest_anion_distance(Å)': np.nan, 'D2_qc_flags': '',
         'D3_pair_proxy (eV)': np.nan, 'D3_pair_label': 'NA',
         'D3_H2_like_motif': False, 'D3_final_HH_distance(Å)': np.nan, 'D3_structure_cif': '',
+        'D2_fixed_relaxation_scope': 'partial', 'D2_constraint_policy': 'bottom_n_layers_fixed; upper_slab_and_H_relaxed',
+        'D2_fine_relax_fixed_atoms': 0, 'D2_fixed_atom_count': 0, 'D2_relaxed_atom_count': 0,
         'D3_relaxation_scope': '', 'D3_total_relax_n_steps': 0, 'D3_fine_relax_relaxed_atoms': 0,
         'D3_candidates_csv': '', 'D3_status': 'disabled_by_design', 'D3_pair_seed_count': 0,
         'D3_valid_pair_count': 0, 'error': '',
@@ -1243,8 +1382,7 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
     d2_best = None
     d2_targets: list[dict[str, object]] = []
     d1_scope = D1_FIXED_RELAXATION_POLICY
-    d2_policy = D2_FIXED_RELAXATION_POLICY
-    d2_scope = D2_UNDERLYING_RELAXATION_SCOPE
+    d2_scope = D2_FIXED_RELAXATION_SCOPE
     d3_scope = d2_scope
 
     if need_d1:
@@ -1263,6 +1401,10 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                     z_steps=z_steps, free_steps=free_steps,
                     use_net_corr=use_net_corr,
                     out_cif=clean_cif,
+                    thermo_mode=thermo_mode,
+                    local_zpe_cutoff=local_zpe_cutoff,
+                    local_zpe_max_neighbors=local_zpe_max_neighbors,
+                    standard_che_corr=standard_che_corr,
                 )
                 clean_row['stage'] = 'D1_clean'
                 d1_clean_rows.append(clean_row)
@@ -1277,6 +1419,10 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                     use_net_corr=use_net_corr,
                     out_cif=preoh_cif,
                     bg_out_cif=preoh_bg_cif,
+                    thermo_mode=thermo_mode,
+                    local_zpe_cutoff=local_zpe_cutoff,
+                    local_zpe_max_neighbors=local_zpe_max_neighbors,
+                    standard_che_corr=standard_che_corr,
                 )
                 pre_row['stage'] = 'D1_preOH'
                 d1_pre_rows.append(pre_row)
@@ -1317,6 +1463,11 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                 summary['D1_relaxation_scope'] = str(d1_best.get('relaxation_scope', d1_scope))
                 summary['D1_total_relax_n_steps'] = int(_safe_float(d1_best.get('total_relax_n_steps'), 0.0))
                 summary['D1_fine_relax_relaxed_atoms'] = int(_safe_float(d1_best.get('fine_relax_relaxed_atoms'), 0.0))
+                summary['D1_thermo_mode'] = str(d1_best.get('thermo_mode', thermo_mode))
+                summary['D1_OH_CHE (eV)'] = _safe_float(d1_best.get('ΔG_H_CHE (eV)', d1_best.get('ΔG_CHE (eV)', np.nan)))
+                summary['D1_OH_local (eV)'] = _safe_float(d1_best.get('ΔG_H_local (eV)', d1_best.get('ΔG_local (eV)', np.nan)))
+                summary['D1_local_thermo_corr (eV)'] = _safe_float(d1_best.get('local_thermo_corr (eV)', np.nan))
+                summary['D1_local_zpe_status'] = str(d1_best.get('local_zpe_status', ''))
             else:
                 summary['D1_seed_quality'] = 'missing'
                 summary['D1_seed_warning'] = 'No D1 O-top targets were evaluated.'
@@ -1349,12 +1500,19 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                         out_cif=d2_cif,
                         relaxation_scope=d2_scope,
                         n_fix_layers=int(n_fix_layers),
+                        thermo_mode=thermo_mode,
+                        local_zpe_cutoff=local_zpe_cutoff,
+                        local_zpe_max_neighbors=local_zpe_max_neighbors,
+                        standard_che_corr=standard_che_corr,
                     )
                     d2_rows.append(row)
                 except Exception as row_e:
                     d2_rows.append({
                         'stage': 'D2_metal_cation_Hstar',
                         'D2_policy': 'surface_metal_cation_centered_Hstar',
+                        'D2_fixed_relaxation_scope': str(d2_scope),
+                        'D2_constraint_policy': 'bottom_n_layers_fixed; upper_slab_and_H_relaxed',
+                        'D2_n_fix_layers': int(n_fix_layers),
                         'site_label': str(site_seed.get('site_label', f'D2_failed_{i}')),
                         'site_kind': str(site_seed.get('site_kind', 'unknown')),
                         'seed_source': str(site_seed.get('seed_source', 'oxide_D2_surface_metal_cation')),
@@ -1365,7 +1523,11 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                         'final_site_kind': 'failed',
                         'qc_flags': f'evaluation_failed:{row_e}',
                         'ΔG_H (eV)': np.nan,
+                        'ΔG_H_CHE (eV)': np.nan,
+                        'ΔG_H_local (eV)': np.nan,
                         'ΔE_H_user (eV)': np.nan,
+                        'local_thermo_corr (eV)': np.nan,
+                        'local_zpe_status': 'not_evaluated_failed_candidate',
                         'abs_ΔG_H (eV)': np.nan,
                         'H_lateral_disp(Å)': np.nan,
                     })
@@ -1397,17 +1559,27 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                     summary['D2_final_site_kind'] = str(d2_best.get('final_site_kind', summary['D2_binding_class']))
                     summary['D2_structure_cif'] = str(d2_best.get('structure_cif', ''))
                     summary['D2_seed_disp(Å)'] = _safe_float(d2_best.get('H_lateral_disp(Å)'))
-                    summary['D2_relaxation_policy'] = str(d2_best.get('D2_relaxation_policy', d2_policy))
-                    summary['D2_underlying_relaxation_scope'] = str(d2_best.get('D2_underlying_relaxation_scope', d2_scope))
-                    summary['D2_constraint_equivalent_scope'] = str(d2_best.get('D2_constraint_equivalent_scope', D2_CONSTRAINT_EQUIVALENT_SCOPE))
                     summary['D2_relaxation_scope'] = str(d2_best.get('relaxation_scope', d2_scope))
                     summary['D2_total_relax_n_steps'] = int(_safe_float(d2_best.get('total_relax_n_steps', d2_best.get('z_relax_n_steps', 0.0)), 0.0))
                     summary['D2_fine_relax_relaxed_atoms'] = int(_safe_float(d2_best.get('fine_relax_relaxed_atoms', 0.0), 0.0))
+                    summary['D2_fine_relax_fixed_atoms'] = int(_safe_float(d2_best.get('fine_relax_fixed_atoms', 0.0), 0.0))
+                    summary['D2_fixed_atom_count'] = int(_safe_float(d2_best.get('D2_fixed_atom_count', d2_best.get('fine_relax_fixed_atoms', 0.0)), 0.0))
+                    summary['D2_relaxed_atom_count'] = int(_safe_float(d2_best.get('D2_relaxed_atom_count', d2_best.get('fine_relax_relaxed_atoms', 0.0)), 0.0))
+                    summary['D2_fixed_relaxation_scope'] = str(d2_best.get('D2_fixed_relaxation_scope', d2_scope))
+                    summary['D2_constraint_policy'] = str(d2_best.get('D2_constraint_policy', 'bottom_n_layers_fixed; upper_slab_and_H_relaxed'))
                     summary['D2_nearest_metal_symbol'] = str(d2_best.get('nearest_metal_symbol', 'unknown'))
                     summary['D2_nearest_metal_distance(Å)'] = _safe_float(d2_best.get('nearest_metal_distance(Å)'))
                     summary['D2_nearest_anion_symbol'] = str(d2_best.get('nearest_anion_symbol', 'unknown'))
                     summary['D2_nearest_anion_distance(Å)'] = _safe_float(d2_best.get('nearest_anion_distance(Å)'))
                     summary['D2_qc_flags'] = str(d2_best.get('qc_flags', ''))
+                    summary['D2_thermo_mode'] = str(d2_best.get('thermo_mode', thermo_mode))
+                    summary['D2_Hreact_CHE (eV)'] = _safe_float(d2_best.get('ΔG_H_CHE (eV)', np.nan))
+                    summary['D2_Hreact_local (eV)'] = _safe_float(d2_best.get('ΔG_H_local (eV)', np.nan))
+                    summary['D2_local_thermo_corr (eV)'] = _safe_float(d2_best.get('local_thermo_corr (eV)', np.nan))
+                    summary['D2_local_zpe_status'] = str(d2_best.get('local_zpe_status', ''))
+                    summary['D2_local_zpe_n_vib_atoms'] = int(_safe_float(d2_best.get('local_zpe_n_vib_atoms', 0), 0.0))
+                    summary['D2_local_zpe_warnings'] = str(d2_best.get('local_zpe_warnings', ''))
+                    summary['D2_local_zpe_error'] = str(d2_best.get('local_zpe_error', ''))
                     if _rows_same_basin(d1_best, d2_best, slab_u_rel=slab_u_rel):
                         summary['D2_same_basin_as_D1'] = True
                         summary['D2_basin_note'] = 'D2 selected metal-centered H* basin overlaps the D1 OH basin; inspect final-state classification.'
