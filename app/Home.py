@@ -604,6 +604,162 @@ def _get_oxide_her_constrained_prerelaxed_slab(
     return relaxed, meta
 
 
+
+def _counter_to_compact_formula(counter: Counter | dict | None) -> str:
+    """Format an element counter as a compact formula-like string for QC display."""
+    if not counter:
+        return ""
+    items = []
+    for el in sorted(counter.keys()):
+        try:
+            n = int(counter[el])
+        except Exception:
+            n = counter[el]
+        items.append(f"{el}{n}")
+    return " ".join(items)
+
+
+def _common_like_bottom_fix_indices(atoms, n_fix_layers: int = 2, z_tol: float = 0.25) -> list[int]:
+    """Replicate common.py partial-relaxation bottom-layer fixing logic for UI/QC audit."""
+    if atoms is None or len(atoms) == 0:
+        return []
+    z = np.asarray(atoms.get_positions()[:, 2], dtype=float)
+    zs = np.unique(np.round(z, 3))
+    zs.sort()
+    cuts = zs[: min(int(n_fix_layers), len(zs))]
+    fixed = []
+    for i, atom in enumerate(atoms):
+        if atom.symbol == "H":
+            continue
+        if np.any(np.abs(float(atom.position[2]) - cuts) < float(z_tol)):
+            fixed.append(int(i))
+    return fixed
+
+
+def _oxide_her_pre_run_audit(atoms, *, n_fix_layers: int = 2, z_tol: float = 0.25, layer_tol: float = 0.8) -> dict:
+    """Audit the exact slab that will enter oxide HER D1/D2 descriptor calculations.
+
+    This is intentionally non-invasive: it does not slabify or modify uploaded
+    Miller-index slabs. It only exposes the vacuum, z-layer, top/bottom
+    composition, and D2-partial fixed/relaxed atom counts so upload-CIF and
+    MP-generated slabs can be checked under the same guardrail.
+    """
+    audit = {"status": "not_available", "hard_errors": [], "warnings": []}
+    if atoms is None:
+        audit["hard_errors"].append("No prepared slab is available.")
+        return audit
+    a = atoms.copy()
+    audit["status"] = "ok"
+    audit["n_atoms"] = int(len(a))
+    try:
+        audit["formula"] = str(a.get_chemical_formula())
+    except Exception:
+        audit["formula"] = ""
+    try:
+        cell = a.get_cell()
+        audit["cell_z_A"] = float(cell.lengths()[2])
+    except Exception:
+        audit["cell_z_A"] = float("nan")
+    try:
+        z = np.asarray(a.get_positions()[:, 2], dtype=float)
+        audit["z_min_A"] = float(np.min(z))
+        audit["z_max_A"] = float(np.max(z))
+        audit["slab_thickness_z_A"] = float(np.max(z) - np.min(z))
+        audit["estimated_vacuum_z_A"] = float(audit["cell_z_A"] - audit["slab_thickness_z_A"])
+    except Exception:
+        audit["z_min_A"] = audit["z_max_A"] = audit["slab_thickness_z_A"] = audit["estimated_vacuum_z_A"] = float("nan")
+    try:
+        rep = validate_structure(a, target_area=70.0)
+        audit["validate_vacuum_z_A"] = float(getattr(rep, "vacuum_z", np.nan))
+    except Exception as e:
+        audit["validate_vacuum_z_A"] = float("nan")
+        audit["warnings"].append(f"validate_structure failed: {e}")
+    try:
+        pbc = tuple(bool(x) for x in a.get_pbc())
+        audit["pbc"] = str(pbc)
+        audit["pbc_z"] = bool(pbc[2])
+    except Exception:
+        audit["pbc"] = "unknown"
+        audit["pbc_z"] = True
+    try:
+        layers = _cluster_z_layers_simple(a, tol=float(layer_tol))
+        audit["n_z_layers_clustered"] = int(len(layers))
+        if layers:
+            bottom_layer = layers[0]
+            top_layer = layers[-1]
+            audit["bottom_layer_atom_count"] = int(len(bottom_layer))
+            audit["top_layer_atom_count"] = int(len(top_layer))
+            audit["bottom_layer_formula"] = _counter_to_compact_formula(Counter(a[i].symbol for i in bottom_layer))
+            audit["top_layer_formula"] = _counter_to_compact_formula(Counter(a[i].symbol for i in top_layer))
+        else:
+            audit["bottom_layer_atom_count"] = 0
+            audit["top_layer_atom_count"] = 0
+            audit["bottom_layer_formula"] = ""
+            audit["top_layer_formula"] = ""
+    except Exception as e:
+        audit["n_z_layers_clustered"] = 0
+        audit["warnings"].append(f"z-layer clustering failed: {e}")
+    fixed_idx = _common_like_bottom_fix_indices(a, n_fix_layers=int(n_fix_layers), z_tol=float(z_tol))
+    audit["D2_partial_n_fix_layers"] = int(n_fix_layers)
+    audit["D2_partial_fixed_atom_count"] = int(len(fixed_idx))
+    audit["D2_partial_relaxed_atom_count"] = int(len(a) - len(fixed_idx))
+    audit["D2_partial_fixed_formula"] = _counter_to_compact_formula(Counter(a[i].symbol for i in fixed_idx))
+    audit["D2_partial_policy"] = "bottom_n_layers_fixed; upper_slab_and_H_relaxed"
+    vac_eff = audit.get("validate_vacuum_z_A", audit.get("estimated_vacuum_z_A", float("nan")))
+    if np.isfinite(vac_eff):
+        if bool(audit.get("pbc_z", True)) and float(vac_eff) < 8.0:
+            audit["hard_errors"].append(f"Vacuum is too small for adsorption screening (vacuum_z={vac_eff:.2f} Å).")
+        elif float(vac_eff) < 15.0:
+            audit["warnings"].append(f"Vacuum is below the recommended upload-slab audit threshold (vacuum_z={vac_eff:.2f} Å).")
+    if int(audit.get("D2_partial_fixed_atom_count", 0)) <= 0:
+        audit["hard_errors"].append("D2 partial relaxation would fix zero slab atoms; check z orientation/layering.")
+    if int(audit.get("D2_partial_relaxed_atom_count", 0)) <= 0:
+        audit["hard_errors"].append("D2 partial relaxation would leave no atoms free; check n_fix_layers/layering.")
+    if int(audit.get("n_z_layers_clustered", 0)) < max(3, int(n_fix_layers) + 1):
+        audit["warnings"].append("Few z-layers were detected; bottom-layer fixing may be poorly defined.")
+    return audit
+
+
+def _render_oxide_her_pre_run_audit(audit: dict, *, expanded: bool = False):
+    """Render the oxide HER D1/D2 input-slab audit in Streamlit."""
+    if not isinstance(audit, dict) or not audit:
+        return
+    with st.expander("Oxide HER D1/D2 pre-run slab audit", expanded=bool(expanded)):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Atoms", str(audit.get("n_atoms", "NA")))
+        c2.metric("Vacuum z", f"{_safe_float(audit.get('validate_vacuum_z_A', audit.get('estimated_vacuum_z_A', np.nan))):.2f} Å")
+        c3.metric("D2 fixed atoms", str(audit.get("D2_partial_fixed_atom_count", "NA")))
+        c4.metric("D2 relaxed atoms", str(audit.get("D2_partial_relaxed_atom_count", "NA")))
+        st.write(f"- Formula: **{audit.get('formula', '')}**")
+        st.write(f"- Top layer: **{audit.get('top_layer_formula', '')}**")
+        st.write(f"- Bottom layer: **{audit.get('bottom_layer_formula', '')}**")
+        st.write(f"- D2 policy: **{audit.get('D2_partial_policy', '')}**")
+        if audit.get("warnings"):
+            st.warning("; ".join(str(x) for x in audit.get("warnings", [])))
+        if audit.get("hard_errors"):
+            st.error("; ".join(str(x) for x in audit.get("hard_errors", [])))
+
+
+def _append_oxide_her_audit_columns(df: pd.DataFrame, audit: dict) -> pd.DataFrame:
+    """Attach scalar pre-run audit metadata to the result table."""
+    if not isinstance(df, pd.DataFrame) or not isinstance(audit, dict) or not audit:
+        return df
+    out = df.copy()
+    keys = [
+        "formula", "cell_z_A", "slab_thickness_z_A", "estimated_vacuum_z_A",
+        "validate_vacuum_z_A", "pbc", "pbc_z", "n_z_layers_clustered",
+        "top_layer_formula", "bottom_layer_formula", "D2_partial_n_fix_layers",
+        "D2_partial_fixed_atom_count", "D2_partial_relaxed_atom_count",
+        "D2_partial_fixed_formula", "D2_partial_policy",
+    ]
+    for key in keys:
+        if key in audit:
+            out[f"pre_run_{key}"] = audit.get(key)
+    out["pre_run_audit_warnings"] = "; ".join(str(x) for x in audit.get("warnings", []))
+    out["pre_run_audit_hard_errors"] = "; ".join(str(x) for x in audit.get("hard_errors", []))
+    return out
+
+
 def _surface_fraction_from_meta(meta: dict, side: str):
     if meta is None:
         return None
@@ -1404,7 +1560,17 @@ else:
                         st.success("Applied 2×2×1.")
                         st.rerun()
             else:
-                colR1, colR2, colR3 = st.columns(3)
+                st.caption("Uploaded or current slabs may be kept at their existing XY size. Expand only when the in-plane cell is too small for the intended screening.")
+                colR0, colR1, colR2, colR3 = st.columns(4)
+                with colR0:
+                    if st.button("Keep current XY and continue", key="btn_rep_keep_current_upload"):
+                        try:
+                            st.session_state["slab_reduction_base_atoms"] = prepared.copy()
+                        except Exception:
+                            pass
+                        st.session_state["surface_setup_stage"] = 3
+                        st.info("Kept current XY supercell without expansion.")
+                        st.rerun()
                 with colR1:
                     if st.button("2×2×1", key="btn_rep_221"):
                         a2 = repeat_xy(prepared, 2, 2)
@@ -1431,18 +1597,27 @@ else:
                     if st.button("Use auto recommendation", key="btn_rep_auto"):
                         rec = getattr(rep, "recommend_repeat", None)
                         if not rec:
-                            st.warning("No repeat recommendation available.")
+                            st.warning("No repeat recommendation available. Use 'Keep current XY and continue' if the uploaded slab size is intentional.")
                         else:
                             nx, ny, _nz = rec
-                            a2 = repeat_xy(prepared, int(nx), int(ny))
-                            _push_prepared_update(a2, "repeat_xy_auto", {"nx": int(nx), "ny": int(ny), "from": "validate_structure"})
-                            try:
-                                st.session_state["slab_reduction_base_atoms"] = a2.copy()
-                            except Exception:
-                                pass
-                            st.session_state["surface_setup_stage"] = 3
-                            st.success(f"Applied {int(nx)}×{int(ny)}×1.")
-                            st.rerun()
+                            if int(nx) == 1 and int(ny) == 1:
+                                try:
+                                    st.session_state["slab_reduction_base_atoms"] = prepared.copy()
+                                except Exception:
+                                    pass
+                                st.session_state["surface_setup_stage"] = 3
+                                st.info("Auto recommendation is 1×1×1. Kept current XY supercell.")
+                                st.rerun()
+                            else:
+                                a2 = repeat_xy(prepared, int(nx), int(ny))
+                                _push_prepared_update(a2, "repeat_xy_auto", {"nx": int(nx), "ny": int(ny), "from": "validate_structure"})
+                                try:
+                                    st.session_state["slab_reduction_base_atoms"] = a2.copy()
+                                except Exception:
+                                    pass
+                                st.session_state["surface_setup_stage"] = 3
+                                st.success(f"Applied {int(nx)}×{int(ny)}×1.")
+                                st.rerun()
             if st.button("← Back to vacuum", key="btn_back_stage2"):
                 st.session_state["surface_setup_stage"] = 1
                 st.rerun()
@@ -2107,10 +2282,10 @@ else:
     local_zpe_max_neighbors = 3
 
     # HER relaxation policy defaults.
-    # Metal HER path is preserved as-is.
-    # Oxide descriptor mode is routed through a descriptor-level policy,
-    # D2_react_only, which has the same top-level status as rigid/partial/full
-    # in CHE_mode.py but is interpreted only by the oxide descriptor workflow.
+    # Metal HER path is preserved as-is by the current app UI call path.
+    # Oxide descriptor mode uses an internal fixed policy:
+    #   D1 = constrained/rigid O-site OH descriptor handling
+    #   D2_Hreact = partial metal-cation-centered H* relaxation
     her_relaxation_scope = "partial" if (is_her and mtype == "metal") else "rigid"
     her_n_fix_layers = 2
 
@@ -2169,16 +2344,14 @@ else:
         st.caption("D3 / H₂ pairing proxy is disabled in the current app build. The code skeleton is retained only as commented legacy logic.")
 
         # Oxide HER descriptor relaxation is intentionally not user-selectable.
-        # A single UI-level relaxation control cannot describe both descriptor stages.
-        # D2_react_only is a descriptor-level policy with the same top-level status
-        # as rigid/partial/full, but it is valid only for oxide HER descriptor mode:
+        # A single UI-level relaxation control cannot describe both descriptor stages:
         #   D1 = constrained/rigid O-site OH descriptor handling
         #   D2_Hreact = partial metal-cation-centered H* relaxation
         # Metal HER behavior is handled by the metal branch and is not changed here.
-        her_relaxation_scope = "D2_react_only"
+        her_relaxation_scope = "rigid"
         her_n_fix_layers = 2
         st.caption(
-            "Oxide HER descriptor relaxation policy is fixed to D2_react_only: "
+            "Oxide HER descriptor relaxation policy is fixed internally: "
             "D1 uses constrained/rigid O-site OH handling; "
             "D2_Hreact uses partial metal-cation-centered H* relaxation. "
             "The metal HER workflow is unchanged."
@@ -2300,10 +2473,38 @@ else:
     else:
         st.warning("No prepared structure available yet. Complete Step 1–3 first.")
 
+    oxide_her_input_audit = None
+    if atoms_for_calc is not None and is_her and (mtype == "oxide"):
+        oxide_her_input_audit = _oxide_her_pre_run_audit(
+            atoms_for_calc,
+            n_fix_layers=int(her_n_fix_layers),
+        )
+        _render_oxide_her_pre_run_audit(oxide_her_input_audit, expanded=False)
+
     if st.button("Run Calculation", type="primary", key="btn_run_calc"):
         if atoms_for_calc is None:
             st.error("No prepared structure available.")
             st.stop()
+
+        if is_her and (mtype == "oxide"):
+            setup_stage = int(st.session_state.get("surface_setup_stage", 0))
+            if setup_stage < 4:
+                st.error(
+                    "Oxide HER D1/D2 calculation requires a reviewed prepared slab. "
+                    "Complete Step 2 through vacuum, XY-size review, and slab-reduction/review before running. "
+                    "This does not force slabify or XY expansion; uploaded Miller-index slabs can be kept at the current XY size after review."
+                )
+                st.stop()
+            oxide_her_input_audit = _oxide_her_pre_run_audit(
+                atoms_for_calc,
+                n_fix_layers=int(her_n_fix_layers),
+            )
+            if oxide_her_input_audit.get("hard_errors"):
+                st.error(
+                    "Prepared oxide slab failed the D1/D2 pre-run audit: "
+                    + "; ".join(str(x) for x in oxide_her_input_audit.get("hard_errors", []))
+                )
+                st.stop()
 
         seeds.fix_all(GLOBAL_SEED)
 
@@ -2339,6 +2540,19 @@ else:
 
         slab_path = uploads / "slab.cif"
         write(slab_path, atoms_for_calc_run, format="cif")
+
+        oxide_her_calc_audit = None
+        if is_her and (mtype == "oxide"):
+            oxide_her_calc_audit = _oxide_her_pre_run_audit(
+                atoms_for_calc_run,
+                n_fix_layers=int(her_n_fix_layers),
+            )
+            if oxide_her_calc_audit.get("hard_errors"):
+                st.error(
+                    "Final oxide slab failed the D1/D2 audit after optional pre-relax/conditioning: "
+                    + "; ".join(str(x) for x in oxide_her_calc_audit.get("hard_errors", []))
+                )
+                st.stop()
 
         if is_her and (mtype == "oxide") and final_user_sites:
             try:
@@ -2445,6 +2659,8 @@ else:
         if isinstance(df, pd.DataFrame) and (not df.empty):
             df["surfactant_class"] = str(surfactant_class)
             df["surfactant_chgnet_prerelax_slab"] = bool(surfactant_prerelax_slab)
+            if is_her and (mtype == "oxide") and isinstance(oxide_her_calc_audit, dict):
+                df = _append_oxide_her_audit_columns(df, oxide_her_calc_audit)
 
         mode_label = "HER" if is_her else ("ORR" if is_orr else "CO2RR")
 
@@ -2487,11 +2703,19 @@ else:
             df_rel, df_unrel = df_keep, df_reject
             migration_summary = summarize_site_transitions(df)
 
+        try:
+            if isinstance(df, pd.DataFrame):
+                df.to_csv(csv_path, index=False)
+        except Exception as _e:
+            st.warning(f"Could not write annotated result CSV: {_e}")
+
         # Persist results for rendering even after rerun (e.g., toggling UI options)
         if isinstance(meta, dict):
             meta = dict(meta)
             meta["SURFACTANT_CLASS"] = str(surfactant_class)
             meta["SURFACTANT_CHGNET_PRERELAX_SLAB"] = bool(surfactant_prerelax_slab)
+            if is_her and (mtype == "oxide") and isinstance(oxide_her_calc_audit, dict):
+                meta["OXIDE_HER_PRE_RUN_AUDIT"] = oxide_her_calc_audit
             if migration_summary is not None:
                 meta["MIGRATION_SUMMARY"] = migration_summary
 
