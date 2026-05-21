@@ -72,12 +72,6 @@ THREE_STAGE_OXIDE_HER_CAUTION = (
 DESCRIPTOR_D1_DISP_THRESH_A = 1.20
 DESCRIPTOR_D2_DISP_THRESH_A = 1.00
 
-# Descriptor-level relaxation policy. This is intentionally handled above
-# the low-level relax_freeH() engine: D2_react_only is not a fourth physical
-# relaxation engine; it means D1 stays constrained while D2_Hreact uses the
-# partial relaxation engine.
-D2_REACT_ONLY_SCOPE = "D2_react_only"
-
 # --- CO2RR adsorbate-specific constant shifts (ZPE + TΔS lumped) ---
 # Defaults used when thermo_CO2RR.json is missing or cannot be parsed
 DEFAULT_ADS_CORR: Dict[str, float] = {
@@ -812,23 +806,10 @@ def _run_her_che(
     if not target_sites:
         raise RuntimeError(f"No target adsorption sites were built for mtype='{mtype}'.")
 
-    raw_her_relaxation_scope = str(her_relaxation_scope).strip()
-    if raw_her_relaxation_scope == D2_REACT_ONLY_SCOPE:
-        if str(mtype).lower() != "oxide":
-            raise ValueError("D2_react_only is valid only for oxide HER descriptor mode.")
-        resolved_her_relaxation_scope = D2_REACT_ONLY_SCOPE
-    elif raw_her_relaxation_scope.lower() == "auto":
+    if str(her_relaxation_scope).strip().lower() == "auto":
         resolved_her_relaxation_scope = "rigid" if str(mtype).lower() == "oxide" else "partial"
     else:
-        resolved_her_relaxation_scope = normalize_relaxation_scope(raw_her_relaxation_scope)
-
-    # D2_react_only is a descriptor policy, not a low-level relaxation engine.
-    # Any legacy/guardrail calculation that still requires a physical engine
-    # receives a normal scope. Descriptor calculations receive the policy itself
-    # and interpret it in oxide_descriptor.py.
-    physical_her_relaxation_scope = (
-        "rigid" if resolved_her_relaxation_scope == D2_REACT_ONLY_SCOPE else resolved_her_relaxation_scope
-    )
+        resolved_her_relaxation_scope = normalize_relaxation_scope(her_relaxation_scope)
 
     # --- Optional HER guardrail (single-site; cheap) ---
     her_guard = None
@@ -847,7 +828,7 @@ def _run_her_che(
                 site_preference=str(her_site_preference),
                 use_net_corr=bool(her_use_net_corr),
                 out_cif=out_cif_g,
-                relaxation_scope=physical_her_relaxation_scope,
+                relaxation_scope=resolved_her_relaxation_scope,
                 n_fix_layers=int(her_n_fix_layers),
             )
             if her_guard is not None:
@@ -868,12 +849,6 @@ def _run_her_che(
         and str(oxide_descriptor_mode) != "Basic HER screening"
     )
 
-    if resolved_her_relaxation_scope == D2_REACT_ONLY_SCOPE and not descriptor_primary_results:
-        raise ValueError(
-            "D2_react_only is only valid for oxide HER descriptor-primary mode; "
-            "use rigid/partial/full for basic HER screening."
-        )
-
     if descriptor_primary_results:
         # Oxide descriptor mode is now D2-primary.  The legacy O-anchor HER
         # candidate loop is intentionally skipped, so anion_ontop rows do not
@@ -893,12 +868,16 @@ def _run_her_che(
                 descriptor_mode=str(oxide_descriptor_mode),
                 max_reactive_per_kind=int(oxide_descriptor_max_reactive_per_kind),
                 pair_limit=int(oxide_descriptor_pair_limit),
-                # Descriptor-level policy with the same top-level status as
-                # rigid/partial/full. oxide_descriptor.py interprets this as:
-                #   D1 = constrained/rigid O-site OH descriptor
-                #   D2_Hreact = partial metal-cation-centered H* descriptor
-                relaxation_scope=D2_REACT_ONLY_SCOPE,
+                # Fixed oxide-descriptor policy:
+                # D1 remains constrained/rigid; D2_Hreact is forced to partial
+                # inside oxide_descriptor.py. Passing "rigid" here prevents
+                # legacy UI selections from changing oxide descriptor semantics.
+                relaxation_scope="rigid",
                 n_fix_layers=int(her_n_fix_layers),
+                thermo_mode=str(thermo_mode),
+                local_zpe_cutoff=float(local_zpe_cutoff),
+                local_zpe_max_neighbors=int(local_zpe_max_neighbors),
+                standard_che_corr=float(STANDARD_CHE_CORR),
             )
         except Exception as e:
             oxide_descriptor_summary = {
@@ -925,9 +904,13 @@ def _run_her_che(
                 "binding_class": "unresolved",
                 "D2_descriptor_valid": False,
                 "D2_selection_rule": "min_abs_deltaG_among_valid_metal_centered_Hstar",
+                "thermo_mode": str(thermo_mode),
                 "ΔG_H_CHE (eV)": np.nan,
+                "ΔG_H_local (eV)": np.nan,
                 "ΔG_H (eV)": np.nan,
                 "ΔE_H_user (eV)": np.nan,
+                "local_thermo_corr (eV)": np.nan,
+                "local_zpe_status": "not_available",
                 "H_lateral_disp(Å)": np.nan,
                 "is_duplicate": False,
                 "qc_flags": str((oxide_descriptor_summary or {}).get("error", "D2_primary_result_unavailable")),
@@ -942,7 +925,6 @@ def _run_her_che(
             "relax_mode": relax_mode,
             "steps": {"slab": slab_steps, "H": z_steps, "H2": h2_steps},
             "HER_RELAXATION_SCOPE": str(resolved_her_relaxation_scope),
-            "HER_PHYSICAL_RELAXATION_SCOPE": str(physical_her_relaxation_scope),
             "HER_N_FIX_LAYERS": int(her_n_fix_layers),
             "thermo": {"NET_CORR": net_corr, "standard": f"{STANDARD_CHE_CORR:.2f} eV"},
             "E_H2": E_H2,
@@ -1176,6 +1158,10 @@ def _run_her_che(
                 pair_limit=int(oxide_descriptor_pair_limit),
                 relaxation_scope=str(resolved_her_relaxation_scope),
                 n_fix_layers=int(her_n_fix_layers),
+                thermo_mode=str(thermo_mode),
+                local_zpe_cutoff=float(local_zpe_cutoff),
+                local_zpe_max_neighbors=int(local_zpe_max_neighbors),
+                standard_che_corr=float(STANDARD_CHE_CORR),
             )
         except Exception as e:
             oxide_descriptor_summary = {'error': str(e), 'descriptor_mode': str(oxide_descriptor_mode)}
@@ -1196,8 +1182,7 @@ def _run_her_che(
         "steps": {"slab": slab_steps, "H": z_steps, "H2": h2_steps},
         "HER_RELAXATION_SCOPE": str(resolved_her_relaxation_scope),
         "HER_N_FIX_LAYERS": int(her_n_fix_layers),
-        "OXIDE_DESCRIPTOR_RELAXATION_POLICY": "D2_react_only",
-        "OXIDE_DESCRIPTOR_POLICY_DETAILS": "D1=constrained/rigid O-site OH; D2_Hreact=partial metal-cation-centered H*",
+        "OXIDE_DESCRIPTOR_RELAXATION_POLICY": "D1=constrained/rigid O-site OH; D2_Hreact=partial metal-cation-centered H*",
         "thermo": {"NET_CORR": net_corr, "standard": f"{STANDARD_CHE_CORR:.2f} eV"},
         "E_H2": E_H2,
         "HER_GUARDRAIL": her_guard,
@@ -1653,13 +1638,11 @@ def _fmt_surface_indices(indices: object) -> str:
 def _oxide_d2_summary_to_primary_results_df(summary: Optional[dict], *, net_corr: float = STANDARD_CHE_CORR) -> pd.DataFrame:
     """Build the user-facing oxide HER result table from the selected D2 descriptor.
 
-    This is intentionally used only for oxide descriptor modes. It prevents the
-    legacy O-anchor/anion_ontop HER rows from becoming the primary oxide result
-    table when the requested workflow is the metal-cation-centered D2 descriptor.
-
-    The full D2 candidate audit table remains available through
-    ``summary['D2_candidates_csv']``. The returned DataFrame contains only the
-    selected D2 representative row.
+    Local-ZPE-aware version.  The selected D2 candidate row is treated as the
+    source of truth when available.  If the oxide descriptor module produced
+    ΔG_H_local, local_thermo_corr, and local_zpe_status columns, they are kept
+    in the primary HER table instead of being silently collapsed back to the
+    standard CHE value.
     """
     if not isinstance(summary, dict) or not summary:
         return pd.DataFrame()
@@ -1701,10 +1684,28 @@ def _oxide_d2_summary_to_primary_results_df(summary: Optional[dict], *, net_corr
             return selected.get(key)
         return summary.get(key, fallback)
 
+    # Prefer the actual selected descriptor value.  If local ZPE was requested
+    # and succeeded, oxide_descriptor.py should already have made ΔG_H use the
+    # local-corrected value.
     dG = _safe_float(_get("ΔG_H (eV)", summary.get("D2_Hreact (eV)", np.nan)))
+    dG_che = _safe_float(_get("ΔG_H_CHE (eV)", summary.get("D2_Hreact_CHE (eV)", np.nan)))
+    dG_local = _safe_float(_get("ΔG_H_local (eV)", summary.get("D2_Hreact_local (eV)", np.nan)))
     dE = _safe_float(_get("ΔE_H_user (eV)", np.nan))
+
+    if not np.isfinite(dG) and np.isfinite(dG_local):
+        dG = dG_local
+    if not np.isfinite(dG) and np.isfinite(dG_che):
+        dG = dG_che
+    if not np.isfinite(dG_che) and np.isfinite(dE):
+        dG_che = float(dE) + float(net_corr)
+    if not np.isfinite(dE) and np.isfinite(dG_che):
+        dE = float(dG_che) - float(net_corr)
     if not np.isfinite(dE) and np.isfinite(dG):
         dE = float(dG) - float(net_corr)
+
+    thermo_mode_val = str(_get("thermo_mode", summary.get("D2_thermo_mode", summary.get("thermo_mode", "CHE correction (fast screening)"))))
+    local_corr = _safe_float(_get("local_thermo_corr (eV)", summary.get("D2_local_thermo_corr (eV)", np.nan)))
+    local_status = str(_get("local_zpe_status", summary.get("D2_local_zpe_status", "not_requested")) or "not_requested")
 
     site_kind = str(_get("site_kind", summary.get("D2_binding_class", "metal_centered_Hstar")) or "metal_centered_Hstar")
     final_kind = str(_get("final_site_kind", summary.get("D2_final_site_kind", site_kind)) or site_kind)
@@ -1721,10 +1722,8 @@ def _oxide_d2_summary_to_primary_results_df(summary: Optional[dict], *, net_corr
         "result_role": "oxide_D2_primary",
         "descriptor": "D2",
         "D2_policy": "surface_metal_cation_centered_Hstar",
-        "oxide_descriptor_relaxation_policy": str(summary.get("descriptor_relaxation_policy", "D2_react_only")),
+        "oxide_descriptor_relaxation_policy": "D1=constrained/rigid; D2_Hreact=partial",
         "D1_relaxation_policy": str(summary.get("D1_fixed_relaxation_policy", "anchor_oh_hookean_preOH")),
-        "D2_relaxation_policy": str(summary.get("D2_fixed_relaxation_policy", "D2_react_only")),
-        "D2_underlying_relaxation_scope": str(summary.get("D2_underlying_relaxation_scope", "partial")),
         "D2_relaxation_scope": str(summary.get("D2_relaxation_scope", summary.get("D2_fixed_relaxation_scope", "partial"))),
         "site": site_kind,
         "site_label": label,
@@ -1744,9 +1743,17 @@ def _oxide_d2_summary_to_primary_results_df(summary: Optional[dict], *, net_corr
         "actual_migration_path": f"{site_kind} -> {final_kind}",
         "site_transition_type": "stable" if (np.isfinite(disp) and disp <= MIGRATE_THR) else "relaxed_D2_state",
         "structure_cif": cif,
-        "thermo_mode": "CHE correction (fast screening)",
-        "ΔG_H_CHE (eV)": dG,
+        "thermo_mode": thermo_mode_val,
+        "ΔG_H_CHE (eV)": dG_che,
+        "ΔG_H_local (eV)": dG_local,
         "ΔG_H (eV)": dG,
+        "local_thermo_corr (eV)": local_corr,
+        "local_delta_zpe_eV": _safe_float(_get("local_delta_zpe_eV", np.nan)),
+        "local_delta_ts_eV": _safe_float(_get("local_delta_ts_eV", np.nan)),
+        "local_zpe_status": local_status,
+        "local_zpe_n_vib_atoms": int(_safe_float(_get("local_zpe_n_vib_atoms", 0), 0.0)),
+        "local_zpe_warnings": str(_get("local_zpe_warnings", summary.get("D2_local_zpe_warnings", "")) or ""),
+        "local_zpe_error": str(_get("local_zpe_error", summary.get("D2_local_zpe_error", "")) or ""),
         "ΔE_H_user (eV)": dE,
         "ΔE_H (eV)": dE,
         "abs_ΔG_H (eV)": abs(dG) if np.isfinite(dG) else np.nan,
@@ -1759,7 +1766,6 @@ def _oxide_d2_summary_to_primary_results_df(summary: Optional[dict], *, net_corr
         "nearest_anion_distance(Å)": _safe_float(summary.get("D2_nearest_anion_distance(Å)", _get("nearest_anion_distance(Å)", np.nan))),
     }
     return pd.DataFrame([row])
-
 
 def _mic_xy_delta(cell, pbc, xy0: np.ndarray, xy1: np.ndarray) -> tuple[np.ndarray, float]:
     xy0 = np.asarray(xy0, dtype=float).reshape(2)
