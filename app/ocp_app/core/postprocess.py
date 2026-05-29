@@ -45,6 +45,9 @@ def _normalize_site_name_series(s: pd.Series) -> pd.Series:
         "fcc": "fcc",
         "bridge": "bridge",
         "br": "bridge",
+        "oer": "oer_cation",
+        "cation": "oer_cation",
+        "oer_cation": "oer_cation",
         "unknown": "unknown",
         "nan": "unknown",
         "none": "unknown",
@@ -58,8 +61,16 @@ def _requested_site_from_label(df: pd.DataFrame) -> pd.Series:
         return _normalize_site_name_series(_string_series(df, "requested_site", default="unknown"))
     if "site_label" in df.columns:
         raw = _string_series(df, "site_label", default="unknown")
-        base = raw.astype(str).str.split("_").str[0]
-        return _normalize_site_name_series(base)
+        raw_s = raw.astype(str).str.strip().str.lower()
+        # OER oxide labels are intentionally prefixed with oer_cation_... .
+        # Splitting on the first underscore would produce requested_site='oer',
+        # which creates a false placement_mismatch against initial_geom_site='oer_cation'.
+        out = pd.Series("unknown", index=df.index, dtype="object")
+        mask_oer = raw_s.str.startswith("oer_cation") | raw_s.str.startswith("cation_")
+        out.loc[mask_oer] = "oer_cation"
+        mask_rest = ~mask_oer
+        out.loc[mask_rest] = raw_s.loc[mask_rest].str.split("_").str[0]
+        return _normalize_site_name_series(out)
     if "site" in df.columns:
         return _normalize_site_name_series(_string_series(df, "site", default="unknown"))
     return pd.Series(["unknown"] * len(df), index=df.index, dtype="object")
@@ -119,6 +130,15 @@ def annotate_site_transitions(df: pd.DataFrame, disp_thresh: float = 0.8) -> pd.
             mask_bad = out["relaxed_site"].isin(["", "unknown"])
             out.loc[mask_bad, "relaxed_site"] = relaxed_site.loc[mask_bad]
             relaxed_site = _normalize_site_name_series(out["relaxed_site"])
+
+    # OER oxide taxonomy: cation/oer_cation naming differences are not
+    # physical migration. Normalize the requested label to the OER site family
+    # when the initial/final classifiers identify an oer_cation basin.
+    try:
+        oer_like = initial_geom_site.eq("oer_cation") | relaxed_site.eq("oer_cation")
+        requested_site.loc[oer_like & requested_site.isin(["oer", "cation", "unknown", ""]) ] = "oer_cation"
+    except Exception:
+        pass
 
     # Invalid/final-unknown handling
     final_valid = ~relaxed_site.isin(["", "unknown", "nan", "none"])
@@ -279,6 +299,102 @@ def co2rr_split_by_qa(df: pd.DataFrame):
     keep_mask = qa.isin(["ok", "migrated"])
     return df[keep_mask].copy(), df[~keep_mask].copy()
 
+
+def oxygen_apply_qa_policy(df: pd.DataFrame, disp_thresh: float = 0.8) -> pd.DataFrame:
+    """QA policy for OER oxygen-intermediate rows.
+
+    Unlike CO2RR, a plain `migrated` oxygen intermediate is not automatically
+    accepted.  It is accepted only when the engine marked it as a bound oxygen
+    adsorbate (`valid_for_oer_summary=True`), in which case the normalized
+    status is `bound_relaxed` when the OER cation site remains stable, or `bound_migrated` when a genuine site change is detected.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = co2rr_apply_qa_policy(df, disp_thresh=disp_thresh).copy()
+    qa = _normalize_text_series(out["qa"]) if "qa" in out.columns else pd.Series("ok", index=out.index)
+
+    if "valid_for_oer_summary" in out.columns:
+        valid = out["valid_for_oer_summary"].astype(str).str.lower().isin(["true", "1", "yes"])
+    else:
+        valid = qa.eq("ok")
+
+    # Channel-level hard rejects for AEM OER summaries.
+    if "surface_channel" in out.columns:
+        bad_ch = {
+            "protonated_lattice_oxygen",
+            "anion_o",
+            "lattice_protonation_disabled_for_aem",
+            "fallback_site",
+        }
+        ch = out["surface_channel"].astype(str).str.strip().str.lower()
+        qa.loc[ch.isin(bad_ch)] = "invalid_oer_channel"
+        valid.loc[ch.isin(bad_ch)] = False
+
+    # Detached/broken/crashed states remain rejected.
+    for col in ("oer_state_class", "qa"):
+        if col in out.columns:
+            s = out[col].astype(str).str.lower()
+            bad = s.str.contains("detached|broken|crashed|invalid|fallback", regex=True)
+            valid.loc[bad] = False
+            qa.loc[bad & qa.isin(["ok", "migrated", "bound_migrated"])] = s.loc[bad]
+
+    mig = out["migrated"].astype(bool) if "migrated" in out.columns else pd.Series(False, index=out.index)
+
+    # v16 OER cation-bound label refinement.  If an oxygen intermediate remains
+    # cation-bound and site tracking says the oer_cation basin is stable, do not
+    # treat lateral relaxation alone as physical migration.
+    def _bool_col(name, default=False):
+        if name not in out.columns:
+            return pd.Series([default] * len(out), index=out.index)
+        return out[name].astype(str).str.lower().isin(["true", "1", "yes"])
+
+    stable_oer_cation = pd.Series(False, index=out.index)
+    if len(out) > 0:
+        oxygen_bound = _bool_col("oxygen_bound_to_cation", default=False)
+        stable_transition = (
+            out["site_transition_type"].astype(str).str.lower().eq("stable")
+            if "site_transition_type" in out.columns else pd.Series(False, index=out.index)
+        )
+        actual_migration = _bool_col("migrated_actual", default=False)
+        site_family_ok = (
+            out["site_family"].astype(str).str.lower().eq("oxide_oer_cation")
+            if "site_family" in out.columns else pd.Series(True, index=out.index)
+        )
+        init_ok = (
+            out["initial_geom_site"].astype(str).str.lower().eq("oer_cation")
+            if "initial_geom_site" in out.columns else pd.Series(True, index=out.index)
+        )
+        final_ok = (
+            out["relaxed_site"].astype(str).str.lower().eq("oer_cation")
+            if "relaxed_site" in out.columns else pd.Series(True, index=out.index)
+        )
+        stable_oer_cation = valid & oxygen_bound & stable_transition & (~actual_migration) & site_family_ok & init_ok & final_ok
+
+    qa.loc[stable_oer_cation] = "bound_relaxed"
+    mig.loc[stable_oer_cation] = False
+    qa.loc[(~stable_oer_cation) & mig & valid] = "bound_migrated"
+    qa.loc[mig & (~valid) & qa.eq("migrated")] = "migrated_rejected"
+
+    out["migrated"] = mig
+    out["qa"] = qa
+    out["valid_for_oer_summary"] = valid
+    return out
+
+
+def oxygen_split_by_qa(df: pd.DataFrame):
+    """Split OER rows into valid candidates and rejected attempts."""
+    if df is None or df.empty:
+        return df, df
+    out = oxygen_apply_qa_policy(df)
+    qa = _normalize_text_series(out["qa"]) if "qa" in out.columns else pd.Series("ok", index=out.index)
+    keep = qa.isin(["ok", "bound_relaxed", "bound_migrated"])
+    if "valid_for_oer_summary" in out.columns:
+        valid = out["valid_for_oer_summary"].astype(str).str.lower().isin(["true", "1", "yes"])
+        keep &= valid
+    return out[keep].copy(), out[~keep].copy()
+
+
 def co2rr_dedupe_candidates(df_keep: pd.DataFrame) -> pd.DataFrame:
     """Deduplicate CO2RR candidates by (adsorbate, relaxed_site) keeping the best (lowest) energy row."""
     if df_keep is None or df_keep.empty:
@@ -356,8 +472,24 @@ def build_compact_table(df, mode: str):
             "site_transition_type",
             "oxide_seed_mode",
             "surface_channel",
+            "oer_base_site_label",
+            "oer_start_height_A",
             "adsorbate",
             "qa",
+            "oer_state_class",
+            "oer_state_note",
+            "valid_for_oer_summary",
+            "oxygen_ads_bound",
+            "oxygen_bound_to_cation",
+            "oxygen_nearest_slab_symbol",
+            "oxygen_anchor_slab_dist(Å)",
+            "oxygen_anchor_cation_dist(Å)",
+            "oxygen_anchor_target_cation_dist(Å)",
+            "oxygen_anchor_target_cation_index",
+            "oxygen_anchor_target_cation_symbol",
+            "oxygen_anchor_anion_dist(Å)",
+            "oxygen_internal_bond_ok",
+            "oxygen_surface_bond_ok",
             "ΔG_ads (eV)",
             "ΔE_ads_user (eV)",
             "ΔE_raw(slab+ads - slab) (eV)",

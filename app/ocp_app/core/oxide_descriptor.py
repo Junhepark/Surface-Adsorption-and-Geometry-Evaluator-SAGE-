@@ -30,6 +30,12 @@ from ocp_app.core.anchors.common import (
 )
 
 from ocp_app.core.anchors.local_zpe import compute_local_h_thermo_correction
+from ocp_app.core.anchors.oxide_interface_her import (
+    generate_interface_metal_bridge_targets,
+    classify_final_h_metal_environment,
+    summarize_d2_bridge_distribution,
+    bridge_distribution_summary_for_global_row,
+)
 
 THREE_STAGE_OXIDE_HER_CAUTION = (
     "Caution: In the current oxide workflow, D1 is treated as a contextual O-top protonation probe, "
@@ -486,13 +492,35 @@ def _pick_descriptor_seed_row(
 
 
 def _build_reactive_h_targets_oxide(slab_u_rel, max_per_kind: int = 2) -> list[dict[str, object]]:
-    """Build oxide-D2 targets on exposed surface metal cations.
+    """Build oxide-D2 targets.
 
-    D2 is deliberately separated from D1.  D1 uses O-top/OH anchoring, while
-    D2 samples metal-cation-centered H* basins.  The AdsSite objects are still
-    generated from the existing oxide top-cation layer detector, but the seed
-    labels and anchor coordinates are converted to D2-specific metadata here.
+    Priority is now:
+      1. interface-resolved metal bridge targets, e.g., Cu-Ni / Cu-Cu / Ni-Ni
+      2. legacy generic oxide surface-cation targets as fallback
+
+    This keeps the existing SAGE D2 execution path intact while adding
+    local-environment-resolved mixed-oxide/interface screening.
     """
+    try:
+        interface_targets = generate_interface_metal_bridge_targets(
+            slab_u_rel,
+            max_per_pair=max(1, int(max_per_kind)),
+            z_window=3.2,
+            min_mm_dist=2.0,
+            max_mm_dist=3.9,
+            max_pair_dz=2.2,
+            local_cutoff=3.5,
+            frac_margin=0.04,
+            prefer_mixed_pairs=True,
+        )
+    except Exception:
+        interface_targets = []
+
+    if interface_targets:
+        return interface_targets
+
+    # Fallback for ordinary single-metal oxides or structures where the
+    # interface bridge generator cannot find valid metal-pair targets.
     try:
         auto_sites = detect_oxide_surface_sites(slab_u_rel, max_sites_per_kind=200, z_tol=1.2)
         rep_sites = select_representative_sites(auto_sites, per_kind=max(1, int(max_per_kind)))
@@ -509,8 +537,6 @@ def _build_reactive_h_targets_oxide(slab_u_rel, max_per_kind: int = 2) -> list[d
             return np.mean(pos_all[np.asarray(metal_idx, dtype=int), :3], axis=0)
         p = np.asarray(getattr(site, 'position', [np.nan, np.nan, np.nan]), dtype=float).reshape(-1)
         if p.size >= 3 and np.isfinite(p[:3]).all():
-            # site.position includes the display/seed height.  For D2 anchoring, use
-            # the nearest top cation z instead when possible.
             xy = p[:2]
             metals = _metal_indices(slab_u_rel)
             if len(metals) > 0:
@@ -558,8 +584,10 @@ def _build_reactive_h_targets_oxide(slab_u_rel, max_per_kind: int = 2) -> list[d
             'initial_xyz': np.asarray([anchor_xyz[0], anchor_xyz[1], anchor_xyz[2]], dtype=float),
             'surface_indices': surf_idx,
             'surface_metal_symbols': ','.join(metal_symbols),
-            'seed_source': 'oxide_D2_surface_metal_cation',
-            'D2_policy': 'surface_metal_cation_centered_Hstar',
+            'seed_source': 'oxide_D2_surface_metal_cation_fallback',
+            'D2_policy': 'surface_metal_cation_centered_Hstar_fallback',
+            'initial_bridge_pair': 'NA',
+            'initial_interface_like': False,
         })
     return targets
 
@@ -699,7 +727,10 @@ def _classify_d2_metal_centered_state(relaxed_atoms, h_index: int = -1) -> dict[
         final_site_kind = 'unresolved'
         qc_flags.append('unresolved_final_state')
 
+    bridge_env = classify_final_h_metal_environment(relaxed_atoms, h_index=int(h_index), metal_cutoff=D2_METAL_BIND_MAX_A, local_cutoff=3.5)
+
     return {
+        **bridge_env,
         'binding_class': binding_class,
         'final_site_kind': final_site_kind,
         'descriptor_valid': bool(descriptor_valid),
@@ -1064,6 +1095,19 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
     row = {
         'stage': 'D2_metal_cation_Hstar',
         'D2_policy': str(site_seed.get('D2_policy', 'surface_metal_cation_centered_Hstar')),
+        'initial_bridge_pair': str(site_seed.get('initial_bridge_pair', 'NA')),
+        'initial_bridge_metal_1': str(site_seed.get('initial_bridge_metal_1', site_seed.get('initial_bridge_metal_1', 'NA'))),
+        'initial_bridge_metal_2': str(site_seed.get('initial_bridge_metal_2', site_seed.get('initial_bridge_metal_2', 'NA'))),
+        'initial_bridge_index_1': int(_safe_float(site_seed.get('initial_bridge_index_1', -1), -1)),
+        'initial_bridge_index_2': int(_safe_float(site_seed.get('initial_bridge_index_2', -1), -1)),
+        'initial_bridge_indices': str(site_seed.get('initial_bridge_indices', '')),
+        'initial_M1_M2_distance(Å)': _safe_float(site_seed.get('initial_M1_M2_distance(Å)', np.nan)),
+        'initial_pair_dz(Å)': _safe_float(site_seed.get('initial_pair_dz(Å)', np.nan)),
+        'initial_interface_like': bool(site_seed.get('initial_interface_like', False)),
+        'initial_local_Cu_fraction': _safe_float(site_seed.get('initial_local_Cu_fraction', np.nan)),
+        'initial_local_Ni_fraction': _safe_float(site_seed.get('initial_local_Ni_fraction', np.nan)),
+        'initial_local_Co_fraction': _safe_float(site_seed.get('initial_local_Co_fraction', np.nan)),
+        'initial_local_metal_count': int(_safe_float(site_seed.get('initial_local_metal_count', 0), 0)),
         'site_label': label,
         'site_kind': kind,
         'raw_site_kind': str(site_seed.get('raw_site_kind', kind)),
@@ -1085,6 +1129,21 @@ def _evaluate_single_h_descriptor(*, slab_u_rel, E_slab_u: float, E_H2: float, s
         'binding_class': binding_class,
         'D2_binding_class': binding_class,
         'final_site_kind': final_site_kind,
+        'final_bridge_pair': str(d2_state.get('final_bridge_pair', 'NA')),
+        'final_bridge_kind': str(d2_state.get('final_bridge_kind', 'NA')),
+        'final_bridge_metal_1': str(d2_state.get('final_bridge_metal_1', 'NA')),
+        'final_bridge_metal_2': str(d2_state.get('final_bridge_metal_2', 'NA')),
+        'final_bridge_index_1': int(d2_state.get('final_bridge_index_1', -1)),
+        'final_bridge_index_2': int(d2_state.get('final_bridge_index_2', -1)),
+        'final_bridge_indices': str(d2_state.get('final_bridge_indices', '')),
+        'final_M1_M2_distance(Å)': _safe_float(d2_state.get('final_M1_M2_distance(Å)', np.nan)),
+        'final_H_M1_distance(Å)': _safe_float(d2_state.get('final_H_M1_distance(Å)', np.nan)),
+        'final_H_M2_distance(Å)': _safe_float(d2_state.get('final_H_M2_distance(Å)', np.nan)),
+        'final_interface_like': bool(d2_state.get('final_interface_like', False)),
+        'final_local_Cu_fraction': _safe_float(d2_state.get('final_local_Cu_fraction', np.nan)),
+        'final_local_Ni_fraction': _safe_float(d2_state.get('final_local_Ni_fraction', np.nan)),
+        'final_local_Co_fraction': _safe_float(d2_state.get('final_local_Co_fraction', np.nan)),
+        'final_local_metal_count': int(_safe_float(d2_state.get('final_local_metal_count', 0), 0)),
         'descriptor_valid': descriptor_valid,
         'D2_descriptor_valid': descriptor_valid,
         'qc_flags': ';'.join(qc_flags),
@@ -1353,6 +1412,7 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
         'D2_relaxation_scope': '', 'D2_total_relax_n_steps': 0, 'D2_fine_relax_relaxed_atoms': 0,
         'D2_same_basin_as_D1': False, 'D2_basin_note': '',
         'D2_candidates_csv': '', 'D2_target_count': 0, 'D2_abs_Hreact (eV)': np.nan, 'D2_selection_rule': '',
+        'D2_bridge_distribution_csv': '', 'D2_primary_bridge_pair': 'NA', 'D2_bridge_pair_classes': '',
         'D2_final_site_kind': 'NA', 'D2_nearest_metal_symbol': 'NA', 'D2_nearest_metal_distance(Å)': np.nan,
         'D2_nearest_anion_symbol': 'NA', 'D2_nearest_anion_distance(Å)': np.nan, 'D2_qc_flags': '',
         'D3_pair_proxy (eV)': np.nan, 'D3_pair_label': 'NA',
@@ -1537,6 +1597,21 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
             if not d2_df.empty:
                 d2_df.to_csv(d2_csv, index=False)
                 summary['D2_candidates_csv'] = str(d2_csv.resolve())
+                try:
+                    dist_df = summarize_d2_bridge_distribution(
+                        d2_df,
+                        energy_col='ΔG_H (eV)',
+                        pair_col='final_bridge_pair',
+                        validity_col='D2_descriptor_valid',
+                        near_zero_window=0.30,
+                    )
+                    if dist_df is not None and not dist_df.empty:
+                        dist_csv = stage_dir / 'D2_bridge_distribution.csv'
+                        dist_df.to_csv(dist_csv, index=False)
+                        summary['D2_bridge_distribution_csv'] = str(dist_csv.resolve())
+                        summary.update(bridge_distribution_summary_for_global_row(dist_df, near_zero_window=0.30))
+                except Exception as dist_e:
+                    summary['D2_bridge_distribution_error'] = str(dist_e)
 
             energy_col = 'ΔG_H (eV)' if 'ΔG_H (eV)' in d2_df.columns else ('ΔG (eV)' if 'ΔG (eV)' in d2_df.columns else None)
             if not d2_df.empty and energy_col is not None:
@@ -1555,6 +1630,12 @@ def run_oxide_descriptor_profile(*, slab_u_rel, E_slab_u: float, E_H2: float,
                     summary['D2_abs_Hreact (eV)'] = abs(_safe_float(d2_best.get(energy_col)))
                     summary['D2_selection_rule'] = 'min_abs_deltaG_among_valid_metal_centered_Hstar'
                     summary['D2_site_label'] = str(d2_best.get('site_label', d2_best.get('site', 'unknown')))
+                    summary['D2_initial_bridge_pair'] = str(d2_best.get('initial_bridge_pair', 'NA'))
+                    summary['D2_final_bridge_pair'] = str(d2_best.get('final_bridge_pair', 'NA'))
+                    summary['D2_initial_interface_like'] = bool(d2_best.get('initial_interface_like', False))
+                    summary['D2_final_interface_like'] = bool(d2_best.get('final_interface_like', False))
+                    summary['D2_initial_local_Cu_fraction'] = _safe_float(d2_best.get('initial_local_Cu_fraction', np.nan))
+                    summary['D2_final_local_Cu_fraction'] = _safe_float(d2_best.get('final_local_Cu_fraction', np.nan))
                     summary['D2_binding_class'] = str(d2_best.get('D2_binding_class', d2_best.get('binding_class', d2_best.get('site_kind', 'unknown'))))
                     summary['D2_final_site_kind'] = str(d2_best.get('final_site_kind', summary['D2_binding_class']))
                     summary['D2_structure_cif'] = str(d2_best.get('structure_cif', ''))

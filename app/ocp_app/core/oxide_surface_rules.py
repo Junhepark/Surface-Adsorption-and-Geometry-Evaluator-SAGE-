@@ -466,6 +466,240 @@ def _oxide_mode_keep_candidate(meta, mode: str):
     return usability in ("reference_use", "exploratory_only")
 
 
+
+
+# =============================================================================
+# OER AEM cation-exposed oxide slab suitability
+# =============================================================================
+
+_OER_AEM_ANIONS = {"O", "N", "F", "Cl", "S", "Br", "I"}
+
+
+def _oxide_oer_local_open_direction(atoms, cation_index: int, *, neighbor_cutoff: float = 2.75, upward_bias: float = 1.35):
+    """Estimate a vacuum-facing, O-crowding-avoiding direction from a surface cation.
+
+    This helper is used only for OER slab suitability/ranking. It does not alter
+    HER oxide O-anchor logic. The vector is biased upward and away from nearby
+    lattice anions, so it approximates the missing-ligand direction of an
+    exposed cation such as Ir_cus on rutile IrO2(110).
+    """
+    try:
+        pos = np.asarray(atoms.get_positions(), dtype=float)
+        sym = atoms.get_chemical_symbols()
+        ci = int(cation_index)
+        if ci < 0 or ci >= len(pos):
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        cpos = pos[ci]
+        vec = np.array([0.0, 0.0, float(upward_bias)], dtype=float)
+        for j, sj in enumerate(sym):
+            if sj not in _OER_AEM_ANIONS:
+                continue
+            r = cpos - pos[j]
+            d = float(np.linalg.norm(r))
+            if not np.isfinite(d) or d < 1e-8 or d > float(neighbor_cutoff):
+                continue
+            # Nearby anions and anions at similar z crowd the cation site most.
+            zfac = 1.0 + max(0.0, 1.25 - abs(float(pos[j, 2]) - float(cpos[2])))
+            vec += (r / d) * (zfac / max(d, 0.75))
+        if vec[2] < 0.20:
+            vec[2] = 0.20
+        n = float(np.linalg.norm(vec))
+        if not np.isfinite(n) or n < 1e-10:
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        return vec / n
+    except Exception:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+
+
+def _oxide_oer_cation_metrics(atoms, *, top_window: float = 1.80, cation_window_from_top: float = 2.40, o_coord_cutoff: float = 2.45):
+    """Compute cation-exposed AEM-OER slab metrics without modifying the slab."""
+    out = {
+        "oer_slab_role": "OER_AEM_cation",
+        "oer_top_cation_count": 0,
+        "oer_top_anion_count": 0,
+        "oer_top_cation_symbols": "",
+        "oer_surface_O_fraction_top": float("nan"),
+        "oer_candidate_cation_indices": "",
+        "oer_candidate_cation_symbols": "",
+        "oer_best_cation_index": None,
+        "oer_best_cation_symbol": "",
+        "oer_best_cation_coordination": None,
+        "oer_best_cation_z_depth_A": float("nan"),
+        "oer_best_open_direction_z": float("nan"),
+        "oer_best_o_crowding_min_OO_A": float("nan"),
+        "oer_best_site_score": 0.0,
+        "oer_cation_exposure_score": 0.0,
+        "oer_o_crowding_penalty": 1.0,
+        "oer_slab_score": 0.0,
+        "oer_slab_suitability": "OER-not-suitable",
+        "oer_slab_warning": "",
+        "oer_slab_notes": [],
+    }
+    if atoms is None or len(atoms) == 0:
+        out["oer_slab_warning"] = "empty structure"
+        return out
+    pos = np.asarray(atoms.get_positions(), dtype=float)
+    sym = atoms.get_chemical_symbols()
+    z_top = float(np.max(pos[:, 2]))
+    top_idx = [i for i in range(len(atoms)) if (z_top - float(pos[i, 2])) <= float(top_window)]
+    top_cat = [i for i in top_idx if sym[i] not in _OER_AEM_ANIONS and sym[i] != "H"]
+    top_an = [i for i in top_idx if sym[i] in _OER_AEM_ANIONS]
+    top_o = [i for i in top_an if sym[i] == "O"]
+    out["oer_top_cation_count"] = int(len(top_cat))
+    out["oer_top_anion_count"] = int(len(top_an))
+    out["oer_top_cation_symbols"] = ",".join(sorted(set(sym[i] for i in top_cat)))
+    out["oer_surface_O_fraction_top"] = float(len(top_o) / max(len(top_idx), 1))
+
+    cation_idx = [i for i, el in enumerate(sym) if el not in _OER_AEM_ANIONS and el != "H"]
+    anion_idx = [i for i, el in enumerate(sym) if el in _OER_AEM_ANIONS]
+    if not cation_idx:
+        out["oer_slab_warning"] = "No cation species was found."
+        return out
+    z_cat_max = float(np.max(pos[np.asarray(cation_idx, dtype=int), 2]))
+    cand = []
+    for i in cation_idx:
+        depth = float(z_top - pos[int(i), 2])
+        if depth <= float(cation_window_from_top) or (z_cat_max - float(pos[int(i), 2])) <= 1.20:
+            cand.append(int(i))
+    if not cand:
+        out["oer_slab_warning"] = "No top-near cation was detected for cation-bound OER AEM."
+        return out
+
+    scores = []
+    an_pos = pos[np.asarray(anion_idx, dtype=int)] if anion_idx else np.empty((0, 3))
+    for i in cand:
+        cpos = pos[int(i)]
+        if anion_idx:
+            d_an = np.linalg.norm(an_pos - cpos[None, :], axis=1)
+            coord = int(np.sum(d_an <= float(o_coord_cutoff)))
+        else:
+            coord = 0
+        depth = max(0.0, float(z_top - cpos[2]))
+        direction = _oxide_oer_local_open_direction(atoms, int(i))
+        # Probe where an O-anchor would sit. This approximates whether *O/*OH/*OOH
+        # can enter without immediate O_lattice--O_ads crowding.
+        probe = cpos + direction * 1.95
+        if anion_idx:
+            d_probe = np.linalg.norm(an_pos - probe[None, :], axis=1)
+            min_oo = float(np.min(d_probe)) if len(d_probe) else float("inf")
+        else:
+            min_oo = float("inf")
+        topness = max(0.0, min(1.0, 1.0 - depth / max(float(cation_window_from_top), 1e-6)))
+        coord_score = max(0.0, min(1.0, (6.5 - float(coord)) / 4.0))  # low coordination preferred
+        open_score = max(0.0, min(1.0, float(direction[2])))
+        if not np.isfinite(min_oo):
+            crowd_score = 1.0
+        else:
+            # <1.45 Å is severe O-O collision; >2.05 Å is relatively open.
+            crowd_score = max(0.0, min(1.0, (float(min_oo) - 1.45) / 0.60))
+        site_score = 0.25 * topness + 0.25 * coord_score + 0.25 * open_score + 0.25 * crowd_score
+        scores.append({
+            "idx": int(i), "symbol": str(sym[int(i)]), "coord": int(coord), "depth": float(depth),
+            "open_z": float(direction[2]), "min_oo": float(min_oo), "score": float(site_score),
+        })
+    scores.sort(key=lambda x: (-x["score"], x["coord"], x["depth"], x["idx"]))
+    cand_sorted = [d["idx"] for d in scores]
+    out["oer_candidate_cation_indices"] = ",".join(str(i) for i in cand_sorted[:24])
+    out["oer_candidate_cation_symbols"] = ",".join(sorted(set(sym[i] for i in cand_sorted)))
+    if scores:
+        b = scores[0]
+        out["oer_best_cation_index"] = int(b["idx"])
+        out["oer_best_cation_symbol"] = str(b["symbol"])
+        out["oer_best_cation_coordination"] = int(b["coord"])
+        out["oer_best_cation_z_depth_A"] = float(b["depth"])
+        out["oer_best_open_direction_z"] = float(b["open_z"])
+        out["oer_best_o_crowding_min_OO_A"] = float(b["min_oo"])
+        out["oer_best_site_score"] = float(b["score"])
+
+    top_cat_score = max(0.0, min(1.0, len(cand_sorted) / 3.0))
+    exposure_score = float(out["oer_best_site_score"])
+    o_frac = out["oer_surface_O_fraction_top"]
+    o_only_penalty = 0.35 if np.isfinite(o_frac) and float(o_frac) >= 0.85 and len(top_cat) == 0 else 0.0
+    o_rich_penalty = 0.15 if np.isfinite(o_frac) and float(o_frac) >= 0.85 else 0.0
+    score = max(0.0, min(1.0, 0.35 * top_cat_score + 0.65 * exposure_score - o_only_penalty - o_rich_penalty))
+    out["oer_cation_exposure_score"] = float(exposure_score)
+    out["oer_o_crowding_penalty"] = float(1.0 - max(0.0, min(1.0, (out.get("oer_best_o_crowding_min_OO_A", 0.0) - 1.45) / 0.60)) if np.isfinite(out.get("oer_best_o_crowding_min_OO_A", np.nan)) else 0.0)
+    out["oer_slab_score"] = float(score)
+
+    if score >= 0.70:
+        suit = "OER-ready"
+    elif score >= 0.50:
+        suit = "OER-usable"
+    elif score >= 0.25:
+        suit = "OER-exploratory"
+    else:
+        suit = "OER-not-suitable"
+    out["oer_slab_suitability"] = suit
+    notes = []
+    if len(top_cat) == 0:
+        notes.append("topmost z-window is cation-poor/cation-buried")
+    if np.isfinite(o_frac) and float(o_frac) >= 0.85:
+        notes.append("top surface is O-rich; AEM cation-bound intermediates may detach")
+    if scores and float(scores[0]["min_oo"]) < 1.70:
+        notes.append("best O-anchor probe is crowded by lattice oxygen")
+    if scores and int(scores[0]["coord"]) >= 6:
+        notes.append("best cation appears bulk-like/high-coordinate")
+    out["oer_slab_notes"] = notes
+    if suit == "OER-not-suitable":
+        out["oer_slab_warning"] = "; ".join(notes) or "No OER AEM-ready exposed cation site was found."
+    elif notes:
+        out["oer_slab_warning"] = "; ".join(notes)
+    return out
+
+
+def _normalize_oxide_candidate_oer_top_surface(atoms, meta=None, z_window: float = 1.8):
+    """Normalize oxide slab orientation for OER AEM cation-exposed screening.
+
+    Unlike _normalize_oxide_candidate_top_surface(), this does NOT force an
+    O-dominant top surface. It compares both z orientations and keeps the side
+    with the better exposed-cation / lower O-crowding OER score. HER and oxide
+    HER logic must continue using _normalize_oxide_candidate_top_surface().
+    """
+    a0 = atoms.copy()
+    m0 = dict(meta or {})
+    q0 = _oxide_oer_cation_metrics(a0, top_window=float(z_window))
+    af = _flip_slab_z_keep_cell(a0)
+    qf = _oxide_oer_cation_metrics(af, top_window=float(z_window))
+    score0 = float(q0.get("oer_slab_score", 0.0) or 0.0)
+    scoref = float(qf.get("oer_slab_score", 0.0) or 0.0)
+    flipped = bool(scoref > score0 + 1e-9)
+    a = af if flipped else a0
+    q = qf if flipped else q0
+    m = dict(m0)
+    m.update(_classify_surface_exposure(a, z_window=float(z_window)))
+    m.update(q)
+    m["oxide_surface_role"] = "OER_AEM_cation"
+    m["flipped_for_oer_cation_exposure"] = bool(flipped)
+    m["flipped_for_oxide_top_exposure"] = bool(flipped)
+    # Keep compatibility fields without pretending O-rich is required.
+    m["oxide_top_surface_ok"] = str(q.get("oer_slab_suitability", "")).startswith("OER-")
+    m["oxide_validity"] = "pass" if q.get("oer_slab_suitability") in {"OER-ready", "OER-usable"} else "warn"
+    m["oxide_role"] = "oer_reference" if q.get("oer_slab_suitability") == "OER-ready" else "oer_exploratory"
+    m["oxide_rule_notes"] = list(q.get("oer_slab_notes", []) or [])
+    m["oxide_reject"] = (q.get("oer_slab_suitability") == "OER-not-suitable")
+    # Preserve general diagnostics but do not allow HER-oriented O-rich rejection to override.
+    try:
+        m = _annotate_step2_slab_symmetry(m) if '_annotate_step2_slab_symmetry' in globals() else m
+    except Exception:
+        pass
+    return a, m
+
+
+def _oxide_oer_candidate_rank_key(meta):
+    """Rank oxide slab candidates for OER AEM cation-bound screening."""
+    m = dict(meta or {})
+    suit = str(m.get("oer_slab_suitability", "OER-not-suitable"))
+    suit_score = {"OER-ready": 0, "OER-usable": 1, "OER-exploratory": 2, "OER-not-suitable": 5}.get(suit, 4)
+    score = -float(m.get("oer_slab_score", 0.0) or 0.0)
+    crowd = float(m.get("oer_o_crowding_penalty", 1.0) or 1.0)
+    coord = int(m.get("oer_best_cation_coordination", 99) if m.get("oer_best_cation_coordination", None) is not None else 99)
+    depth = float(m.get("oer_best_cation_z_depth_A", 99.0) or 99.0)
+    asym = 1 if bool(m.get("top_bottom_asymmetric", False)) else 0
+    n_atoms = int(m.get("n_atoms", 10**9))
+    vac_penalty = abs(float(m.get("vacuum_z", 0.0)) - 30.0)
+    return (suit_score, score, crowd, coord, depth, asym, n_atoms, vac_penalty)
+
+
 def _normalize_oxide_candidate_top_surface(atoms, meta=None, z_window: float = 1.8):
     """Normalize oxide slabs toward an O-dominant top surface and attach validity metadata.
 

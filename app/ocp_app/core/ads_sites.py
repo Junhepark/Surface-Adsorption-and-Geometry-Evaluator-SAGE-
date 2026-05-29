@@ -8,7 +8,7 @@ import numpy as np
 from ase import Atoms, Atom
 
 # Site types: ontop / bridge / hollow (legacy aliases fcc / hcp kept for compatibility)
-AdsKind = Literal["ontop", "bridge", "hollow", "fcc", "hcp"]
+AdsKind = Literal["ontop", "bridge", "hollow", "fcc", "hcp", "cation", "oer_cation", "anion_ontop"]
 
 
 @dataclass
@@ -700,6 +700,7 @@ def generate_candidate_sites(
     n_random: int = 12,
     rng_seed: int = 0,
     random_kind: str = "hollow",
+    reaction_mode: str | None = None,
 ) -> list[AdsSite]:
     """
     Generate a richer candidate site list for screening:
@@ -728,13 +729,21 @@ def generate_candidate_sites(
         return []
 
     # Geometry seeds
+    rxn = str(reaction_mode or "").strip().upper()
     if mtype == "metal":
         geom_sites = detect_metal_111_sites(slab_atoms)
+        rep = select_representative_sites(geom_sites, per_kind=int(max(1, geom_per_kind))) if geom_sites else []
+        cand: list[AdsSite] = list(rep)
+    elif rxn == "OER":
+        # Oxide OER must not inherit metal-like ontop/bridge/fcc plumbing.
+        # Use exposed cation AEM sites only and disable random hollow probes.
+        geom_sites = detect_oxide_oer_cation_sites(slab_atoms, max_sites=int(max(1, geom_per_kind)))
+        cand = list(geom_sites)
+        n_random = 0
     else:
         geom_sites = detect_oxide_surface_sites(slab_atoms)
-
-    rep = select_representative_sites(geom_sites, per_kind=int(max(1, geom_per_kind))) if geom_sites else []
-    cand: list[AdsSite] = list(rep)
+        rep = select_representative_sites(geom_sites, per_kind=int(max(1, geom_per_kind))) if geom_sites else []
+        cand: list[AdsSite] = list(rep)
 
     # Random probes
     n_random = int(max(0, n_random))
@@ -869,7 +878,7 @@ def snap_sites_to_unique_top_anions(
 
 
 # =============================================================================
-# ORR/OER oxide seed helpers
+# OER oxide seed helpers
 # =============================================================================
 
 def _top_layer_cation_indices_z(atoms: Atoms, z_tol: float = 0.8) -> np.ndarray:
@@ -893,25 +902,224 @@ def _top_layer_cation_indices_z(atoms: Atoms, z_tol: float = 0.8) -> np.ndarray:
     return cat_idx[top_mask]
 
 
-def expand_oxide_channels_for_adsorbate(adsorbate: str) -> tuple[str, ...]:
+
+
+def _oxide_oer_open_direction_from_cation(
+    atoms: Atoms,
+    cation_index: int,
+    *,
+    neighbor_cutoff: float = 2.75,
+    upward_bias: float = 1.20,
+) -> np.ndarray:
+    """Estimate a vacuum-facing open direction for cation-bound OER AEM placement.
+
+    This is used only by the OER oxygen-intermediate branch.  It is not
+    used by HER or oxide-HER O-anchor descriptors.
     """
-    Determine initial seed channel policy for ORR/OER oxygen intermediates
-    on oxide surfaces (e.g. NiO, CuO).
+    try:
+        pos = np.asarray(atoms.get_positions(), dtype=float)
+        sym = atoms.get_chemical_symbols()
+        ci = int(cation_index)
+        if ci < 0 or ci >= len(pos):
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        cpos = pos[ci]
+        vec = np.array([0.0, 0.0, float(upward_bias)], dtype=float)
+        for j, sj in enumerate(sym):
+            if sj not in ANION_SYMBOLS:
+                continue
+            r = cpos - pos[j]
+            d = float(np.linalg.norm(r))
+            if not np.isfinite(d) or d < 1e-8 or d > float(neighbor_cutoff):
+                continue
+            z_weight = 1.0 + max(0.0, 1.2 - abs(float(pos[j, 2]) - float(cpos[2])))
+            vec += (r / d) * (z_weight / max(d, 0.8))
+        if vec[2] < 0.25:
+            vec[2] = 0.25
+        n = float(np.linalg.norm(vec))
+        if not np.isfinite(n) or n < 1e-10:
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        return vec / n
+    except Exception:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
 
-    Default policy:
-      - O*   : cation-top preferred, mixed bridge as supplement
-      - OOH* : cation-top preferred, mixed bridge as supplement
-      - OH*  : both cation adsorption and protonated lattice oxygen
-      - H*   : oxide O-top (HER mode)
+def detect_oxide_oer_cation_sites(
+    atoms: Atoms,
+    *,
+    z_window_from_top: float = 2.30,
+    cation_z_tol: float = 1.20,
+    max_sites: int = 24,
+    o_coord_cutoff: float = 2.45,
+) -> List[AdsSite]:
+    """Detect exposed cation sites for oxide OER AEM screening.
 
-    O-top is included by default only in the OH* protonated-lattice-oxygen
-    channel; it is not globally forced for O* or OOH*.
+    This detector is intentionally separate from the oxide-HER O-anchor
+    detector.  HER on oxides often needs top lattice-O/protonation sites,
+    whereas AEM OER needs cation-bound *OH/*O/*OOH on exposed metal
+    cations (e.g. Ir_cus on rutile IrO2(110)).
+
+    The returned AdsSite objects have kind="oer_cation" and surface_indices=(i,)
+    where i is the selected cation index.  The z coordinate is only a seed
+    height; downstream OER placement reuses the explicit cation index.
+    """
+    if atoms is None or len(atoms) == 0:
+        return []
+
+    pos = np.asarray(atoms.get_positions(), dtype=float)
+    sym = atoms.get_chemical_symbols()
+    z_top = float(np.max(pos[:, 2]))
+
+    cation_idx = [i for i, el in enumerate(sym) if el not in ANION_SYMBOLS]
+    if not cation_idx:
+        return []
+
+    # Candidate cations must be close to the top surface OR among the topmost
+    # cation layer. This covers rutile (110), where bridging O can sit above
+    # the coordinatively unsaturated metal cation.
+    z_cat = np.asarray([pos[i, 2] for i in cation_idx], dtype=float)
+    z_cat_max = float(np.max(z_cat))
+    cand = []
+    for i in cation_idx:
+        zi = float(pos[i, 2])
+        if (z_top - zi <= float(z_window_from_top)) or (z_cat_max - zi <= float(cation_z_tol)):
+            cand.append(int(i))
+    if not cand:
+        cand = [int(i) for i in cation_idx if (z_cat_max - float(pos[i, 2])) <= float(cation_z_tol)]
+
+    anion_idx = [i for i, el in enumerate(sym) if el in ANION_SYMBOLS]
+
+    def _o_coord(i: int) -> int:
+        if not anion_idx:
+            return 0
+        d = np.linalg.norm(pos[np.asarray(anion_idx, dtype=int)] - pos[int(i)][None, :], axis=1)
+        return int(np.sum(d <= float(o_coord_cutoff)))
+
+    def _oer_site_score(i: int) -> tuple:
+        # Prefer exposed, low-coordination cations with an open O-anchor cone.
+        # This ranking is used only for oxide OER AEM cation sites and does not
+        # affect oxide-HER O-anchor detection.
+        coord = int(_o_coord(i))
+        depth = max(0.0, z_top - float(pos[int(i), 2]))
+        direction = _oxide_oer_open_direction_from_cation(atoms, int(i))
+        probe = pos[int(i)] + direction * 1.95
+        anion_idx2 = [j for j, el in enumerate(sym) if el in ANION_SYMBOLS]
+        if anion_idx2:
+            d_probe = np.linalg.norm(pos[np.asarray(anion_idx2, dtype=int)] - probe[None, :], axis=1)
+            min_oo = float(np.min(d_probe))
+        else:
+            min_oo = float('inf')
+        # Convert to negative scores for ascending sort; low coord/depth retained.
+        crowd_score = max(0.0, min(1.0, (min_oo - 1.45) / 0.60)) if np.isfinite(min_oo) else 1.0
+        open_score = max(0.0, min(1.0, float(direction[2])))
+        top_score = max(0.0, min(1.0, 1.0 - depth / max(float(z_window_from_top), 1e-6)))
+        combined = 0.35 * crowd_score + 0.25 * open_score + 0.25 * top_score + 0.15 * max(0.0, min(1.0, (6.5 - coord) / 4.0))
+        return (-float(combined), coord, depth, int(i))
+
+    # Prefer more exposed / lower-crowding / lower-coordinated cations.
+    # This is a heuristic for finding Ir_cus-like sites without changing HER.
+    ranked = sorted(cand, key=_oer_site_score)
+
+    sites: List[AdsSite] = []
+    seen_xy = set()
+    for i in ranked:
+        x, y, z = [float(v) for v in pos[int(i)]]
+        key = (round(x, 3), round(y, 3))
+        if key in seen_xy:
+            continue
+        seen_xy.add(key)
+        sites.append(
+            AdsSite(
+                kind="oer_cation",
+                position=(x, y, z + 1.80),
+                surface_indices=(int(i),),
+            )
+        )
+        if len(sites) >= int(max_sites):
+            break
+    return sites
+
+
+def oxide_oer_slab_suitability(
+    atoms: Atoms,
+    *,
+    top_window: float = 1.80,
+    cation_window_from_top: float = 2.30,
+) -> Dict[str, object]:
+    """Return non-invasive slab QC metadata for oxide OER AEM screening.
+
+    This is a diagnostic helper only.  It does not change HER or slabify
+    behavior.  It flags whether the top surface exposes cations suitable for
+    cation-bound *OH/*O/*OOH placement.
+    """
+    out: Dict[str, object] = {
+        "oer_slab_role": "OER_AEM_cation",
+        "oer_top_cation_count": 0,
+        "oer_top_anion_count": 0,
+        "oer_top_cation_symbols": "",
+        "oer_surface_O_fraction_top": float("nan"),
+        "oer_candidate_cation_indices": "",
+        "oer_slab_suitability": "unknown",
+        "oer_slab_warning": "",
+    }
+    if atoms is None or len(atoms) == 0:
+        out["oer_slab_suitability"] = "invalid"
+        out["oer_slab_warning"] = "empty structure"
+        return out
+    pos = np.asarray(atoms.get_positions(), dtype=float)
+    sym = atoms.get_chemical_symbols()
+    z_top = float(np.max(pos[:, 2]))
+    top_idx = [i for i in range(len(atoms)) if (z_top - float(pos[i, 2])) <= float(top_window)]
+    top_cat = [i for i in top_idx if sym[i] not in ANION_SYMBOLS]
+    top_an = [i for i in top_idx if sym[i] in ANION_SYMBOLS]
+    top_o = [i for i in top_an if sym[i] == "O"]
+    cand_sites = detect_oxide_oer_cation_sites(atoms, z_window_from_top=float(cation_window_from_top))
+    cand_idx = [int(s.surface_indices[0]) for s in cand_sites if s.surface_indices]
+    out["oer_top_cation_count"] = int(len(top_cat))
+    out["oer_top_anion_count"] = int(len(top_an))
+    out["oer_top_cation_symbols"] = ",".join(sorted(set(sym[i] for i in top_cat)))
+    out["oer_surface_O_fraction_top"] = float(len(top_o) / max(len(top_idx), 1))
+    out["oer_candidate_cation_indices"] = ",".join(str(i) for i in cand_idx)
+    if len(cand_idx) == 0:
+        out["oer_slab_suitability"] = "unsuitable"
+        out["oer_slab_warning"] = "No exposed/top-near cation was found for cation-bound OER AEM placement."
+    elif len(top_cat) == 0:
+        out["oer_slab_suitability"] = "warning_cation_buried"
+        out["oer_slab_warning"] = "Topmost layer is anion-rich; cations are below the top layer. Use only if this is expected for the target facet (e.g., rutile 110 with cus cations)."
+    elif out["oer_surface_O_fraction_top"] >= 0.85:
+        out["oer_slab_suitability"] = "warning_o_rich"
+        out["oer_slab_warning"] = "Top surface is O-rich; cation-bound OER AEM placement may be unstable."
+    else:
+        out["oer_slab_suitability"] = "usable"
+    return out
+
+
+def expand_oxide_channels_for_adsorbate(adsorbate: str, policy: str = "default") -> tuple[str, ...]:
+    """
+    Determine initial seed-channel policy for oxygen intermediates on oxide
+    surfaces.  This function is used by CO2RR/ORR/OER helper branches only;
+    HER's H-on-oxide logic remains in add_adsorbate_on_site(..., symbol="H",
+    mode="oxide_o") and is intentionally untouched.
+
+    policy
+    ------
+    default
+        oxygen-intermediate exploration.  O* and OOH*
+        may also probe mixed bridge sites.
+    oer_aem_cation
+        Strict AEM benchmark mode.  *OH, *O and *OOH are seeded only on
+        surface cation sites.  Lattice-O protonation and bridge_mixed states
+        are excluded from the primary OER summary.
     """
     a = str(adsorbate).replace('*', '').upper()
+    pol = str(policy or "default").strip().lower()
+
     if a == 'H':
-        return ('anion_o',)
+        return ('anion_o',)  # legacy HER O-top behavior; do not alter
+
+    if pol in {'oer_aem_cation', 'aem_cation', 'strict', 'cation_only'} and a in {'OH', 'O', 'OOH'}:
+        return ('oer_cation',)
+
     if a == 'OH':
-        return ('cation', 'anion_o')
+        return ('cation',)
     if a in ('O', 'OOH'):
         return ('cation', 'bridge_mixed')
     return ('cation',)
@@ -925,7 +1133,7 @@ def oxide_surface_seed_position(
     z_tol: float = 0.8,
 ) -> tuple[float, float, float, str]:
     """
-    Compute the initial anchor position for an ORR/OER intermediate on an
+    Compute the initial anchor position for an OER intermediate on an
     oxide surface, dispatched by channel type.
 
     Returns
@@ -934,8 +1142,9 @@ def oxide_surface_seed_position(
         surface_channel examples:
           - adsorbate_on_cation
           - mixed_bridge
-          - protonated_lattice_oxygen
-          - anion_o
+          - adsorbate_on_cation
+          - mixed_bridge
+          - lattice_protonation_disabled_for_aem
           - fallback_site
     """
     ads_clean = str(adsorbate).replace('*', '').upper()
@@ -978,7 +1187,13 @@ def oxide_surface_seed_position(
     if channel == 'anion_o':
         idx = _nearest(top_an_pref, target_xy)
         if idx is not None:
-            label = 'protonated_lattice_oxygen' if ads_clean == 'OH' else 'anion_o'
+            # H* keeps the legacy lattice-O protonation coordinate used by HER.
+            # For OH*/O*/OOH* this channel is not a valid AEM adsorbate state;
+            # it is retained only as an explicitly labelled, non-summary
+            # diagnostic/fallback state if a caller requests it manually.
+            if ads_clean == 'H':
+                return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), 'anion_o'
+            label = 'lattice_protonation_disabled_for_aem'
             return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), label
 
     if channel == 'bridge_mixed':
@@ -990,9 +1205,28 @@ def oxide_surface_seed_position(
                 z0 = max(float(pos[ic, 2]), float(pos[ia, 2])) + h + float(extra_bridge.get(ads_clean, 0.10))
                 return float(xy_mid[0]), float(xy_mid[1]), float(z0), 'mixed_bridge'
 
-    if channel == 'cation':
-        idx = _nearest(top_cat, target_xy)
+    if channel in {'cation', 'oer_cation'}:
+        # OER AEM cation placement should stay on the explicit cation site
+        # when one is supplied by detect_oxide_oer_cation_sites().  This avoids
+        # silently snapping back to a neighboring lattice-O/bridge-like site.
+        idx = None
+        try:
+            sidx = tuple(int(i) for i in (getattr(site, 'surface_indices', ()) or ()))
+            if sidx and sym[int(sidx[0])] not in ANION_SYMBOLS:
+                idx = int(sidx[0])
+        except Exception:
+            idx = None
+        if idx is None:
+            idx = _nearest(top_cat, target_xy)
         if idx is not None:
+            # For OER AEM, place the adsorbate along a local open direction
+            # away from neighboring lattice oxygen atoms, not simply along
+            # the global z axis.  This is restricted to OH/O/OOH; HER keeps
+            # the legacy anion-O/H placement path above.
+            if ads_clean in {'O', 'OH', 'OOH'}:
+                direction = _oxide_oer_open_direction_from_cation(slab, int(idx))
+                anchor = pos[int(idx)] + direction * h
+                return float(anchor[0]), float(anchor[1]), float(anchor[2]), 'adsorbate_on_cation'
             return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), 'adsorbate_on_cation'
 
     # ordered fallback: cation -> anion -> original site
@@ -1001,8 +1235,9 @@ def oxide_surface_seed_position(
         return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), 'adsorbate_on_cation'
     idx = _nearest(top_an_pref, target_xy)
     if idx is not None:
-        label = 'protonated_lattice_oxygen' if ads_clean == 'OH' else 'anion_o'
-        return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), label
+        if ads_clean == 'H':
+            return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), 'anion_o'
+        return float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2] + h), 'lattice_protonation_disabled_for_aem'
 
     x, y, z = site.position
     return float(x), float(y), float(z), 'fallback_site'

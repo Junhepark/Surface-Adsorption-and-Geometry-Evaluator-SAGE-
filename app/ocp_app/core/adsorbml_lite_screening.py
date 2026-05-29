@@ -20,13 +20,14 @@ from .ads_sites import (
     _oxide_o_based_ads_position,
     oxide_surface_seed_position,
     expand_oxide_channels_for_adsorbate,
+    detect_oxide_oer_cation_sites,
     detect_metal_111_sites,
     detect_oxide_surface_sites,
     ANION_SYMBOLS,
 )
 
-ReactionMode = Literal["HER", "CO2RR", "ORR"]
-OxideAnchorMode = Literal["cation", "anion_o", "bridge_mixed"]
+ReactionMode = Literal["HER", "CO2RR", "OER"]
+OxideAnchorMode = Literal["cation", "oer_cation", "anion_o", "bridge_mixed"]
 SurfactantClass = Literal["none", "cationic", "anionic", "nonionic"]
 
 
@@ -103,6 +104,9 @@ class ScreenResult:
 def _normalize_site_kind(kind: object) -> str:
     k = str(kind or "").strip().lower()
     aliases = {
+        "cation": "oer_cation",
+        "oer-cation": "oer_cation",
+        "oer_cation_top": "oer_cation",
         "top": "ontop",
         "atop": "ontop",
         "on-top": "ontop",
@@ -116,6 +120,7 @@ def _normalize_site_kind(kind: object) -> str:
 
 def _kind_priority(kind: str) -> int:
     return {
+        "oer_cation": 0,
         "ontop": 0,
         "anion_ontop": 0,
         "bridge": 1,
@@ -190,6 +195,17 @@ def _classify_oxide_site_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, objec
     return _classify_site_from_candidates(slab_only, anchor_xy, cands, unknown_tol=1.1)
 
 
+def _classify_oxide_oer_cation_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
+    try:
+        cands = detect_oxide_oer_cation_sites(slab_only, max_sites=200)
+    except Exception:
+        cands = []
+    out = _classify_site_from_candidates(slab_only, anchor_xy, cands, unknown_tol=1.65)
+    if out.get("kind") not in ("unknown", "", None):
+        out["kind"] = "oer_cation"
+    return out
+
+
 def _classify_oxide_anion_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, object]:
     try:
         pos = slab_only.get_positions()
@@ -235,6 +251,9 @@ def _resolve_site_tracking(
     if mode == "oxide_anion":
         final = _classify_oxide_anion_xy(slab_only, final_anchor_xy)
         site_family = "oxide_anion"
+    elif mode == "oxide_oer_cation":
+        final = _classify_oxide_oer_cation_xy(slab_only, final_anchor_xy)
+        site_family = "oxide_oer_cation"
     elif str(mtype).lower() == "metal":
         final = _classify_metal_site_xy(slab_only, final_anchor_xy)
         site_family = "metal"
@@ -447,15 +466,25 @@ def _load_ads_template(ref_dir: str, ads: str) -> Atoms:
 
     syms = a.get_chemical_symbols()
     anchor_idx = 0
-    for i, s in enumerate(syms):
-        if s == "C":
-            anchor_idx = i
-            break
+    if ads_clean in {"O", "OH", "OOH"}:
+        o_idx = [i for i, s in enumerate(syms) if s == "O"]
+        if o_idx:
+            pos0 = a.get_positions()
+            if ads_clean == "OOH" and len(o_idx) > 1:
+                anchor_idx = int(o_idx[int(np.argmin(pos0[np.asarray(o_idx, int), 2]))])
+            else:
+                anchor_idx = int(o_idx[0])
+    else:
+        for i, s in enumerate(syms):
+            if s == "C":
+                anchor_idx = i
+                break
 
     pos = a.get_positions()
     pos -= pos[anchor_idx].copy()
-    if pos[:, 2].mean() < 0:
-        pos[:, 2] *= -1
+    # Keep oxygen intermediates above the anchor plane.  This makes OH*/O*/OOH*
+    # placement explicit and avoids a CO2RR C-anchor fallback.
+    pos[:, 2] = np.abs(pos[:, 2])
     a.set_positions(pos)
     return a
 
@@ -475,34 +504,66 @@ def _build_slab_ads_co2rr(
     x, y, z = site.position
 
     anchor_mode = oxide_anchor_mode_override or settings.oxide_anchor_mode
+    explicit_anchor = False
 
-    if anchor_mode == "anion_o":
+    if anchor_mode in {"cation", "bridge_mixed", "anion_o"}:
+        # For oxygen intermediates on oxides, place the proximal O using the
+        # same channel-specific seed helper as the final CHE workflow.  This
+        # prevents OER preview/ML-screening from falling back to generic CO2RR
+        # clearances or lattice-O biased coordinates.  HER does not use this
+        # function.
+        try:
+            x, y, z, _surface_channel = oxide_surface_seed_position(
+                slab0,
+                AdsSite(kind=site.kind, position=(x, y, z), surface_indices=site.surface_indices),
+                ads,
+                channel=str(anchor_mode),
+            )
+            explicit_anchor = True
+        except Exception:
+            explicit_anchor = False
+
+    if (not explicit_anchor) and anchor_mode == "anion_o":
         x, y, z = _oxide_o_based_ads_position(
             slab0,
             AdsSite(kind=site.kind, position=(x, y, z), surface_indices=site.surface_indices),
             h_oh=float(settings.oxide_anchor_height),
             extra_z=0.0,
         )
+        explicit_anchor = True
 
     ads_atoms = _load_ads_template(ref_dir=ref_dir, ads=ads)
     n_slab = len(slab0)
 
     syms = ads_atoms.get_chemical_symbols()
+    ads_clean = str(ads).replace("*", "").upper()
     anchor_local = 0
-    for i, s in enumerate(syms):
-        if s == "C":
-            anchor_local = i
-            break
+    if ads_clean in {"O", "OH", "OOH"}:
+        pos_tmp = ads_atoms.get_positions()
+        o_idx = [i for i, s in enumerate(syms) if s == "O"]
+        if o_idx:
+            if ads_clean == "OOH" and len(o_idx) > 1:
+                anchor_local = int(o_idx[int(np.argmin(pos_tmp[np.asarray(o_idx, int), 2]))])
+            else:
+                anchor_local = int(o_idx[0])
+    else:
+        for i, s in enumerate(syms):
+            if s == "C":
+                anchor_local = i
+                break
 
     pos_ads = ads_atoms.get_positions()
     z_min_ads = float(pos_ads[:, 2].min())
 
-    # base Z: global top + clearance (default)
-    target_z_base = z_top_global + float(settings.co2rr_clearance)
-
-    # if site z is already near top surface, respect it
-    if z > z_top_global - 0.5:
-        target_z_base = max(target_z_base, float(z))
+    # base Z: for explicit oxide oxygen-intermediate seeds, place the anchor
+    # exactly at the channel-specific coordinate.  Otherwise retain legacy
+    # CO2RR clearance behavior.
+    if explicit_anchor:
+        target_z_base = float(z)
+    else:
+        target_z_base = z_top_global + float(settings.co2rr_clearance)
+        if z > z_top_global - 0.5:
+            target_z_base = max(target_z_base, float(z))
 
     base_z = target_z_base - z_min_ads
     base = np.array([float(x), float(y), float(base_z)], dtype=float)
@@ -630,9 +691,23 @@ def screen_sites_adsorbml_lite(
         else:
             anchor_modes = [settings.oxide_anchor_mode]
 
-    mult = int(len(anchor_modes)) if ((reaction == "CO2RR") and (mtype == "oxide")) else 1
+    if (str(reaction) == "OER") and (mtype == "oxide"):
+        # Per-adsorbate oxide channels are expanded later; OER uses strict
+        # cation-only AEM policy.
+        _pol = "oer_aem_cation" if str(reaction) == "OER" else "default"
+        mult = max(len(expand_oxide_channels_for_adsorbate(str(a).replace("*", "").upper(), policy=_pol)) for a in (adsorbates or ["OH*"]))
+    else:
+        mult = int(len(anchor_modes)) if ((reaction == "CO2RR") and (mtype == "oxide")) else 1
     n_total = int(max(len(adsorbates), 1) * max(len(sites), 1) * max(mult, 1))
     job_idx = 0
+
+    # OER oxide screening should use cation-exposed AEM sites, not the
+    # oxide-HER O-anchor site list.  This preview/screening path is kept
+    # separate from HER.
+    if (str(reaction) == "OER") and (mtype == "oxide"):
+        oer_sites = detect_oxide_oer_cation_sites(slab, max_sites=max(1, len(sites or []) or int(top_k)))
+        if oer_sites:
+            sites = oer_sites
 
     results_by_ads: Dict[str, List[ScreenResult]] = {}
     raw_by_ads: Dict[str, List[ScreenResult]] = {}
@@ -645,8 +720,9 @@ def screen_sites_adsorbml_lite(
             ads_clean = str(ads).replace("*", "").upper()
             if (reaction == "CO2RR") and (mtype == "oxide"):
                 run_modes = anchor_modes
-            elif (reaction == "ORR") and (mtype == "oxide"):
-                run_modes = list(expand_oxide_channels_for_adsorbate(ads_clean))
+            elif (str(reaction) == "OER") and (mtype == "oxide"):
+                _pol = "oer_aem_cation" if str(reaction) == "OER" else "default"
+                run_modes = list(expand_oxide_channels_for_adsorbate(ads_clean, policy=_pol))
             else:
                 run_modes = [None]
 
@@ -698,7 +774,7 @@ def screen_sites_adsorbml_lite(
                         seed_kind=("anion_ontop" if ((reaction == "HER") and (mtype == "oxide")) else site.kind),
                         initial_xy=anchor_xy0,
                         final_anchor_xy=anchor_xy1,
-                        classification_mode=("oxide_anion" if ((reaction == "HER") and (mtype == "oxide")) else "auto"),
+                        classification_mode=("oxide_anion" if ((reaction == "HER") and (mtype == "oxide")) else ("oxide_oer_cation" if ((str(reaction) == "OER") and (mtype == "oxide")) else "auto")),
                         disp_threshold=float(settings.max_lateral_disp),
                     )
                     migrated_flag = bool(tracking["migrated"])
