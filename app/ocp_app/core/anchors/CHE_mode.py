@@ -20,6 +20,8 @@ from ocp_app.core.ads_sites import (
     detect_oxide_surface_sites,
     expand_oxide_channels_for_adsorbate,
     oxide_surface_seed_position,
+    detect_oxide_oer_cation_sites,
+    oxide_oer_slab_suitability,
     select_representative_sites,
     ANION_SYMBOLS,
 )
@@ -54,7 +56,7 @@ from ocp_app.core.anchors.oxide_her import (
 # Unified CHE workflow (Metal & Oxide)
 #  - HER: ΔG_H (H* adsorption)
 #  - CO2RR: ΔG_ads for COOH*, CO*, HCOO*, OCHO* (reaction-descriptor based)
-#  - ORR: stepwise free energies for OOH*, O*, OH* (4e⁻ Norskov CHE)
+#  - OER: stepwise free energies for OOH*, O*, OH* (4e⁻ Norskov CHE)
 # =====================================================================
 
 # --- HER CHE correction (calibrated on Ni(111)) ---
@@ -95,12 +97,12 @@ ADS_TEMPLATE_FILES: Dict[str, str] = {
 
 THERMO_CO2RR_NAME = "thermo_CO2RR.json"
 
-# ── ORR settings ──────────────────────────────────────────────────────
+# ── ORR/OER oxygen-intermediate settings ──────────────────────────────────────────────────────
 # Uses the Norskov CHE approach without direct O2 energy calculation:
 # E_O2_eff = 2·E_H2O - 2·E_H2 + 4×1.23 eV
 ORR_EQUIL_POTENTIAL = 1.23  # V vs RHE (standard O2 reduction equilibrium potential)
 
-# ORR ZPE + TΔS correction defaults (can be overridden via thermo_ORR.json)
+# ORR/OER ZPE + TΔS correction defaults (can be overridden via thermo_ORR.json)
 DEFAULT_ORR_CORR: Dict[str, float] = {
     "OOH": 0.40,
     "O":   0.05,
@@ -111,6 +113,31 @@ THERMO_ORR_NAME = "thermo_ORR.json"
 
 # Number of electrons consumed per ORR intermediate (4e⁻ pathway)
 ORR_N_ELECTRONS: Dict[str, int] = {"OOH": 1, "O": 2, "OH": 3}
+
+# OER AEM strict benchmark placement policy.  These are applied only in
+# reaction_mode="OER" on oxide surfaces.  HER placement and HER descriptor
+# logic are intentionally not connected to this table.
+OER_AEM_CATION_HEIGHT_GRID: Dict[str, Tuple[float, ...]] = {
+    "O": (1.55, 1.75, 1.95),
+    "OH": (1.65, 1.85, 2.05),
+    "OOH": (1.80, 2.05, 2.30),
+}
+
+# OER AEM stabilization policy:
+# Do not use the v7 guided FixBondLength relaxation.  It tended to produce
+# artificial fragmentation after constraint release on rutile IrO2.
+# Instead, keep the v6 local-open-direction placement and apply only a short,
+# unconstrained adsorbate relaxation for oxide-OER cation-bound oxygen
+# intermediates.  This is intentionally limited to reaction_mode="OER" and
+# does not touch HER.
+OER_AEM_SHORT_RELAX_STEPS = 80
+OER_AEM_SHORT_RELAX_FMAX = 0.08
+
+# OER diagnostic relaxation modes. These apply only to reaction_mode="OER"
+# on oxide cation-bound oxygen intermediates. HER/CO2RR/ORR paths do not use
+# these switches.
+OER_RELAXATION_MODES = {"placement_only", "single_point", "short_relax", "normal_relax"}
+DEFAULT_OER_RELAXATION_MODE = "short_relax"
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -947,6 +974,7 @@ def _run_her_che(
                 "slab_relax_drop": meta_flags["slab_relax_drop"],
                 "vac_warning": meta_flags["vac_warning"],
             },
+            "OER_SLAB_QC": oer_slab_qc,
         }
         (out_root / "meta_her.json").write_text(json.dumps(meta, indent=2))
         return str(out_csv), meta
@@ -1202,6 +1230,7 @@ def _run_her_che(
             "slab_relax_drop": meta_flags["slab_relax_drop"],
             "vac_warning": meta_flags["vac_warning"],
         },
+        "OER_SLAB_QC": oer_slab_qc,
     }
     (out_root / "meta_her.json").write_text(json.dumps(meta, indent=2))
 
@@ -1321,6 +1350,25 @@ def _load_ads_template(ads: str, ref_dir: str | Path = "ref_gas"):
             anchor_pos = pos[0].copy()
             anchor_mode = "atom0"
 
+    elif ads_clean in ("O", "OH", "OOH"):
+        # ORR/OER oxygen intermediates must be O-anchored.  For OOH*,
+        # the proximal O is taken as the O atom with the lowest z in the
+        # template.  This makes the adsorbate state explicit instead of
+        # relying on the CO2RR C-anchor fallback.
+        o_idx = [i for i, s in enumerate(symbols) if s == "O"]
+        if len(o_idx) >= 1:
+            if ads_clean == "OOH" and len(o_idx) > 1:
+                iz_local = int(np.argmin(pos[np.asarray(o_idx, int), 2]))
+                iz = int(o_idx[iz_local])
+                anchor_mode = "O_prox(min_z)"
+            else:
+                iz = int(o_idx[0])
+                anchor_mode = "O"
+            anchor_pos = pos[iz].copy()
+        else:
+            anchor_pos = pos[0].copy()
+            anchor_mode = "atom0_no_O"
+
     else:
         # CO / COOH: anchor atom = C preferred
         c_idx = None
@@ -1350,6 +1398,75 @@ def _load_ads_template(ads: str, ref_dir: str | Path = "ref_gas"):
     return a
 
 
+def _rotation_matrix_from_z_to_vec(vec: np.ndarray) -> np.ndarray:
+    """Return a 3x3 rotation matrix that maps +z onto vec.
+
+    Used only for OER/ORR molecular oxygen intermediates.  HER placement is
+    not routed through this helper.
+    """
+    v = np.asarray(vec, dtype=float).reshape(3)
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < 1e-12:
+        return np.eye(3)
+    b = v / n
+    a = np.array([0.0, 0.0, 1.0], dtype=float)
+    c = float(np.dot(a, b))
+    if c > 1.0 - 1e-10:
+        return np.eye(3)
+    if c < -1.0 + 1e-10:
+        return np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], dtype=float)
+    vx = np.array([
+        [0.0, -b[2], b[1]],
+        [b[2], 0.0, -b[0]],
+        [-b[1], b[0], 0.0],
+    ], dtype=float)
+    return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+
+def _oxide_oer_open_direction(
+    slab,
+    target_cation_index: int,
+    *,
+    neighbor_cutoff: float = 2.75,
+    upward_bias: float = 1.20,
+) -> np.ndarray:
+    """Estimate an open direction from a target oxide cation toward vacuum.
+
+    The vector is biased upward and away from neighboring lattice oxygens.
+    It is used only for cation-bound OER AEM placement of *O/*OH/*OOH.
+    This avoids putting the adsorbate oxygen directly into an O-rich bridge
+    region where it tends to detach or form a non-AEM lattice-O state.
+    """
+    try:
+        pos = np.asarray(slab.get_positions(), dtype=float)
+        syms = slab.get_chemical_symbols()
+        ci = int(target_cation_index)
+        if ci < 0 or ci >= len(pos):
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        cpos = pos[ci]
+        z_top = float(np.max(pos[:, 2]))
+        vec = np.array([0.0, 0.0, float(upward_bias)], dtype=float)
+        for j, sj in enumerate(syms):
+            if sj not in ANION_SYMBOLS:
+                continue
+            r = cpos - pos[j]
+            d = float(np.linalg.norm(r))
+            if not np.isfinite(d) or d < 1e-8 or d > float(neighbor_cutoff):
+                continue
+            # Weight nearby and top-near oxygen atoms more strongly.
+            z_weight = 1.0 + max(0.0, 1.2 - abs(float(pos[j, 2]) - float(cpos[2])))
+            vec += (r / d) * (z_weight / max(d, 0.8))
+        # Enforce a positive vacuum-facing component.
+        if vec[2] < 0.25:
+            vec[2] = 0.25 + 0.5 * max(0.0, z_top - float(cpos[2]))
+        n = float(np.linalg.norm(vec))
+        if not np.isfinite(n) or n < 1e-10:
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        return vec / n
+    except Exception:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+
+
 def _build_adsorbate_on_site(
     slab,
     xy: np.ndarray,
@@ -1357,11 +1474,16 @@ def _build_adsorbate_on_site(
     dz: float = 1.8,
     ref_dir: str | Path = "ref_gas",
     target_anchor_xyz: np.ndarray | None = None,
+    target_anchor_dir: np.ndarray | None = None,
 ):
     """
     Place an adsorbate template on the slab at the given xy position,
     offset above the slab top by dz.  Returns the combined slab+ads
     Atoms object.
+
+    target_anchor_dir is used only for OER/ORR molecular oxygen intermediates
+    to align the template's normalized +z direction with a local open direction.
+    HER placement does not use this argument.
     """
     from ase import Atoms  # type: ignore
 
@@ -1385,6 +1507,14 @@ def _build_adsorbate_on_site(
     ads_atoms = _load_ads_template(ads_clean, ref_dir=ref_dir)
     ads_atoms.set_cell(slab.get_cell())
     ads_atoms.set_pbc(slab.get_pbc())
+
+    if target_anchor_dir is not None and ads_clean in {"OH", "OOH"}:
+        # Templates are normalized with anchor at origin and positive z away
+        # from the surface.  Rotate that local +z direction toward the local
+        # open direction from the exposed cation.
+        R = _rotation_matrix_from_z_to_vec(np.asarray(target_anchor_dir, dtype=float))
+        p0 = np.asarray(ads_atoms.get_positions(), dtype=float)
+        ads_atoms.set_positions(p0 @ R.T)
 
     ads_atoms.translate(base)
 
@@ -1503,6 +1633,18 @@ def _co2rr_anchor_xy(
         z = float(ads_coords3[:, 2].min())
         return xy, z, "COM_fallback"
 
+    if ads_clean in ("O", "OH", "OOH"):
+        o_idx = [i for i, s in enumerate(ads_symbols) if s == "O"]
+        if len(o_idx) >= 1:
+            if ads_clean == "OOH" and len(o_idx) > 1:
+                iz = int(o_idx[int(np.argmin(ads_coords3[np.asarray(o_idx, int), 2]))])
+                return ads_coords3[iz, :2], float(ads_coords3[iz, 2]), "O_prox(min_z)"
+            iz = int(o_idx[0])
+            return ads_coords3[iz, :2], float(ads_coords3[iz, 2]), "O"
+        xy = ads_coords3[:, :2].mean(axis=0)
+        z = float(ads_coords3[:, 2].min())
+        return xy, z, "COM_fallback_no_O"
+
     # CO / COOH: anchor = C if present
     c_idx = None
     for i, s in enumerate(ads_symbols):
@@ -1591,9 +1733,170 @@ def _co2rr_min_slab_dist(slab_coords3: np.ndarray, ads_coords3: np.ndarray) -> f
     return float(np.min(d))
 
 
+def _oxygen_adsorbate_state_metrics(
+    slab_coords3: np.ndarray,
+    ads_coords3: np.ndarray,
+    ads_symbols: list[str],
+    ads_clean: str,
+    surface_channel: object = None,
+    slab_symbols: list[str] | None = None,
+    target_cation_indices: tuple[int, ...] | None = None,
+) -> dict[str, object]:
+    """Classify ORR/OER oxygen-intermediate binding state.
+
+    This is a QA helper for *O, *OH and *OOH only.  It does not affect HER.
+    A row can be migrated and still usable only if the proximal O remains
+    surface-bound and the internal O-H/O-O bonds remain intact.
+    """
+    ads_clean = str(ads_clean).replace("*", "").upper()
+    out: dict[str, object] = {
+        "oxygen_adsorbate": bool(ads_clean in {"O", "OH", "OOH"}),
+        "oxygen_anchor_index_local": -1,
+        "oxygen_anchor_symbol": "",
+        "oxygen_anchor_slab_dist(Å)": float("nan"),
+        "oxygen_nearest_slab_index": -1,
+        "oxygen_nearest_slab_symbol": "",
+        "oxygen_anchor_cation_dist(Å)": float("nan"),
+        "oxygen_anchor_target_cation_dist(Å)": float("nan"),
+        "oxygen_anchor_target_cation_index": -1,
+        "oxygen_anchor_target_cation_symbol": "",
+        "oxygen_anchor_anion_dist(Å)": float("nan"),
+        "oxygen_bound_to_cation": False,
+        "oxygen_ads_bound": False,
+        "oxygen_internal_bond_ok": False,
+        "oxygen_surface_bond_ok": False,
+        "valid_for_oer_summary": False,
+        "oer_state_class": "not_oxygen_intermediate",
+        "oer_state_note": "",
+    }
+    if ads_clean not in {"O", "OH", "OOH"}:
+        return out
+    if ads_coords3 is None or ads_coords3.shape[0] == 0 or slab_coords3 is None or slab_coords3.shape[0] == 0:
+        out["oer_state_class"] = "missing_geometry"
+        return out
+
+    idx_O = [i for i, s in enumerate(ads_symbols) if s == "O"]
+    idx_H = [i for i, s in enumerate(ads_symbols) if s == "H"]
+    if not idx_O:
+        out["oer_state_class"] = "no_anchor_O"
+        return out
+
+    if ads_clean == "OOH" and len(idx_O) > 1:
+        anchor_i = int(idx_O[int(np.argmin(ads_coords3[np.asarray(idx_O, int), 2]))])
+    else:
+        anchor_i = int(idx_O[0])
+
+    anchor = np.asarray(ads_coords3[anchor_i], dtype=float)
+    slab_dists = np.linalg.norm(slab_coords3 - anchor[None, :], axis=1)
+    nearest_slab_i = int(np.argmin(slab_dists)) if len(slab_dists) else -1
+    d_to_slab = float(slab_dists[nearest_slab_i]) if nearest_slab_i >= 0 else float("nan")
+
+    slab_symbols = list(slab_symbols or [])
+    nearest_sym = str(slab_symbols[nearest_slab_i]) if (nearest_slab_i >= 0 and nearest_slab_i < len(slab_symbols)) else ""
+    cation_idx = [i for i, sym in enumerate(slab_symbols) if sym not in ANION_SYMBOLS]
+    anion_idx = [i for i, sym in enumerate(slab_symbols) if sym in ANION_SYMBOLS]
+    d_cation = float(np.min(np.linalg.norm(slab_coords3[np.asarray(cation_idx, int)] - anchor[None, :], axis=1))) if cation_idx else float("nan")
+    d_anion = float(np.min(np.linalg.norm(slab_coords3[np.asarray(anion_idx, int)] - anchor[None, :], axis=1))) if anion_idx else float("nan")
+    target_cation_indices = tuple(int(i) for i in (target_cation_indices or tuple()) if 0 <= int(i) < len(slab_coords3))
+    target_cation_index = int(target_cation_indices[0]) if target_cation_indices else -1
+    d_target_cation = (
+        float(np.linalg.norm(slab_coords3[target_cation_index] - anchor))
+        if target_cation_index >= 0 else float("nan")
+    )
+    target_cation_symbol = (
+        str(slab_symbols[target_cation_index])
+        if (target_cation_index >= 0 and target_cation_index < len(slab_symbols)) else ""
+    )
+
+    out["oxygen_anchor_index_local"] = int(anchor_i)
+    out["oxygen_anchor_symbol"] = str(ads_symbols[anchor_i])
+    out["oxygen_anchor_slab_dist(Å)"] = d_to_slab
+    out["oxygen_nearest_slab_index"] = int(nearest_slab_i)
+    out["oxygen_nearest_slab_symbol"] = nearest_sym
+    out["oxygen_anchor_cation_dist(Å)"] = d_cation
+    out["oxygen_anchor_target_cation_dist(Å)"] = d_target_cation
+    out["oxygen_anchor_target_cation_index"] = int(target_cation_index)
+    out["oxygen_anchor_target_cation_symbol"] = target_cation_symbol
+    out["oxygen_anchor_anion_dist(Å)"] = d_anion
+
+    # Internal-bond sanity.  Use permissive upper bounds because ML relaxation
+    # may stretch weakly bound adsorbates, but broken OOH/OH should not enter
+    # OER summaries.
+    internal_ok = True
+    if ads_clean == "O":
+        internal_ok = (len(idx_O) == 1)
+    elif ads_clean == "OH":
+        if len(idx_O) != 1 or len(idx_H) != 1:
+            internal_ok = False
+        else:
+            oh = float(np.linalg.norm(ads_coords3[idx_O[0]] - ads_coords3[idx_H[0]]))
+            internal_ok = (0.60 <= oh <= 1.25)
+            out["oxygen_OH_bond(Å)"] = oh
+    elif ads_clean == "OOH":
+        if len(idx_O) != 2 or len(idx_H) != 1:
+            internal_ok = False
+        else:
+            oo = float(np.linalg.norm(ads_coords3[idx_O[0]] - ads_coords3[idx_O[1]]))
+            oh = min(float(np.linalg.norm(ads_coords3[h] - ads_coords3[o])) for h in idx_H for o in idx_O)
+            internal_ok = (1.05 <= oo <= 1.75) and (0.60 <= oh <= 1.25)
+            out["oxygen_OO_bond(Å)"] = oo
+            out["oxygen_OH_bond(Å)"] = oh
+
+    # Surface-bound criterion for proximal O.  For AEM cation-bound OER,
+    # require a plausible cation-O anchor distance and reject cases where the
+    # closest binding partner is lattice oxygen.  This prevents bridge/lattice
+    # O placements from being mixed into *OH/*O/*OOH cation-site summaries.
+    ch = str(surface_channel or "").strip().lower()
+    max_cation_dist = {"O": 2.30, "OH": 2.45, "OOH": 2.55}.get(ads_clean, 2.45)
+    cation_bound = bool(np.isfinite(d_cation) and (1.10 <= d_cation <= float(max_cation_dist)))
+    target_cation_bound = bool(np.isfinite(d_target_cation) and (1.10 <= d_target_cation <= float(max_cation_dist)))
+    # A neighboring lattice O can be geometrically close on rutile-like oxides.
+    # Do not reject a cation-bound AEM state merely because a lattice O is
+    # slightly closer than the target cation.  Reject only nonphysical O-O
+    # collision distances; ambiguous bridge/peroxo cases remain QA-visible via
+    # oxygen_anchor_anion_dist(Å).
+    anion_too_close_cut = {"O": 1.42, "OH": 1.50, "OOH": 1.50}.get(ads_clean, 1.50)
+    anion_too_close = bool(np.isfinite(d_anion) and d_anion < float(anion_too_close_cut))
+
+    if ch == "adsorbate_on_cation":
+        # Strict OER AEM: anchor must be bound to the intended exposed cation.
+        surf_ok = bool((target_cation_bound if target_cation_index >= 0 else cation_bound) and not anion_too_close)
+    else:
+        surf_ok = bool(np.isfinite(d_to_slab) and (0.80 <= d_to_slab <= 2.75))
+
+    invalid_channel = ch in {
+        "protonated_lattice_oxygen",
+        "anion_o",
+        "lattice_protonation_disabled_for_aem",
+        "fallback_site",
+    }
+
+    out["oxygen_bound_to_cation"] = bool((target_cation_bound if target_cation_index >= 0 else cation_bound) and not anion_too_close)
+    out["oxygen_internal_bond_ok"] = bool(internal_ok)
+    out["oxygen_surface_bond_ok"] = bool(surf_ok)
+    out["oxygen_ads_bound"] = bool(internal_ok and surf_ok)
+    if invalid_channel:
+        out["oer_state_class"] = "invalid_oer_channel"
+        out["oer_state_note"] = f"surface_channel={surface_channel} is excluded from AEM OER summaries"
+    elif not internal_ok:
+        out["oer_state_class"] = "broken_oxygen_intermediate"
+    elif not surf_ok:
+        out["oer_state_class"] = "misbound_or_detached_oxygen_intermediate" if ch == "adsorbate_on_cation" else "detached_oxygen_intermediate"
+        if ch == "adsorbate_on_cation":
+            out["oer_state_note"] = f"target_cation_dist={d_target_cation:.3f}; nearest_cation_dist={d_cation:.3f}; anion_dist={d_anion:.3f}; anion_too_close={anion_too_close}; nearest={nearest_sym}"
+    else:
+        out["oer_state_class"] = "bound_oxygen_intermediate"
+        out["valid_for_oer_summary"] = True
+    return out
+
+
+
 def _normalize_site_kind(kind: object) -> str:
     k = str(kind or "").strip().lower()
     aliases = {
+        "cation": "oer_cation",
+        "oer-cation": "oer_cation",
+        "oer_cation_top": "oer_cation",
         "top": "ontop",
         "atop": "ontop",
         "on-top": "ontop",
@@ -1878,6 +2181,24 @@ def _classify_oxide_geom_site_xy(slab_only, anchor_xy: np.ndarray) -> dict[str, 
     return out
 
 
+def _classify_oxide_oer_cation_site_xy(slab_only, anchor_xy: np.ndarray, tol: float = 1.65) -> dict[str, object]:
+    """Classify an OER oxygen-intermediate anchor by exposed cation sites only.
+
+    This avoids reclassifying oxide OER AEM rows as metal-like ontop/bridge/fcc
+    sites.  It is intentionally used only when classification_mode=
+    "oxide_oer_cation".
+    """
+    try:
+        candidates = detect_oxide_oer_cation_sites(slab_only, max_sites=200)
+    except Exception:
+        candidates = []
+    out = _classify_site_from_candidates(slab_only, anchor_xy, candidates, unknown_tol=float(tol))
+    if out.get("kind") not in ("unknown", "", None):
+        out["kind"] = "oer_cation"
+    out["classification_mode"] = "oxide_oer_cation"
+    return out
+
+
 def _classify_oxide_anion_site_xy(slab_only, anchor_xy: np.ndarray, tol: float = 0.75) -> dict[str, object]:
     try:
         pos = slab_only.get_positions()
@@ -1926,6 +2247,10 @@ def _resolve_site_tracking(
         initial_kind = "anion_ontop"
         final_meta = _classify_oxide_anion_site_xy(slab_only, final_anchor_xy)
         site_family = "oxide_anion_top"
+    elif classification_mode == "oxide_oer_cation":
+        initial_kind = "oer_cation"
+        final_meta = _classify_oxide_oer_cation_site_xy(slab_only, final_anchor_xy)
+        site_family = "oxide_oer_cation"
     elif str(mtype).lower() == "metal":
         initial_kind = _canonicalize_metal_kind(seed_kind_norm)
         final_meta = _classify_metal_site_xy(slab_only, final_anchor_xy)
@@ -2105,19 +2430,35 @@ def _run_co2rr_che(
     her_guardrail: bool = False,
     her_site_preference: str = "ontop",
     her_use_net_corr: bool = True,
-    reaction_mode: str = "CO2RR",   # "CO2RR" | "ORR"
+    reaction_mode: str = "CO2RR",   # "CO2RR" | "OER"
     orr_u: float = 0.0,
+    oer_relaxation_mode: str = DEFAULT_OER_RELAXATION_MODE,
+    oer_manual_cation_indices: Optional[Iterable[int]] = None,
 ):
     """
-    Reaction-descriptor based ΔE/ΔG screening for CO2RR or ORR.
+    Reaction-descriptor based ΔE/ΔG screening for CO2RR or oxygen intermediates.
 
     CO2RR adsorbates: COOH*, CO*, HCOO*, OCHO*
-    ORR adsorbates:   OOH*, O*, OH*
+    OER adsorbates: OOH*, O*, OH*
 
-    When reaction_mode="ORR", the ORR reference reaction scheme and
-    thermodynamic corrections are used instead of the CO2RR defaults.
+    When reaction_mode is "OER", the oxygen-intermediate reference scheme
+    and thermodynamic corrections are used instead of the CO2RR defaults.
     """
-    _is_orr = (str(reaction_mode).upper() == "ORR")
+    _rxn_mode = str(reaction_mode).upper()
+    if _rxn_mode == "ORR":
+        raise ValueError("ORR mode has been removed in SAGE v1.1.0. Use OER, HER, or CO2RR.")
+    _is_oxygen = _rxn_mode in {"OER", "OER_COMPETITION", "OXYGEN"}
+    _is_orr = False
+    _is_oer = _rxn_mode in {"OER", "OER_COMPETITION", "OXYGEN"}
+    _oer_relax_mode = str(oer_relaxation_mode or DEFAULT_OER_RELAXATION_MODE).strip().lower()
+    if _oer_relax_mode not in OER_RELAXATION_MODES:
+        _oer_relax_mode = DEFAULT_OER_RELAXATION_MODE
+    _manual_oer_cations = []
+    if oer_manual_cation_indices is not None:
+        try:
+            _manual_oer_cations = [int(i) for i in oer_manual_cation_indices if int(i) >= 0]
+        except Exception:
+            _manual_oer_cations = []
     (
         slab_u_rel,
         E_slab_u,
@@ -2133,8 +2474,80 @@ def _run_co2rr_che(
 
     target_sites = _build_target_sites(mtype, slab_u_rel, sites, user_ads_sites)
 
+    # OER on oxides requires a different slab/site policy from oxide-HER.
+    # HER uses lattice-O/O-anchor sites; AEM OER requires exposed cation sites
+    # for cation-bound *OH/*O/*OOH.  This branch is intentionally isolated
+    # from HER logic.
+    oer_slab_qc = None
+    if _is_oer and str(mtype).lower() == "oxide":
+        try:
+            oer_slab_qc = oxide_oer_slab_suitability(slab_u_rel)
+        except Exception as e:
+            oer_slab_qc = {"oer_slab_suitability": "qc_failed", "oer_slab_warning": str(e)}
+        syms = slab_u_rel.get_chemical_symbols()
+        pos_all = np.asarray(slab_u_rel.get_positions(), dtype=float)
+        if _manual_oer_cations:
+            # Diagnostic/manual Ir_cus mode: use user-specified cation indices
+            # rather than the automatic top-cation detector. This is useful for
+            # IrO2(110) benchmarking where the active Ir_cus atom is known.
+            oer_cation_sites = []
+            for ci in _manual_oer_cations:
+                if 0 <= int(ci) < len(syms) and syms[int(ci)] not in ANION_SYMBOLS:
+                    p_ci = pos_all[int(ci)]
+                    oer_cation_sites.append(AdsSite(kind="oer_cation", position=(float(p_ci[0]), float(p_ci[1]), float(p_ci[2])), surface_indices=(int(ci),)))
+        elif user_ads_sites:
+            # Respect Step-3 Geometry representative sites for oxide-OER.
+            # Previous versions redetected OER cation sites here, making the
+            # separate OER max-site cap override the UI representative-site
+            # slider and sometimes breaking OH/O/OOH triplet consistency.
+            oer_cation_sites = []
+            for _label, _site in (user_ads_sites or {}).items():
+                try:
+                    _kind = str(getattr(_site, "kind", "")).strip().lower()
+                    _sidx = tuple(int(i) for i in (getattr(_site, "surface_indices", ()) or ()))
+                    if _kind not in {"oer_cation", "cation"}:
+                        continue
+                    if len(_sidx) != 1:
+                        continue
+                    _ci = int(_sidx[0])
+                    if not (0 <= _ci < len(syms)) or syms[_ci] in ANION_SYMBOLS:
+                        continue
+                    _p = np.asarray(getattr(_site, "position", pos_all[_ci]), dtype=float)
+                    if _p.shape[0] < 3:
+                        _p = pos_all[_ci]
+                    oer_cation_sites.append(AdsSite(kind="oer_cation", position=(float(_p[0]), float(_p[1]), float(_p[2])), surface_indices=(_ci,)))
+                except Exception:
+                    continue
+            if not oer_cation_sites:
+                oer_cation_sites = detect_oxide_oer_cation_sites(slab_u_rel, max_sites=max(1, len(list(sites or [])) or 12))
+        else:
+            oer_cation_sites = detect_oxide_oer_cation_sites(slab_u_rel, max_sites=max(1, len(list(sites or [])) or 12))
+        if not oer_cation_sites:
+            raise RuntimeError(
+                "OER AEM oxide mode requires at least one exposed/top-near cation site. "
+                "The current slab appears unsuitable for cation-bound *OH/*O/*OOH placement. "
+                "Use a cation-exposed termination such as rutile IrO2(110) with Ir_cus sites, "
+                "or provide manual cation indices for diagnostic benchmarking."
+            )
+        target_sites = []
+        for k, site in enumerate(oer_cation_sites):
+            sidx = tuple(int(i) for i in getattr(site, "surface_indices", ()) or ())
+            ci = int(sidx[0]) if sidx else -1
+            label_sym = syms[ci] if (0 <= ci < len(syms)) else "M"
+            pos_site = np.asarray(site.position[:3], dtype=float)
+            target_sites.append({
+                "site_label": f"oer_cation_{k}_{label_sym}{ci}",
+                "site_kind": "oer_cation",
+                "xy": np.asarray(pos_site[:2], dtype=float),
+                "initial_xyz": pos_site,
+                "surface_indices": sidx,
+                "seed_source": "oxide_oer_manual_cation" if _manual_oer_cations else "oxide_oer_aem_cation_detector",
+                "active_cation_index": ci,
+                "active_cation_symbol": label_sym,
+            })
+
     # Load thermodynamic corrections (ORR vs CO2RR branch)
-    if _is_orr:
+    if _is_oxygen:
         ads_corr = _load_orr_thermo()
         thermo_data = None
         thermo_path = Path("ref_gas") / THERMO_ORR_NAME
@@ -2158,7 +2571,7 @@ def _run_co2rr_che(
     gas_src["H2"] = "get_h2_ref"
 
     # Determine required gas references (ORR does not need CO2; H2O is required)
-    required_gas = ["H2O"] if _is_orr else ["CO2", "H2O"]
+    required_gas = ["H2O"] if _is_oxygen else ["CO2", "H2O"]
     missing_required = [
         k for k in required_gas if k not in gas_E or not np.isfinite(gas_E[k])
     ]
@@ -2179,10 +2592,10 @@ def _run_co2rr_che(
                 gas_src[ku] = computed_src.get(ku, "computed")
 
     # Final validation
-    _required_keys = ["H2", "H2O"] if _is_orr else ["CO2", "H2", "H2O"]
+    _required_keys = ["H2", "H2O"] if _is_oxygen else ["CO2", "H2", "H2O"]
     for k in _required_keys:
         if k not in gas_E or not np.isfinite(gas_E[k]):
-            _mode_label = "ORR" if _is_orr else "CO2RR"
+            _mode_label = ("OER" if _is_oer else "CO2RR")
             raise RuntimeError(
                 f"{_mode_label} gas reference energies are missing/invalid. "
                 f"Missing: {k}. "
@@ -2242,30 +2655,74 @@ def _run_co2rr_che(
                 "site_kind": str(kind),
                 "xy": np.asarray(xy, float),
                 "target_anchor_xyz": None,
+                "target_anchor_dir": None,
                 "oxide_seed_mode": None,
                 "surface_channel": None,
                 "seed_source": site_seed.get("seed_source"),
                 "surface_indices": tuple(int(i) for i in site_seed.get("surface_indices", ()) or ()),
             }]
-            if _is_orr and mtype == "oxide":
+            if _is_oxygen and mtype == "oxide":
                 seed_variants = []
-                site_obj = AdsSite(kind=str(kind), position=(float(xy[0]), float(xy[1]), float(np.max(slab_u_rel.get_positions()[:, 2]))), surface_indices=())
-                channels = expand_oxide_channels_for_adsorbate(ads_clean)
+                site_xyz = site_seed.get("initial_xyz", None)
+                if site_xyz is None:
+                    site_xyz = (float(xy[0]), float(xy[1]), float(np.max(slab_u_rel.get_positions()[:, 2])))
+                site_obj = AdsSite(
+                    kind=str(kind),
+                    position=(float(site_xyz[0]), float(site_xyz[1]), float(site_xyz[2])),
+                    surface_indices=tuple(int(i) for i in site_seed.get("surface_indices", ()) or ()),
+                )
+                # OER benchmark mode uses strict cation-bound AEM placement.
+                # ORR keeps the broader exploratory channel policy.  HER is not
+                # connected to this branch.
+                channel_policy = "oer_aem_cation" if _is_oer else "default"
+                channels = expand_oxide_channels_for_adsorbate(ads_clean, policy=channel_policy)
                 for ch in channels:
-                    x0, y0, z0, surface_channel = oxide_surface_seed_position(
+                    x0, y0, z0_default, surface_channel = oxide_surface_seed_position(
                         slab_u_rel, site_obj, ads_clean, channel=ch
                     )
-                    site_label_seed = f"{label}:{ch}" if len(channels) > 1 else str(label)
-                    seed_variants.append({
-                        "site_label": site_label_seed,
-                        "site_kind": str(kind),
-                        "xy": np.asarray([x0, y0], float),
-                        "target_anchor_xyz": np.asarray([x0, y0, z0], float),
-                        "oxide_seed_mode": str(ch),
-                        "surface_channel": str(surface_channel),
-                        "seed_source": site_seed.get("seed_source"),
-                        "surface_indices": tuple(int(i) for i in site_seed.get("surface_indices", ()) or ()),
-                    })
+                    target_dir = None
+                    if _is_oer and surface_channel == "adsorbate_on_cation":
+                        try:
+                            _sidx = tuple(int(i) for i in (site_seed.get("surface_indices", ()) or ()))
+                            _ci = int(_sidx[0]) if _sidx else int(site_seed.get("active_cation_index", -1))
+                            target_dir = _oxide_oer_open_direction(slab_u_rel, _ci)
+                        except Exception:
+                            target_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+                    base_label = f"{label}:{ch}" if len(channels) > 1 else str(label)
+                    # Multi-start heights are used only for OER strict cation
+                    # benchmark mode.  This is the standard way to avoid single
+                    # bad initial z placements dominating *OH/*O/*OOH screening.
+                    if _is_oer and surface_channel == "adsorbate_on_cation":
+                        default_h = {"O": 1.45, "OH": 1.80, "OOH": 2.05}.get(ads_clean, 1.80)
+                        z_cation = float(z0_default) - float(default_h)
+                        heights = OER_AEM_CATION_HEIGHT_GRID.get(ads_clean, (float(default_h),))
+                    else:
+                        z_cation = None
+                        heights = (None,)
+                    for h_trial in heights:
+                        if h_trial is None:
+                            z0 = z0_default
+                            site_label_seed = base_label
+                            h_val = None
+                        else:
+                            z0 = float(z_cation) + float(h_trial)
+                            site_label_seed = f"{base_label}:h{float(h_trial):.2f}"
+                            h_val = float(h_trial)
+                        seed_variants.append({
+                            "site_label": site_label_seed,
+                            "oer_base_site_label": base_label,
+                            "oer_start_height_A": h_val,
+                            "site_kind": "oer_cation" if (_is_oer and surface_channel == "adsorbate_on_cation") else str(kind),
+                            "xy": np.asarray([x0, y0], float),
+                            "target_anchor_xyz": np.asarray([x0, y0, z0], float),
+                            "target_anchor_dir": None if target_dir is None else np.asarray(target_dir, float),
+                            "oxide_seed_mode": str(ch),
+                            "surface_channel": str(surface_channel),
+                            "seed_source": site_seed.get("seed_source"),
+                            "surface_indices": tuple(int(i) for i in site_seed.get("surface_indices", ()) or ()),
+                            "active_cation_index": site_seed.get("active_cation_index"),
+                            "active_cation_symbol": site_seed.get("active_cation_symbol"),
+                        })
 
             for seed in seed_variants:
                 slab_ads = _build_adsorbate_on_site(
@@ -2275,17 +2732,57 @@ def _run_co2rr_che(
                     dz=1.8,
                     ref_dir="ref_gas",
                     target_anchor_xyz=seed["target_anchor_xyz"],
+                    target_anchor_dir=seed.get("target_anchor_dir"),
                 )
+
+                site_label_file = str(seed["site_label"]).replace(":", "__")
+                initial_cif_path = UROOT / f"sites/user_{site_label_file}_{ads_clean}_initial.cif"
+                try:
+                    write(initial_cif_path, slab_ads)
+                except Exception:
+                    pass
+
+                # OER oxide AEM diagnostic modes.  HER/CO2RR/ORR paths keep
+                # their original free_steps/fmax behavior.
+                oer_diag = bool(
+                    _is_oer
+                    and str(mtype).lower() == "oxide"
+                    and str(seed.get("surface_channel", "")).lower() == "adsorbate_on_cation"
+                    and ads_clean in {"O", "OH", "OOH"}
+                )
+                if oer_diag:
+                    if _oer_relax_mode in {"placement_only", "single_point"}:
+                        ads_relax_steps = 0
+                        ads_relax_fmax = float(OER_AEM_SHORT_RELAX_FMAX)
+                        relax_ads_flag = False
+                    elif _oer_relax_mode == "short_relax":
+                        ads_relax_steps = int(min(int(free_steps), int(OER_AEM_SHORT_RELAX_STEPS)))
+                        ads_relax_fmax = float(OER_AEM_SHORT_RELAX_FMAX)
+                        relax_ads_flag = True
+                    else:  # normal_relax
+                        ads_relax_steps = int(free_steps)
+                        ads_relax_fmax = 0.05
+                        relax_ads_flag = True
+                else:
+                    ads_relax_steps = int(free_steps)
+                    ads_relax_fmax = 0.05
+                    relax_ads_flag = True
 
                 slab_ads_rel, E_slab_ads, opt_meta_ads = _relax_slab_ads(
                     slab_ads,
                     n_slab_atoms=meta_flags["n_atoms"],
-                    steps=free_steps,
-                    fmax=0.05,
-                    relax_ads=True,
+                    steps=ads_relax_steps,
+                    fmax=ads_relax_fmax,
+                    relax_ads=bool(relax_ads_flag),
                 )
+                if isinstance(opt_meta_ads, dict):
+                    opt_meta_ads["oer_diagnostic_mode"] = str(_oer_relax_mode if oer_diag else "not_oer_diagnostic")
+                    opt_meta_ads["oer_diagnostic_active"] = bool(oer_diag)
+                    opt_meta_ads["oer_ads_relax_steps_used"] = int(ads_relax_steps)
+                    opt_meta_ads["oer_ads_relax_fmax_used"] = float(ads_relax_fmax)
 
-                write(UROOT / f"sites/user_{str(seed['site_label']).replace(':', '__')}_{ads_clean}.cif", slab_ads_rel)
+                relaxed_cif_path = UROOT / f"sites/user_{site_label_file}_{ads_clean}.cif"
+                write(relaxed_cif_path, slab_ads_rel)
 
                 # --- lateral displacement & QA metrics (anchor-based) ---
                 coords = slab_ads_rel.get_positions()
@@ -2311,7 +2808,7 @@ def _run_co2rr_che(
                     seed_kind=seed["site_kind"],
                     initial_xy=np.asarray(seed["xy"], float),
                     final_anchor_xy=anchor_xy,
-                    classification_mode="auto",
+                    classification_mode=("oxide_oer_cation" if (_is_oer and str(mtype).lower() == "oxide" and str(seed.get("surface_channel", "")).lower() == "adsorbate_on_cation") else "auto"),
                     disp_threshold=float(migrate_thr),
                 )
                 tracking["initial_surface_indices"] = _fmt_surface_indices(seed.get("surface_indices", ()))
@@ -2343,6 +2840,39 @@ def _run_co2rr_che(
 
                 migrated = bool(tracking["migrated"])
 
+                oxygen_metrics = _oxygen_adsorbate_state_metrics(
+                    slab_coords3,
+                    ads_coords3,
+                    ads_symbols,
+                    ads_clean,
+                    surface_channel=seed.get("surface_channel"),
+                    slab_symbols=list(symbols_all[:n_slab]),
+                    target_cation_indices=tuple(int(i) for i in seed.get("surface_indices", ()) or ()),
+                ) if _is_oxygen else {}
+
+                legacy_internal_broken = bool(broken)
+                oxygen_override_broken = False
+                # O* is monatomic. Legacy CO2RR internal-bond QA can falsely mark it
+                # as broken because there is no internal bond to check. For oxygen
+                # intermediates, accept monatomic O* when the oxygen-specific cation
+                # binding metrics are valid. Detached/crashed/desorbed states are
+                # still rejected by the separate checks below.
+                if (
+                    _is_oxygen
+                    and ads_clean == "O"
+                    and legacy_internal_broken
+                    and bool(oxygen_metrics.get("oxygen_adsorbate", False))
+                    and bool(oxygen_metrics.get("oxygen_internal_bond_ok", False))
+                    and bool(oxygen_metrics.get("oxygen_surface_bond_ok", False))
+                    and bool(oxygen_metrics.get("oxygen_bound_to_cation", False))
+                ):
+                    broken = False
+                    oxygen_override_broken = True
+                if _is_oxygen:
+                    oxygen_metrics["legacy_internal_broken"] = bool(legacy_internal_broken)
+                    oxygen_metrics["legacy_internal_broken_overridden_for_oer"] = bool(oxygen_override_broken)
+                    oxygen_metrics["oxygen_qa_policy"] = "oer_monatomic_O_surface_binding_override" if oxygen_override_broken else "oxygen_default"
+
                 qa = "ok"
                 if crashed:
                     qa = "crashed"
@@ -2350,8 +2880,30 @@ def _run_co2rr_che(
                     qa = "desorbed"
                 elif broken:
                     qa = "broken"
+                elif bool(oxygen_metrics.get("oxygen_adsorbate", False)) and not bool(oxygen_metrics.get("valid_for_oer_summary", False)):
+                    # Do not allow detached or wrong-channel oxygen intermediates to be
+                    # silently retained as "migrated" OER candidates.
+                    state_class = str(oxygen_metrics.get("oer_state_class", "invalid_oxygen_intermediate"))
+                    qa = "detached" if "detached" in state_class else state_class
+                elif (
+                    _is_oer
+                    and bool(oxygen_metrics.get("valid_for_oer_summary", False))
+                    and str(tracking.get("site_family", "")).lower() == "oxide_oer_cation"
+                    and str(tracking.get("initial_site_kind", "")).lower() == "oer_cation"
+                    and str(tracking.get("final_site_kind", "")).lower() == "oer_cation"
+                ):
+                    # OER cation-bound intermediates often relax laterally while remaining
+                    # bonded to the same exposed-cation basin.  Treat this as a relaxed
+                    # bound state, not as a physical migration, when the OER site taxonomy
+                    # remains stable.
+                    qa = "bound_relaxed"
+                    migrated = False
+                    tracking["migrated"] = False
+                    tracking["migration_basis"] = "none"
+                    tracking["migration_type"] = "none"
+                    tracking["qc_flags"] = [f for f in tracking.get("qc_flags", []) if f != "migrated_site"]
                 elif migrated:
-                    qa = "migrated"
+                    qa = "bound_migrated" if bool(oxygen_metrics.get("valid_for_oer_summary", False)) else "migrated"
 
                 relaxed_site = tracking["final_site_kind"]
                 if relaxed_site == "unknown":
@@ -2379,22 +2931,40 @@ def _run_co2rr_che(
                 elif ads_clean in ("HCOO", "OCHO"):
                     E_reagents = E_CO2 + 0.5 * E_H2
                     ref_rxn = "CO2 + 1/2 H2"
-                # ── ORR intermediates ────────────────────────────────────────
+                # ── ORR/OER oxygen intermediates ─────────────────────────────
                 elif ads_clean == "OOH":
-                    # O2 + (H⁺+e⁻) → OOH*
-                    _E_O2_eff = 2 * E_H2O - 2 * E_H2 + 4 * ORR_EQUIL_POTENTIAL
-                    E_reagents = _E_O2_eff + 0.5 * E_H2
-                    ref_rxn = "O2_eff + 1/2 H2"
+                    if _is_oer:
+                        # OER AEM standard CHE intermediate:
+                        # ΔG_*OOH = G_*OOH - G_* - (2H2O - 3/2 H2)
+                        E_reagents = 2.0 * E_H2O - 1.5 * E_H2
+                        ref_rxn = "2H2O - 3/2 H2 [OER_AEM]"
+                    else:
+                        # ORR descriptor: O2 + (H+ + e-) -> OOH*
+                        _E_O2_eff = 2 * E_H2O - 2 * E_H2 + 4 * ORR_EQUIL_POTENTIAL
+                        E_reagents = _E_O2_eff + 0.5 * E_H2
+                        ref_rxn = "O2_eff + 1/2 H2 [ORR]"
                 elif ads_clean == "O":
-                    # O2 + 2(H⁺+e⁻) → O* + H2O
-                    _E_O2_eff = 2 * E_H2O - 2 * E_H2 + 4 * ORR_EQUIL_POTENTIAL
-                    E_reagents = _E_O2_eff + E_H2 - E_H2O
-                    ref_rxn = "O2_eff + H2 - H2O"
+                    if _is_oer:
+                        # OER AEM standard CHE intermediate:
+                        # ΔG_*O = G_*O - G_* - (H2O - H2)
+                        E_reagents = E_H2O - E_H2
+                        ref_rxn = "H2O - H2 [OER_AEM]"
+                    else:
+                        # ORR descriptor: O2 + 2(H+ + e-) -> O* + H2O
+                        _E_O2_eff = 2 * E_H2O - 2 * E_H2 + 4 * ORR_EQUIL_POTENTIAL
+                        E_reagents = _E_O2_eff + E_H2 - E_H2O
+                        ref_rxn = "O2_eff + H2 - H2O [ORR]"
                 elif ads_clean == "OH":
-                    # O2 + 3(H⁺+e⁻) → OH* + H2O
-                    _E_O2_eff = 2 * E_H2O - 2 * E_H2 + 4 * ORR_EQUIL_POTENTIAL
-                    E_reagents = _E_O2_eff + 1.5 * E_H2 - E_H2O
-                    ref_rxn = "O2_eff + 3/2 H2 - H2O"
+                    if _is_oer:
+                        # OER AEM standard CHE intermediate:
+                        # ΔG_*OH = G_*OH - G_* - (H2O - 1/2 H2)
+                        E_reagents = E_H2O - 0.5 * E_H2
+                        ref_rxn = "H2O - 1/2 H2 [OER_AEM]"
+                    else:
+                        # ORR descriptor: O2 + 3(H+ + e-) -> OH* + H2O
+                        _E_O2_eff = 2 * E_H2O - 2 * E_H2 + 4 * ORR_EQUIL_POTENTIAL
+                        E_reagents = _E_O2_eff + 1.5 * E_H2 - E_H2O
+                        ref_rxn = "O2_eff + 3/2 H2 - H2O [ORR]"
                 # ─────────────────────────────────────────────────────────────
                 else:
                     E_reagents = 0.0
@@ -2406,7 +2976,7 @@ def _run_co2rr_che(
                 dG_ads = float(dE_ads + g_corr)
     
                 row: Dict[str, object] = {
-                    "mode": "ORR" if _is_orr else "CO2RR",
+                    "mode": ("OER" if _is_oer else "CO2RR"),
                     "adsorbate": ads_clean,
                     "site": seed["site_kind"],
                     "site_label": seed["site_label"],
@@ -2431,12 +3001,21 @@ def _run_co2rr_che(
                     "ads_relax_n_steps": int((opt_meta_ads or {}).get("n_steps", 0)),
                     "ads_relax_converged": (opt_meta_ads or {}).get("converged", None),
                     "ads_relax_error": (opt_meta_ads or {}).get("error", None),
+                    "oer_diagnostic_mode": (opt_meta_ads or {}).get("oer_diagnostic_mode", None),
+                    "oer_diagnostic_active": (opt_meta_ads or {}).get("oer_diagnostic_active", None),
+                    "oer_ads_relax_steps_used": (opt_meta_ads or {}).get("oer_ads_relax_steps_used", None),
+                    "oer_ads_relax_fmax_used": (opt_meta_ads or {}).get("oer_ads_relax_fmax_used", None),
+                    "initial_structure_cif": str(Path(initial_cif_path).resolve()),
+                    "structure_cif": str(Path(relaxed_cif_path).resolve()),
                     "ΔE_ads_user (eV)": float(dE_ads),
                     "ΔE_raw(slab+ads - slab) (eV)": float(dE_raw),
                     "E_ref_reagents (eV)": float(E_reagents),
                     "G_correction (eV)": float(g_corr),
                     "ref_rxn": ref_rxn,
                     "ΔG_ads (eV)": float(dG_ads) if export_absolute else None,
+                    "ΔG_ads_raw_reference_applied (eV)": float(dG_ads) if export_absolute else None,
+                    "OER_reference_scheme": ("standard_OER_AEM_H2O_H2" if _is_oer and ads_clean in {"OH", "O", "OOH"} else "other"),
+                    "oxygen_intermediate_role": ("OER_AEM" if _is_oer and ads_clean in {"OH", "O", "OOH"} else "other"),
                     "initial_anchor_x(Å)": tracking["initial_anchor_x(Å)"],
                     "initial_anchor_y(Å)": tracking["initial_anchor_y(Å)"],
                     "final_anchor_x(Å)": tracking["final_anchor_x(Å)"],
@@ -2445,6 +3024,10 @@ def _run_co2rr_che(
                     "final_site_match_dist(Å)": float(tracking["final_site_match_dist(Å)"]),
                     "oxide_seed_mode": seed.get("oxide_seed_mode"),
                     "surface_channel": seed.get("surface_channel"),
+                    "active_cation_index": seed.get("active_cation_index"),
+                    "active_cation_symbol": seed.get("active_cation_symbol"),
+                    "oer_base_site_label": seed.get("oer_base_site_label"),
+                    "oer_start_height_A": seed.get("oer_start_height_A"),
                     "ads_anchor_mode": anchor_mode,
                     "ads_anchor_z_above_top(Å)": float(anchor_z_above_top),
                     "ads_min_slab_dist(Å)": float(min_slab_dist),
@@ -2455,6 +3038,7 @@ def _run_co2rr_che(
                     "crashed": bool(crashed),
                     "qa": qa,
                     "relaxed_site": relaxed_site,
+                    **oxygen_metrics,
                     "slab_relax_drop": meta_flags["slab_relax_drop"],
                     "vac_warning": meta_flags["vac_warning"],
                 }
@@ -2462,16 +3046,18 @@ def _run_co2rr_che(
 
     # Write metadata even when no rows are produced
     if not rows:
-        _out_name = "results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv"
+        _out_name = ("results_sites_oer.csv" if _is_oer else ("results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv"))
         out_csv = out_root / _out_name
         pd.DataFrame([]).to_csv(out_csv, index=False)
-        _mode_str = "ORR" if _is_orr else "CO2RR"
+        _mode_str = ("OER" if _is_oer else "CO2RR")
         meta = {
             "mode": _mode_str,
             "user_slab": str(Path(user_slab_cif).resolve()),
             "relax_mode": relax_mode,
             "steps": {"slab": slab_steps, "ads": free_steps},
             "adspecies": list(adspecies),
+            "OER_RELAXATION_MODE": str(_oer_relax_mode) if _is_oer else None,
+            "OER_MANUAL_CATION_INDICES": list(_manual_oer_cations) if _is_oer else [],
             "ADS_CORR_effective (eV)": ads_corr,
             "THERMO_FILE": str(thermo_path.resolve()),
             "GAS_REF_E_USED (eV)": gas_E,
@@ -2489,7 +3075,7 @@ def _run_co2rr_che(
         }
         if thermo_data is not None:
             meta["THERMO_RAW"] = thermo_data
-        _meta_name_empty = "meta_orr.json" if _is_orr else "meta_co2rr.json"
+        _meta_name_empty = ("meta_oer.json" if _is_oer else ("meta_orr.json" if _is_orr else "meta_co2rr.json"))
         (out_root / _meta_name_empty).write_text(json.dumps(meta, indent=2))
         return str(out_csv), meta
 
@@ -2502,7 +3088,7 @@ def _run_co2rr_che(
     )
     df = df.assign(abs_val=lambda x: x[key].abs()).sort_values(["abs_val"])
 
-    _out_name2 = "results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv"
+    _out_name2 = ("results_sites_oer.csv" if _is_oer else ("results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv"))
     out_csv = out_root / _out_name2
     df.drop(columns=["abs_val"], errors="ignore").to_csv(
         out_csv,
@@ -2511,16 +3097,16 @@ def _run_co2rr_che(
     )
 
     orr_summary_csv = None
-    if _is_orr:
+    if _is_oxygen:
         try:
-            _orr_summary = _summarize_orr_descriptor_table(df.drop(columns=["abs_val"], errors="ignore"), U=float(orr_u))
-            if _orr_summary is not None and (not _orr_summary.empty):
-                orr_summary_csv = out_root / "results_orr_summary.csv"
-                _orr_summary.to_csv(orr_summary_csv, index=False, float_format="%.6f")
+            _oer_summary = _summarize_oer_descriptor_table(df.drop(columns=["abs_val"], errors="ignore"), U=float(orr_u))
+            if _oer_summary is not None and (not _oer_summary.empty):
+                orr_summary_csv = out_root / "results_oer_competition_summary.csv"
+                _oer_summary.to_csv(orr_summary_csv, index=False, float_format="%.6f")
         except Exception:
             orr_summary_csv = None
 
-    _mode_str2 = "ORR" if _is_orr else "CO2RR"
+    _mode_str2 = ("OER" if _is_oer else "CO2RR")
     meta = {
         "mode": _mode_str2,
         "user_slab": str(Path(user_slab_cif).resolve()),
@@ -2532,6 +3118,7 @@ def _run_co2rr_che(
         "GAS_REF_E_USED (eV)": gas_E,
         "GAS_REF_SOURCE": gas_src,
         "HER_GUARDRAIL": her_guard,
+        "OXYGEN_SUMMARY_CSV": str(orr_summary_csv) if orr_summary_csv is not None else None,
         "DISP_METRIC": "anchor_xy",
         "MIGRATE_THR_CO(Å)": float(MIGRATE_THR),
         "MIGRATE_THR_COOH_HCOO_OCHO(Å)": float(max(MIGRATE_THR, 2.5)),
@@ -2545,7 +3132,7 @@ def _run_co2rr_che(
     if thermo_data is not None:
         meta["THERMO_RAW"] = thermo_data
 
-    _meta_name = "meta_orr.json" if _is_orr else "meta_co2rr.json"
+    _meta_name = ("meta_oer.json" if _is_oer else ("meta_orr.json" if _is_orr else "meta_co2rr.json"))
     (out_root / _meta_name).write_text(json.dumps(meta, indent=2))
 
     return str(out_csv), meta
@@ -2723,14 +3310,14 @@ def run_oxide_co2rr_che(
 
 
 # =====================================================================
-# ORR Public API
-# run_metal_orr_che / run_oxide_orr_che
-# Internally calls _run_co2rr_che with reaction_mode="ORR"
+# OER competition Public API
+# Uses the same OOH*/O*/OH* oxygen-intermediate backend as ORR, but writes
+# OER-oriented output names and summary metadata.
 # =====================================================================
 
-def run_metal_orr_che(
+def run_metal_oer_che(
     user_slab_cif: str,
-    out_root: str | Path = "calc/metal_orr",
+    out_root: str | Path = "calc/metal_oer",
     sites: Iterable[str] = ("ontop", "bridge", "hollow"),
     vac_z: float = 20.0,
     layers: int = 7,
@@ -2742,11 +3329,13 @@ def run_metal_orr_che(
     her_site_preference: str = "ontop",
     her_use_net_corr: bool = True,
     orr_u: float = 0.0,
+    oer_relaxation_mode: str = DEFAULT_OER_RELAXATION_MODE,
 ):
     """
-    ORR screening on metal surfaces.
-    Intermediates: OOH*, O*, OH* (Norskov 4e⁻ CHE)
-    Reference potential: 1.23 V vs RHE (E_O2 = 2·E_H2O - 2·E_H2 + 4×1.23 eV)
+    OER-competition screening on metal surfaces.
+
+    This is not a HER branch.  It evaluates OOH*/O*/OH* descriptors and
+    produces an OER penalty summary for anodic candidate screening.
     """
     return _run_co2rr_che(
         "metal",
@@ -2762,14 +3351,15 @@ def run_metal_orr_che(
         her_guardrail=her_guardrail,
         her_site_preference=her_site_preference,
         her_use_net_corr=her_use_net_corr,
-        reaction_mode="ORR",
+        reaction_mode="OER",
         orr_u=orr_u,
+        oer_relaxation_mode=oer_relaxation_mode,
     )
 
 
-def run_oxide_orr_che(
+def run_oxide_oer_che(
     user_slab_cif: str,
-    out_root: str | Path = "calc/oxide_orr",
+    out_root: str | Path = "calc/oxide_oer",
     sites: Iterable[str] = ("hollow", "bridge", "ontop"),
     vac_z: float = 30.0,
     layers: int = 7,
@@ -2781,11 +3371,14 @@ def run_oxide_orr_che(
     her_site_preference: str = "ontop",
     her_use_net_corr: bool = True,
     orr_u: float = 0.0,
+    oer_relaxation_mode: str = DEFAULT_OER_RELAXATION_MODE,
+    oer_manual_cation_indices: Optional[Iterable[int]] = None,
 ):
     """
-    ORR screening on oxide surfaces.
-    Intermediates: OOH*, O*, OH* (Norskov 4e⁻ CHE)
-    Reference potential: 1.23 V vs RHE (E_O2 = 2·E_H2O - 2·E_H2 + 4×1.23 eV)
+    OER-competition screening on oxide surfaces.
+
+    AEM OER summaries use cation/mixed oxygen-intermediate channels and
+    explicitly exclude lattice-O protonation fallback rows.
     """
     return _run_co2rr_che(
         "oxide",
@@ -2801,14 +3394,61 @@ def run_oxide_orr_che(
         her_guardrail=her_guardrail,
         her_site_preference=her_site_preference,
         her_use_net_corr=her_use_net_corr,
-        reaction_mode="ORR",
+        reaction_mode="OER",
         orr_u=orr_u,
+        oer_relaxation_mode=oer_relaxation_mode,
+        oer_manual_cation_indices=oer_manual_cation_indices,
     )
 
-def _summarize_orr_descriptor_table(df: pd.DataFrame, U: float = 0.0) -> pd.DataFrame:
+
+def _oer_risk_from_eta(eta_oer: float) -> tuple[str, float, str]:
+    """Map OER overpotential proxy to competition-risk metadata.
+
+    In anodic organic-oxidation screening, low ηOER is a penalty because it
+    indicates that water oxidation can compete strongly with the target organic
+    oxidation pathway.
     """
-    Convert descriptor table (ΔG_OOH, ΔG_O, ΔG_OH) into ORR/OER step thermodynamics.
-    One-electron CHE shift is applied to ORR steps as ΔG(U)=ΔG(0)-U.
+    try:
+        eta = float(eta_oer)
+    except Exception:
+        return "unknown", float("nan"), "eta_OER unavailable"
+    if eta < 0.35:
+        return "high", 1.0, "low OER overpotential proxy; high OER-competition risk"
+    if eta < 0.60:
+        return "medium", 0.5, "moderate OER-competition risk"
+    return "low", 0.0, "high OER overpotential proxy; lower OER-competition risk"
+
+
+def _oer_steps_from_intermediates(dg_oh: float, dg_o: float, dg_ooh: float) -> tuple[dict[str, float], float, str]:
+    """Return standard 4-step OER AEM free energies and ηOER.
+
+    Inputs are standard CHE intermediate free energies:
+      ΔG_*OH  = G_*OH  - G_* - (H2O - 1/2 H2)
+      ΔG_*O   = G_*O   - G_* - (H2O - H2)
+      ΔG_*OOH = G_*OOH - G_* - (2H2O - 3/2 H2)
+    """
+    steps = {
+        "OER_step1_H2O_to_OH": float(dg_oh),
+        "OER_step2_OH_to_O": float(dg_o - dg_oh),
+        "OER_step3_O_to_OOH": float(dg_ooh - dg_o),
+        "OER_step4_OOH_to_O2": float(4.92 - dg_ooh),
+    }
+    pds = max(steps, key=steps.get)
+    eta = float(max(steps.values()) - 1.23)
+    return steps, eta, pds
+
+
+def _summarize_oer_descriptor_table(df: pd.DataFrame, U: float = 0.0) -> pd.DataFrame:
+    """
+    Convert an oxygen-intermediate descriptor table into OER step thermodynamics.
+
+    Important: ΔG_ads (eV) must already be referenced to standard OER AEM H2O/H2 intermediates.
+
+    OER safety policy:
+      - If `valid_for_oer_summary` exists, only rows explicitly marked True are used.
+      - Otherwise, rows with qa in {ok, bound_migrated} are used.
+      - Rows from lattice-O protonation / anion_o fallback channels are not mixed
+        into adsorbate-evolution-mechanism OER summaries.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -2816,78 +3456,177 @@ def _summarize_orr_descriptor_table(df: pd.DataFrame, U: float = 0.0) -> pd.Data
     if not need.issubset(set(df.columns)):
         return pd.DataFrame()
 
-    group_cols = [c for c in ["site_label", "site", "oxide_seed_mode", "surface_channel"] if c in df.columns]
+    work = df.copy()
+    mode_series = work["mode"].astype(str).str.upper() if "mode" in work.columns else pd.Series(["OER"] * len(work), index=work.index)
+    is_oer_table = True
+
+    if "valid_for_oer_summary" in work.columns:
+        valid_mask = work["valid_for_oer_summary"].astype(str).str.lower().isin(["true", "1", "yes"])
+        work = work.loc[valid_mask].copy()
+    elif "qa" in work.columns:
+        qa = work["qa"].astype(str).str.strip().str.lower()
+        work = work.loc[qa.isin(["ok", "bound_relaxed", "bound_migrated"])].copy()
+
+    if "surface_channel" in work.columns:
+        bad_channels = {
+            "protonated_lattice_oxygen",
+            "anion_o",
+            "lattice_protonation_disabled_for_aem",
+            "fallback_site",
+        }
+        ch = work["surface_channel"].astype(str).str.strip().str.lower()
+        work = work.loc[~ch.isin(bad_channels)].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    use_base_label = False
+    if "oer_base_site_label" in work.columns:
+        _base = work["oer_base_site_label"].where(~work["oer_base_site_label"].isna(), "").astype(str).str.strip()
+        use_base_label = bool((_base != "").any())
+    if use_base_label:
+        group_cols = [c for c in ["oer_base_site_label", "site", "oxide_seed_mode", "surface_channel"] if c in work.columns]
+    else:
+        group_cols = [c for c in ["site_label", "site", "oxide_seed_mode", "surface_channel"] if c in work.columns]
+
     rows = []
-    for keys, sub in df.groupby(group_cols, dropna=False):
+    for keys, sub in work.groupby(group_cols, dropna=False):
         if not isinstance(keys, tuple):
             keys = (keys,)
         key_map = dict(zip(group_cols, keys))
-        vals = {}
-        qa_map = {}
-        for _, r in sub.iterrows():
+        vals: dict[str, float] = {}
+        qa_map: dict[str, str] = {}
+        state_map: dict[str, str] = {}
+        height_map: dict[str, object] = {}
+        ref_map: dict[str, str] = {}
+
+        # Multi-start policy: for each intermediate, keep the lowest-energy valid geometry.
+        for ads_name, sub_ads in sub.groupby(sub["adsorbate"].astype(str).str.upper(), dropna=False):
+            tmp = sub_ads.copy()
+            tmp["_g"] = pd.to_numeric(tmp.get("ΔG_ads (eV)"), errors="coerce")
+            tmp = tmp[np.isfinite(tmp["_g"])].copy()
+            if tmp.empty:
+                continue
+            ridx = tmp["_g"].idxmin()
+            r = tmp.loc[ridx]
             a = str(r.get("adsorbate", "")).upper()
-            g = pd.to_numeric(r.get("ΔG_ads (eV)"), errors="coerce")
-            if pd.notna(g):
-                vals[a] = float(g)
-                qa_map[a] = str(r.get("qa", ""))
+            vals[a] = float(r["_g"])
+            qa_map[a] = str(r.get("qa", ""))
+            state_map[a] = str(r.get("oer_state_class", ""))
+            height_map[a] = r.get("oer_start_height_A", None)
+            ref_map[a] = str(r.get("ref_rxn", ""))
+
+        # ORR legacy summary requires explicit OOH/O/OH.
         if not {"OOH", "O", "OH"}.issubset(vals.keys()):
             continue
+        # Explicit OER AEM summary.  In OER mode these vals use standard H2O/H2
+        # references.  In ORR mode this is kept as a formal reverse descriptor only.
+        steps_oer_explicit, eta_oer_explicit, pds_oer_explicit = _oer_steps_from_intermediates(
+            vals["OH"], vals["O"], vals["OOH"]
+        )
+        dgooh_minus_dgoh = float(vals["OOH"] - vals["OH"])
 
-        d1_orr_0 = 4.92 - vals["OOH"]
-        d2_orr_0 = vals["OOH"] - vals["O"]
-        d3_orr_0 = vals["O"] - vals["OH"]
-        d4_orr_0 = vals["OH"]
-        d1_orr_u = d1_orr_0 - float(U)
-        d2_orr_u = d2_orr_0 - float(U)
-        d3_orr_u = d3_orr_0 - float(U)
-        d4_orr_u = d4_orr_0 - float(U)
-        steps_orr_0 = {
-            "ORR_step1_O2_to_OOH": d1_orr_0,
-            "ORR_step2_OOH_to_O": d2_orr_0,
-            "ORR_step3_O_to_OH": d3_orr_0,
-            "ORR_step4_OH_to_H2O": d4_orr_0,
-        }
-        steps_orr_u = {
-            "ORR_step1_O2_to_OOH@U": d1_orr_u,
-            "ORR_step2_OOH_to_O@U": d2_orr_u,
-            "ORR_step3_O_to_OH@U": d3_orr_u,
-            "ORR_step4_OH_to_H2O@U": d4_orr_u,
-        }
-        U_lim = min(steps_orr_0.values())
-        pds = min(steps_orr_0, key=steps_orr_0.get)
-        oer1 = vals["OH"]
-        oer2 = vals["O"] - vals["OH"]
-        oer3 = vals["OOH"] - vals["O"]
-        oer4 = 4.92 - vals["OOH"]
-        steps_oer_0 = {
-            "OER_step1_H2O_to_OH": oer1,
-            "OER_step2_OH_to_O": oer2,
-            "OER_step3_O_to_OOH": oer3,
-            "OER_step4_OOH_to_O2": oer4,
-        }
-        pds_oer = max(steps_oer_0, key=steps_oer_0.get)
+        # Scaling-proxy OER summary, useful as a diagnostic fallback and sanity check.
+        dg_ooh_scaling = float(vals["OH"] + 3.20)
+        steps_oer_scaling, eta_oer_scaling, pds_oer_scaling = _oer_steps_from_intermediates(
+            vals["OH"], vals["O"], dg_ooh_scaling
+        )
+        steps_oer_scaling = {f"{k}_scaling_proxy": v for k, v in steps_oer_scaling.items()}
+
+        explicit_available = {"OOH", "O", "OH"}.issubset(vals.keys())
+        # OOH-OH scaling sanity check.  Valid geometry alone is insufficient for
+        # trusting explicit OOH thermodynamics on oxides; peroxide-like OOH can be
+        # over-/under-stabilized depending on site and model.
+        scaling_deviation = float(abs(dgooh_minus_dgoh - 3.20))
+        if 2.80 <= dgooh_minus_dgoh <= 3.60:
+            explicit_ooh_confidence = "usable"
+        elif (2.50 <= dgooh_minus_dgoh < 2.80) or (3.60 < dgooh_minus_dgoh <= 3.90):
+            explicit_ooh_confidence = "caution"
+        else:
+            explicit_ooh_confidence = "unreliable"
+
+        if is_oer_table:
+            if explicit_available and explicit_ooh_confidence == "usable" and (0.35 <= float(eta_oer_explicit) <= 1.20):
+                source = "explicit"
+                recommendation_basis = "explicit_OOH_passed_scaling_and_eta_sanity"
+            else:
+                source = "scaling_proxy"
+                if not explicit_available:
+                    recommendation_basis = "explicit_triplet_missing"
+                elif explicit_ooh_confidence != "usable":
+                    recommendation_basis = "scaling_proxy_due_to_explicit_OOH_scaling_deviation"
+                else:
+                    recommendation_basis = "scaling_proxy_due_to_eta_outside_IrO2_sanity_window"
+
+        eta_selected = eta_oer_explicit if source == "explicit" else eta_oer_scaling
+        pds_selected = pds_oer_explicit if source == "explicit" else pds_oer_scaling
+        risk, penalty, note = _oer_risk_from_eta(eta_selected)
+        if is_oer_table and source == "scaling_proxy":
+            note = str(note) + "; recommended value uses OOH-OH scaling proxy"
+        benchmark_label = (
+            "explicit_benchmark_like" if (source == "explicit" and explicit_ooh_confidence == "usable")
+            else "scaling_proxy_recommended" if source == "scaling_proxy"
+            else "diagnostic_only"
+        )
+
         row = {
             **key_map,
-            "ΔG_OOH (eV)": vals["OOH"],
-            "ΔG_O (eV)": vals["O"],
-            "ΔG_OH (eV)": vals["OH"],
-            **steps_orr_0,
-            **steps_orr_u,
-            **steps_oer_0,
-            "ORR_U_input (V)": float(U),
-            "U_lim_ORR (V)": float(U_lim),
-            "eta_ORR (V)": float(1.23 - U_lim),
-            "ORR_PDS": pds,
-            "max_ΔG_ORR@U (eV)": float(max(steps_orr_u.values())),
-            "eta_OER (V)": float(max(steps_oer_0.values()) - 1.23),
-            "OER_PDS": pds_oer,
+            "OER_reference_scheme": "standard_OER_AEM_H2O_H2",
+            "OER_summary_source": source,
+            "OER_explicit_available": bool(explicit_available),
+            "OOH_OH_scaling_deviation_from_3p20 (eV)": float(scaling_deviation),
+            "explicit_OOH_confidence": explicit_ooh_confidence,
+            "eta_OER_recommended (V)": float(eta_selected),
+            "OER_recommendation_basis": recommendation_basis,
+            "benchmark_consistency_label": benchmark_label,
+            "ΔG_OOH (eV)": float(vals["OOH"]),
+            "ΔG_O (eV)": float(vals["O"]),
+            "ΔG_OH (eV)": float(vals["OH"]),
+            "ΔG_OOH_minus_ΔG_OH (eV)": dgooh_minus_dgoh,
+            "ΔG_OOH_scaling_proxy (eV)": dg_ooh_scaling,
+            "ΔG_OOH_minus_ΔG_OH_scaling_proxy (eV)": 3.20,
+            **steps_oer_explicit,
+            **steps_oer_scaling,
+            "eta_OER_explicit (V)": float(eta_oer_explicit),
+            "eta_OER_scaling_proxy (V)": float(eta_oer_scaling),
+            "eta_OER (V)": float(eta_selected),
+            "OER_PDS_explicit": pds_oer_explicit,
+            "OER_PDS_scaling_proxy": pds_oer_scaling,
+            "OER_PDS": pds_selected,
+            "chosen_h_OH_A": height_map.get("OH", None),
+            "chosen_h_O_A": height_map.get("O", None),
+            "chosen_h_OOH_A": height_map.get("OOH", None),
+            "OER_competition_penalty": float(penalty),
+            "OER_risk_class": risk,
+            "OER_penalty_note": note,
+            "OER_competition_context": "penalty_for_anodic_organic_oxidation_screening",
             "qa_OOH": qa_map.get("OOH", ""),
             "qa_O": qa_map.get("O", ""),
             "qa_OH": qa_map.get("OH", ""),
+            "state_OOH": state_map.get("OOH", ""),
+            "state_O": state_map.get("O", ""),
+            "state_OH": state_map.get("OH", ""),
+            "ref_rxn_OH": ref_map.get("OH", ""),
+            "ref_rxn_O": ref_map.get("O", ""),
+            "ref_rxn_OOH": ref_map.get("OOH", ""),
         }
         rows.append(row)
-    out = pd.DataFrame(rows)
-    if not out.empty and "eta_ORR (V)" in out.columns:
-        out = out.sort_values(["eta_ORR (V)", "site_label"], kind="mergesort").reset_index(drop=True)
-    return out
 
+    out = pd.DataFrame(rows)
+    if not out.empty and "eta_OER (V)" in out.columns:
+        _sort_cols = ["eta_OER (V)"]
+        if "site_label" in out.columns:
+            _sort_cols.append("site_label")
+        elif "oer_base_site_label" in out.columns:
+            _sort_cols.append("oer_base_site_label")
+        out = out.sort_values(_sort_cols, kind="mergesort").reset_index(drop=True)
+        # v16: make representative-site selection explicit in the summary table.
+        # Rank is based on the already-selected/recommended eta value.
+        out["OER_site_rank_by_recommended_eta"] = np.arange(1, len(out) + 1, dtype=int)
+        out["OER_representative_site"] = False
+        if len(out) > 0:
+            out.loc[out.index[0], "OER_representative_site"] = True
+        label_col = "oer_base_site_label" if "oer_base_site_label" in out.columns else ("site_label" if "site_label" in out.columns else None)
+        if label_col is not None and len(out) > 0:
+            out["OER_representative_site_label"] = str(out.loc[out.index[0], label_col])
+    return out
