@@ -28,20 +28,9 @@ from ocp_app.core.anchors.CHE_mode import (
     run_oxide_che,
     run_metal_co2rr_che,
     run_oxide_co2rr_che,
-    run_metal_orr_che,    # ORR support
-    run_oxide_orr_che,    # ORR support
+    run_metal_oer_che,    # OER competition support
+    run_oxide_oer_che,    # OER competition support
 )
-try:
-    from ocp_app.core.gas_refs import make_orr_templates as _make_orr_templates
-except Exception:
-    _make_orr_templates = None
-
-# Auto-generate ORR intermediate template CIFs (only if missing)
-if _make_orr_templates is not None:
-    try:
-        _make_orr_templates("ref_gas")
-    except Exception:
-        pass
 from ocp_app.core.cifgen import (
     BulkSource,
     BulkSpec,
@@ -107,6 +96,9 @@ from ocp_app.core.oxide_surface_rules import (
     _oxide_candidate_rank_key,
     _pick_best_oxide_slab_candidate,
     _oxide_mode_keep_candidate,
+    _normalize_oxide_candidate_oer_top_surface,
+    _oxide_oer_candidate_rank_key,
+    _oxide_oer_cation_metrics,
 )
 from ocp_app.core.surface_families import (
     INTERFACE_FACET_PRESETS,
@@ -148,6 +140,8 @@ from ocp_app.core.postprocess import (
     _normalize_text_series,
     co2rr_apply_qa_policy,
     co2rr_split_by_qa,
+    oxygen_apply_qa_policy,
+    oxygen_split_by_qa,
     co2rr_dedupe_candidates,
     build_compact_table,
     annotate_site_transitions,
@@ -165,7 +159,7 @@ from ocp_app.core.reporting import (
 )
 from ocp_app.core.structure_check import validate_structure
 from ocp_app.core.ads_sites import _oxide_o_based_ads_position
-from ocp_app.core.ads_sites import oxide_surface_seed_position, expand_oxide_channels_for_adsorbate, ANION_SYMBOLS
+from ocp_app.core.ads_sites import oxide_surface_seed_position, expand_oxide_channels_for_adsorbate, ANION_SYMBOLS, detect_oxide_oer_cation_sites
 from ocp_app.core.ads_sites import (
     detect_metal_111_sites,
     detect_oxide_surface_sites,
@@ -209,7 +203,7 @@ except Exception as e:
 
 # ---------------- App config ----------------
 st.set_page_config(page_title="OCP App (HAPLAB)", layout="wide")
-st.title("Surface Adsorption and Geometry Evaluator(SAGE) — HER / CO₂RR / ORR (HAPLAB v1.0)")
+st.title("Surface Adsorption and Geometry Evaluator(SAGE) — HER / CO₂RR / OER (HAPLAB v1.1)")
 
 R_PH = 0.0591  # eV per pH
 GLOBAL_SEED = 42
@@ -266,6 +260,42 @@ def _coerce_bool_series(s: pd.Series, default: bool = False) -> pd.Series:
             return bool(default)
 
     return s.map(_one).astype(bool)
+
+def _oer_site_adsorbate_compact(df: pd.DataFrame) -> pd.DataFrame:
+    """Compact OER site-level rows without destroying OH/O/OOH triplets.
+
+    CO2RR-style deduplication can pick the single best O, OH, and OOH across
+    different sites, which breaks OER thermodynamic interpretation.  For OER,
+    keep one lowest-energy height per (oer_base_site_label, adsorbate).
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    if "adsorbate" not in work.columns:
+        return work
+    if "oer_base_site_label" not in work.columns:
+        if "site_label" in work.columns:
+            work["oer_base_site_label"] = work["site_label"].astype(str).str.replace(r":h[0-9.]+$", "", regex=True)
+        else:
+            work["oer_base_site_label"] = "oer_site"
+    e_col = "ΔG_ads (eV)" if "ΔG_ads (eV)" in work.columns else ("ΔE_ads_user (eV)" if "ΔE_ads_user (eV)" in work.columns else None)
+    if e_col is None:
+        return work
+    work["_oer_energy"] = pd.to_numeric(work[e_col], errors="coerce")
+    work = work[np.isfinite(work["_oer_energy"])].copy()
+    if work.empty:
+        return work.drop(columns=["_oer_energy"], errors="ignore")
+    rows = []
+    ads_order = {"OH": 0, "O": 1, "OOH": 2}
+    for (_base, _ads), sub in work.groupby(["oer_base_site_label", work["adsorbate"].astype(str).str.upper()], dropna=False):
+        # Match backend summary policy: lowest valid ΔG per site/intermediate.
+        ridx = sub["_oer_energy"].idxmin()
+        rows.append(work.loc[ridx])
+    out = pd.DataFrame(rows).drop(columns=["_oer_energy"], errors="ignore")
+    if not out.empty:
+        out["_ads_order"] = out["adsorbate"].astype(str).str.upper().map(lambda x: ads_order.get(x, 9))
+        out = out.sort_values(["oer_base_site_label", "_ads_order", "site_label"], kind="mergesort").drop(columns=["_ads_order"], errors="ignore").reset_index(drop=True)
+    return out
 
 
 def _split_oxide_d2_primary_reliability(df: pd.DataFrame):
@@ -940,12 +970,13 @@ with st.sidebar:
 
     reaction_mode = st.radio(
         "Reaction mode",
-        ["HER (ΔG_H)", "CO₂RR (ΔG_ads)", "ORR (ΔG_ads)"],
+        ["HER (ΔG_H)", "CO₂RR (ΔG_ads)", "OER competition (OOH/O/OH)"],
         horizontal=False,
-        help="HER: H* adsorption free energy | CO₂RR: COOH*/CO*/HCOO*/OCHO* | ORR: OOH*/O*/OH* (Norskov 4e⁻ CHE)",
+        help="HER: H* adsorption free energy | CO₂RR: COOH*/CO*/HCOO*/OCHO* | OER: OOH*/O*/OH* oxygen-intermediate CHE descriptors",
     )
     is_her = reaction_mode.startswith("HER")
-    is_orr = reaction_mode.startswith("ORR")
+    is_oer = reaction_mode.startswith("OER")
+    is_oxygen = is_oer
 
     relax_mode = st.selectbox(
         "Relaxation level (OCP)",
@@ -966,20 +997,34 @@ with st.sidebar:
     if is_her:
         co2_ads = []
         orr_ads = []
-    elif is_orr:
+    elif is_oxygen:
         co2_ads = []
         orr_ads = st.multiselect(
-            "ORR intermediates",
+            "OER intermediates",
             ["OOH*", "O*", "OH*"],
             default=["OOH*", "O*", "OH*"],
-            help="Norskov 4-electron pathway: OOH* → O* → OH* → H₂O",
+            help="OER oxygen-intermediate pathway. OER summaries require valid, surface-bound OH*, O*, and OOH* rows on the same site/channel.",
         )
-        orr_U = st.number_input(
-            "Applied potential U (V vs RHE)",
-            min_value=-2.0, max_value=2.0, value=0.0, step=0.05,
-            help="0.0 = equilibrium potential (1.23 V vs SHE). More negative = higher reduction overpotential.",
-            key="orr_U_input",
-        )
+        if is_oer:
+            oer_relaxation_mode = st.selectbox(
+                "OER diagnostic relaxation mode",
+                ["placement_only", "single_point", "short_relax", "normal_relax"],
+                index=2,
+                help=(
+                    "OER oxide diagnostics only. placement_only/single_point save the initial adsorbate geometry without adsorbate relaxation; "
+                    "short_relax uses short adsorbate-only relaxation; normal_relax uses the standard adsorbate relaxation. HER is unaffected."
+                ),
+                key="oer_relaxation_mode",
+            )
+            oer_manual_cation_indices_text = st.text_input(
+                "OER manual cation indices (optional)",
+                value="",
+                help="Comma/space-separated atom indices for manual Ir_cus/cation targeting. Empty = automatic exposed-cation detector. Used only for oxide OER.",
+                key="oer_manual_cation_indices_text",
+            )
+        else:
+            oer_relaxation_mode = "short_relax"
+            oer_manual_cation_indices_text = ""
     else:
         co2_ads = st.multiselect(
             "CO₂RR intermediates",
@@ -988,6 +1033,10 @@ with st.sidebar:
         )
         orr_ads = []
 
+
+    if not is_oer:
+        oer_relaxation_mode = "short_relax"
+        oer_manual_cation_indices_text = ""
 
     surfactant_class = "none"
     surfactant_prerelax_slab = False
@@ -1175,7 +1224,11 @@ else:
                     facet_scope,
                 )
                 facet_labels = [_format_facet_label_with_alias(hkl) for hkl in facet_choices]
-                oxide_surface_mode = "Exploratory any clean termination"
+                if bool(globals().get("is_oer", False)):
+                    oxide_surface_mode = "OER AEM cation surface preference"
+                    st.info("OER mode: slab candidates will be ranked by cation exposure / Ir_cus-like suitability, not by HER-style O-rich top exposure.")
+                else:
+                    oxide_surface_mode = "Exploratory any clean termination"
                 st.caption("Low-index c-axis facets are exposed through the reduced (001) family. Literature 00l labels such as (002) are treated as the same selectable family.")
                 oxide_hydrox_mode = "Clean only"
                 _oxide_info = infer_oxide_family_from_atoms(prepared)
@@ -1255,21 +1308,35 @@ else:
                                 mode_pref = str(oxide_surface_mode or "Reference clean surface")
                                 rejected = 0
                                 for a_i, m_i in zip(cand_atoms, cand_meta):
-                                    a_n, m_n = _normalize_oxide_candidate_top_surface(a_i, m_i, z_window=1.8)
-                                    m_n["oxide_surface_mode"] = mode_pref
-                                    m_n["hydroxylation_mode"] = "Clean only"
-                                    keep = _oxide_mode_keep_candidate(m_n, mode_pref)
-                                    if keep:
+                                    if bool(globals().get("is_oer", False)):
+                                        a_n, m_n = _normalize_oxide_candidate_oer_top_surface(a_i, m_i, z_window=1.8)
+                                        m_n["oxide_surface_mode"] = mode_pref
+                                        m_n["hydroxylation_mode"] = "Clean only"
                                         m_n = _annotate_step2_slab_symmetry(m_n)
-                                        m_n["oxide_rank_key"] = _oxide_candidate_rank_key(m_n)
-                                        m_n["oxide_plausibility_rank_key"] = _oxide_plausibility_rank_key(m_n)
+                                        m_n["oxide_rank_key"] = _oxide_oer_candidate_rank_key(m_n)
+                                        m_n["oxide_plausibility_rank_key"] = _oxide_oer_candidate_rank_key(m_n)
+                                        # Do not silently discard OER-not-suitable slabs here.
+                                        # Keep them visible so the user can see why a termination is poor.
                                         norm_atoms.append(a_n)
                                         norm_meta.append(m_n)
                                     else:
-                                        rejected += 1
+                                        a_n, m_n = _normalize_oxide_candidate_top_surface(a_i, m_i, z_window=1.8)
+                                        m_n["oxide_surface_mode"] = mode_pref
+                                        m_n["hydroxylation_mode"] = "Clean only"
+                                        keep = _oxide_mode_keep_candidate(m_n, mode_pref)
+                                        if keep:
+                                            m_n = _annotate_step2_slab_symmetry(m_n)
+                                            m_n["oxide_rank_key"] = _oxide_candidate_rank_key(m_n)
+                                            m_n["oxide_plausibility_rank_key"] = _oxide_plausibility_rank_key(m_n)
+                                            norm_atoms.append(a_n)
+                                            norm_meta.append(m_n)
+                                        else:
+                                            rejected += 1
                                 cand_atoms, cand_meta = norm_atoms, norm_meta
                                 if rejected:
                                     st.info(f"Filtered out {rejected} oxide candidate(s) that failed the current clean-surface selection mode.")
+                                if bool(globals().get("is_oer", False)):
+                                    st.caption("OER mode kept all generated terminations but ranked them by OER_AEM_cation suitability. Use OER-not-suitable only as diagnostic, not as a benchmark surface.")
                                 if not cand_atoms:
                                     raise ValueError("No oxide slab candidates remained after family-aware clean-surface filtering. Try another facet or switch to a less restrictive clean-surface mode.")
                                 paired_ranked = sorted(
@@ -1299,26 +1366,41 @@ else:
                         st.session_state["slabify_candidates_meta"] = cand_meta
                     df_cands = pd.DataFrame(cand_meta)
                     if mtype == "oxide":
-                        st.warning(
-                            "Please review `slab_symmetry`, `surface_O_fraction_top`, `slab_usability`, and `facet_warning` before selecting an oxide slab."
-                        )
-                        basic_cols = [c for c in [
-                            "idx", "miller", "top_exposure", "surface_O_fraction_top", "slab_symmetry", "slab_usability", "n_atoms", "vacuum_z"
-                        ] if c in df_cands.columns]
+                        if bool(globals().get("is_oer", False)):
+                            st.warning(
+                                "OER mode: review `oer_slab_suitability`, exposed cation metrics, and O-crowding before selecting an oxide slab. HER-style O-rich slabs can be poor OER AEM surfaces."
+                            )
+                            basic_cols = [c for c in [
+                                "idx", "miller", "oer_slab_suitability", "oer_slab_score", "oer_best_cation_symbol", "oer_best_cation_index", "oer_best_cation_coordination", "oer_best_o_crowding_min_OO_A", "top_exposure", "surface_O_fraction_top", "slab_symmetry", "n_atoms", "vacuum_z"
+                            ] if c in df_cands.columns]
+                        else:
+                            st.warning(
+                                "Please review `slab_symmetry`, `surface_O_fraction_top`, `slab_usability`, and `facet_warning` before selecting an oxide slab."
+                            )
+                            basic_cols = [c for c in [
+                                "idx", "miller", "top_exposure", "surface_O_fraction_top", "slab_symmetry", "slab_usability", "n_atoms", "vacuum_z"
+                            ] if c in df_cands.columns]
                         st.dataframe(df_cands[basic_cols], use_container_width=True)
                         with st.expander("Show detailed slab candidate metadata", expanded=False):
                             detail_cols = [c for c in [
-                                "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
+                                "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "oer_slab_suitability", "oer_slab_score", "oer_slab_warning", "oer_best_cation_index", "oer_best_cation_symbol", "oer_best_cation_coordination", "oer_best_cation_z_depth_A", "oer_best_open_direction_z", "oer_best_o_crowding_min_OO_A", "oer_candidate_cation_indices", "flipped_for_oer_cation_exposure", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
                                 "surface_O_fraction_bottom", "surface_fraction_top", "surface_fraction_bottom", "slab_symmetry", "slab_symmetry_basis", "top_bottom_asymmetric", "flipped_for_oxide_top_exposure", "oxide_top_surface_ok", "facet_warning", "n_atoms",
                                 "vacuum_z", "recommend_repeat", "slab_usability_reason", "oxide_rule_notes", "surface_diagnostics_notes", "issues"
                             ] if c in df_cands.columns]
                             st.dataframe(df_cands[detail_cols], use_container_width=True)
                         auto_idx = 0
                         auto_meta = _annotate_step2_slab_symmetry(cand_meta[auto_idx])
-                        st.caption(
-                            f"Auto-selected oxide candidate: #{auto_idx} | symmetry={auto_meta.get('slab_symmetry')} | usability={auto_meta.get('slab_usability')} | "
-                            f"rule={auto_meta.get('rule_validity')}/{auto_meta.get('rule_role')} | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
-                        )
+                        if bool(globals().get("is_oer", False)):
+                            st.caption(
+                                f"Auto-selected OER oxide candidate: #{auto_idx} | OER={auto_meta.get('oer_slab_suitability')} | "
+                                f"score={_safe_float(auto_meta.get('oer_slab_score', np.nan)):.2f} | best={auto_meta.get('oer_best_cation_symbol')}{auto_meta.get('oer_best_cation_index')} | "
+                                f"crowding_OO={_safe_float(auto_meta.get('oer_best_o_crowding_min_OO_A', np.nan)):.2f} Å | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
+                            )
+                        else:
+                            st.caption(
+                                f"Auto-selected oxide candidate: #{auto_idx} | symmetry={auto_meta.get('slab_symmetry')} | usability={auto_meta.get('slab_usability')} | "
+                                f"rule={auto_meta.get('rule_validity')}/{auto_meta.get('rule_role')} | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
+                            )
                     else:
                         basic_cols = [c for c in ["idx", "miller", "n_atoms", "vacuum_z", "formula"] if c in df_cands.columns]
                         st.dataframe(df_cands[basic_cols], use_container_width=True)
@@ -1331,8 +1413,12 @@ else:
                         list(range(len(cand_atoms))),
                         index=int(auto_idx),
                         format_func=lambda i: (
-                            f"#{i} | {cand_meta[i].get('slab_symmetry', '?')} | {cand_meta[i].get('slab_usability')} | rule={cand_meta[i].get('rule_validity')}/{cand_meta[i].get('rule_role')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
-                            if mtype == "oxide" else
+                            (
+                                f"#{i} | OER={cand_meta[i].get('oer_slab_suitability')} | score={_safe_float(cand_meta[i].get('oer_slab_score', np.nan)):.2f} | "
+                                f"best={cand_meta[i].get('oer_best_cation_symbol')}{cand_meta[i].get('oer_best_cation_index')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
+                            ) if (mtype == "oxide" and bool(globals().get("is_oer", False))) else (
+                                f"#{i} | {cand_meta[i].get('slab_symmetry', '?')} | {cand_meta[i].get('slab_usability')} | rule={cand_meta[i].get('rule_validity')}/{cand_meta[i].get('rule_role')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
+                            ) if mtype == "oxide" else
                             f"#{i} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
                         ),
                         key="slabify_sel_idx",
@@ -1359,6 +1445,14 @@ else:
                                 "oxide_role": cand_meta[sel_idx].get("oxide_role"),
                                 "slab_symmetry": cand_meta[sel_idx].get("slab_symmetry"),
                                 "slab_symmetry_basis": cand_meta[sel_idx].get("slab_symmetry_basis"),
+                                "oxide_surface_role": cand_meta[sel_idx].get("oxide_surface_role"),
+                                "oer_slab_suitability": cand_meta[sel_idx].get("oer_slab_suitability"),
+                                "oer_slab_score": cand_meta[sel_idx].get("oer_slab_score"),
+                                "oer_best_cation_index": cand_meta[sel_idx].get("oer_best_cation_index"),
+                                "oer_best_cation_symbol": cand_meta[sel_idx].get("oer_best_cation_symbol"),
+                                "oer_best_cation_coordination": cand_meta[sel_idx].get("oer_best_cation_coordination"),
+                                "oer_best_o_crowding_min_OO_A": cand_meta[sel_idx].get("oer_best_o_crowding_min_OO_A"),
+                                "oer_slab_warning": cand_meta[sel_idx].get("oer_slab_warning"),
                             },
                         )
                         try:
@@ -1413,6 +1507,18 @@ else:
                     st.caption("Oxide note: top/bottom terminations are asymmetric. Interpret clean-slab HER outputs cautiously.")
                 elif prep_meta.get('slab_symmetry') == 'quasi-symmetric':
                     st.caption("Oxide note: top/bottom terminations are only quasi-symmetric. Treat representative-surface claims cautiously.")
+                if bool(globals().get("is_oer", False)):
+                    try:
+                        oer_qc = _oxide_oer_cation_metrics(prepared)
+                        st.markdown("**OER AEM cation-site slab QC**")
+                        st.write(f"- OER slab suitability: **{oer_qc.get('oer_slab_suitability', 'unknown')}**")
+                        st.write(f"- Top cation count: **{oer_qc.get('oer_top_cation_count', 'NA')}** | top anion count: **{oer_qc.get('oer_top_anion_count', 'NA')}**")
+                        st.write(f"- Top cation symbols: **{oer_qc.get('oer_top_cation_symbols', '')}**")
+                        st.write(f"- Candidate cation indices: **{oer_qc.get('oer_candidate_cation_indices', '')}**")
+                        if oer_qc.get('oer_slab_warning'):
+                            st.warning(str(oer_qc.get('oer_slab_warning')))
+                    except Exception as e:
+                        st.warning(f"OER slab QC failed: {e}")
 
         bulk_like = (vac_z < 10.0) and bool(prepared.get_pbc()[2])
         if bulk_like:
@@ -1938,6 +2044,11 @@ else:
                 if is_her:
                     rep_sites = _generate_oxide_her_oanchor_sites(atoms_for_sites_eff, max_sites=max(1, int(max_rep) * 2), z_window=2.2, min_xy_sep=1.5)
                     rep_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_eff, rep_sites, dz=1.0, extra_z=0.0)
+                elif is_oer:
+                    rep_sites = detect_oxide_oer_cation_sites(
+                        atoms_for_sites_eff,
+                        max_sites=int(max_rep),
+                    )
                 else:
                     auto_sites = detect_oxide_surface_sites(atoms_for_sites_eff)
                     rep_sites = select_representative_sites(auto_sites, per_kind=int(max_rep))
@@ -1953,7 +2064,7 @@ else:
                 st.markdown("#### 3D Preview (Geometry seeds)")
                 if is_her:
                     preview_ads_options = ["H*"]
-                elif is_orr:
+                elif is_oxygen:
                     preview_ads_options = orr_ads if orr_ads else ["OOH*", "O*", "OH*"]
                 else:
                     preview_ads_options = co2_ads if co2_ads else ["COOH*", "CO*"]
@@ -2057,11 +2168,12 @@ else:
                 )
 
                 sig = _atoms_signature(atoms_for_sites_screen)
+                active_ads_for_key = (orr_ads if is_oxygen else co2_ads)
                 key = _make_ml_screen_key(
                     sig,
                     mtype,
                     reaction_mode,
-                    co2_ads,
+                    active_ads_for_key,
                     preset,
                     int(top_k),
                     int(geom_per_kind),
@@ -2082,6 +2194,11 @@ else:
                         min_xy_sep=1.2,
                     )
                     cand_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_screen, cand_sites, dz=1.0, extra_z=0.0)
+                elif mtype == "oxide" and is_oer:
+                    cand_sites = detect_oxide_oer_cation_sites(
+                        atoms_for_sites_screen,
+                        max_sites=max(1, int(geom_per_kind)),
+                    )
                 else:
                     cand_sites = generate_candidate_sites(
                         atoms_for_sites_screen,
@@ -2090,6 +2207,7 @@ else:
                         n_random=int(n_random),
                         rng_seed=GLOBAL_SEED,
                         random_kind="fcc",
+                        reaction_mode=("OER" if is_oer else "CO2RR"),
                     )
                 if not cand_sites:
                     st.error("No candidate sites generated.")
@@ -2127,15 +2245,16 @@ else:
                             return_raw=True,
                         )
                     else:
-                        _active_ads = orr_ads if is_orr else co2_ads
+                        _active_ads = orr_ads if is_oxygen else co2_ads
                         if not _active_ads:
-                            _ads_label = "ORR" if is_orr else "CO2RR"
+                            _ads_label = "OER" if is_oxygen else "CO2RR"
                             st.error(f"Select at least one {_ads_label} intermediate (sidebar).")
                             return False
+                        _screen_reaction = "OER" if is_oer else "CO2RR"
                         by_ads, raw_by_ads, stats_by_ads = screen_sites_adsorbml_lite(
                             atoms_for_sites_screen,
                             cand_sites,
-                            reaction="ORR" if is_orr else "CO2RR",
+                            reaction=_screen_reaction,
                             mtype=mtype,
                             adsorbates=list(_active_ads),
                             top_k=int(top_k),
@@ -2251,7 +2370,7 @@ else:
                             else:
                                 atoms_prev = generate_slab_ads_series(atoms_for_sites_eff, [s], symbol="H", mode="default")[0]
                         else:
-                            if is_orr:
+                            if is_oxygen:
                                 ads0 = (orr_ads[0] if orr_ads else "OOH*")
                             else:
                                 ads0 = (co2_ads[0] if co2_ads else "COOH*")
@@ -2379,7 +2498,7 @@ else:
             )
 
     if (not is_her):
-        st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. ORR additionally writes a step-wise summary file (results_orr_summary.csv) using the entered U for one-electron CHE shifts.")
+        st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. OER writes a step-wise oxygen-intermediate summary; OER mode additionally writes results_oer_competition_summary.csv.")
 
 
     # Defaults (so variables exist regardless of mode)
@@ -2388,7 +2507,7 @@ else:
     her_use_net_corr = True
 
     # Optional companion HER guardrail for CO2RR (single-site, capped steps)
-    if (not is_her):
+    if (not is_her) and (not is_oer):
         st.markdown("### Optional companion: HER guardrail")
         cHG1, cHG2, cHG3 = st.columns([1.6, 1.0, 1.0])
         with cHG1:
@@ -2423,9 +2542,17 @@ else:
 
     final_user_sites = None
     if use_auto_sites_for_calc:
-        if st.session_state.get("ml_union_site_map") is not None:
+        if st.session_state.get("ml_union_site_map") is not None and not (is_oer and mtype == "oxide"):
             st.info("Auto sites source: ML screening union-sites (from Step 3).")
             final_user_sites = st.session_state.get("ml_union_site_map")
+        elif st.session_state.get("ml_union_site_map") is not None and (is_oer and mtype == "oxide"):
+            st.info("Auto sites source: OER cation detector. Legacy ML union-sites are ignored for oxide-OER taxonomy consistency.")
+            try:
+                rep_sites = detect_oxide_oer_cation_sites(atoms_for_calc, max_sites=max(1, int(st.session_state.get("max_sites_kind", 2))))
+                final_user_sites = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)} if rep_sites else None
+            except Exception as e:
+                st.error(f"OER cation auto-sites failed: {e}")
+                final_user_sites = None
         else:
             st.info("Auto sites source: Geometry representative (from Step 3).")
             try:
@@ -2452,6 +2579,13 @@ else:
                             dz=1.0,
                             extra_z=0.0,
                         ) if rep_site_map_for_calc else None
+                    elif is_oer:
+                        rep_sites = detect_oxide_oer_cation_sites(
+                            atoms_for_calc,
+                            max_sites=max(1, int(st.session_state.get("max_sites_kind", 2))),
+                        )
+                        rep_site_map_for_calc = {f"{s.kind}_{i}": s for i, s in enumerate(rep_sites)}
+                        final_user_sites = rep_site_map_for_calc
                     else:
                         auto_sites = detect_oxide_surface_sites(atoms_for_calc)
                         rep_sites = select_representative_sites(auto_sites, per_kind=per_kind)
@@ -2601,28 +2735,48 @@ else:
                         her_relaxation_scope=str(her_relaxation_scope),
                         her_n_fix_layers=int(her_n_fix_layers),
                     )
-            elif is_orr:
-                # ── ORR branch ─────────────────────────────────────────
+            elif is_oxygen:
+                # ── OER oxygen-intermediate branch ─────────────────
                 _orr_adspecies = tuple(orr_ads) if orr_ads else ("OOH*", "O*", "OH*")
-                _orr_U = float(st.session_state.get("orr_U_input", 0.0))
-                if mtype == "metal":
-                    csv_path, meta = run_metal_orr_che(
-                        str(slab_path),
-                        sites=manual_sites,
-                        relax_mode=relax_mode,
-                        user_ads_sites=final_user_sites if final_user_sites else None,
-                        adspecies=_orr_adspecies,
-                        orr_u=_orr_U,
-                    )
-                else:
-                    csv_path, meta = run_oxide_orr_che(
-                        str(slab_path),
-                        sites=manual_sites,
-                        relax_mode=relax_mode,
-                        user_ads_sites=final_user_sites if final_user_sites else None,
-                        adspecies=_orr_adspecies,
-                        orr_u=_orr_U,
-                    )
+                _orr_U = 0.0
+                if is_oer:
+                    if mtype == "metal":
+                        csv_path, meta = run_metal_oer_che(
+                            str(slab_path),
+                            sites=manual_sites,
+                            relax_mode=relax_mode,
+                            user_ads_sites=final_user_sites if final_user_sites else None,
+                            adspecies=_orr_adspecies,
+                            orr_u=_orr_U,
+                            oer_relaxation_mode=str(st.session_state.get("oer_relaxation_mode", "short_relax")),
+                        )
+                    else:
+                        _manual_text = str(st.session_state.get("oer_manual_cation_indices_text", "") or "")
+                        _manual_indices = []
+                        for _tok in re.split(r"[,\s]+", _manual_text.strip()):
+                            if not _tok:
+                                continue
+                            try:
+                                _manual_indices.append(int(_tok))
+                            except Exception:
+                                pass
+                        # Use the existing Geometry representative sites slider as the only
+                        # OER site-count control. If Step 3 produced explicit oer_cation
+                        # sites, pass their count to the backend; otherwise fall back to
+                        # max_sites_kind. This keeps OH/O/OOH triplets on the same selected
+                        # cation sites instead of using a separate OER-only cap.
+                        _oer_site_cap = len(final_user_sites) if isinstance(final_user_sites, dict) and final_user_sites else int(st.session_state.get("max_sites_kind", 2))
+                        _oer_sites_for_detector = tuple(f"oer_cation_{i}" for i in range(max(1, int(_oer_site_cap))))
+                        csv_path, meta = run_oxide_oer_che(
+                            str(slab_path),
+                            sites=_oer_sites_for_detector,
+                            relax_mode=relax_mode,
+                            user_ads_sites=final_user_sites if final_user_sites else None,
+                            adspecies=_orr_adspecies,
+                            orr_u=_orr_U,
+                            oer_relaxation_mode=str(st.session_state.get("oer_relaxation_mode", "short_relax")),
+                            oer_manual_cation_indices=tuple(_manual_indices) if _manual_indices else None,
+                        )
             else:
                 # ── CO2RR branch ───────────────────────────────────────
                 if not co2_ads:
@@ -2662,7 +2816,7 @@ else:
             if is_her and (mtype == "oxide") and isinstance(oxide_her_calc_audit, dict):
                 df = _append_oxide_her_audit_columns(df, oxide_her_calc_audit)
 
-        mode_label = "HER" if is_her else ("ORR" if is_orr else "CO2RR")
+        mode_label = "HER" if is_her else ("OER" if is_oer else "CO2RR")
 
         if is_her and "ΔG_H (eV)" in df.columns:
             df["ΔG_H(U,pH) (eV)"] = df["ΔG_H (eV)"] - float(U_input) - R_PH * float(pH_input)
@@ -2690,10 +2844,19 @@ else:
                 df.loc[df_rel.index, "reliability"] = "reliable"
             migration_summary = summarize_site_transitions(df)
         else:
-            # CO2RR / ORR: QA-driven policy (migrated is NOT an auto-reject)
-            df = co2rr_apply_qa_policy(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
+            # CO2RR / OER: QA-driven policy.
+            # Oxygen-intermediate modes use stricter binding/channel validity:
+            # plain migrated oxygen rows are not accepted unless they remain
+            # surface-bound and valid_for_oer_summary=True.
+            if is_oxygen:
+                df = oxygen_apply_qa_policy(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
+            else:
+                df = co2rr_apply_qa_policy(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
             df = annotate_site_transitions(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
-            df_keep, df_reject = co2rr_split_by_qa(df)
+            if is_oxygen:
+                df_keep, df_reject = oxygen_split_by_qa(df)
+            else:
+                df_keep, df_reject = co2rr_split_by_qa(df)
 
             # Set reliability consistent with QA policy
             df["reliability"] = "unreliable"
@@ -2721,6 +2884,9 @@ else:
 
         st.session_state["last_run"] = {
             "is_her": bool(is_her),
+            "is_oer": bool(is_oer),
+            "is_orr": False,
+            "is_oxygen": bool(is_oxygen),
             "mtype": str(mtype),
             "reaction_mode": str(reaction_mode),
             "mode_label": str(mode_label),
@@ -2896,17 +3062,24 @@ if last_run is not None:
         df_keep = df_rel if isinstance(df_rel, pd.DataFrame) else pd.DataFrame()
         df_reject = df_unrel if isinstance(df_unrel, pd.DataFrame) else pd.DataFrame()
 
-        df_dedup = co2rr_dedupe_candidates(df_keep) if isinstance(df_keep, pd.DataFrame) else pd.DataFrame()
+        if bool(last_run.get("is_oer")):
+            df_dedup = _oer_site_adsorbate_compact(df_keep) if isinstance(df_keep, pd.DataFrame) else pd.DataFrame()
+        else:
+            df_dedup = co2rr_dedupe_candidates(df_keep) if isinstance(df_keep, pd.DataFrame) else pd.DataFrame()
 
         qa_counts = df["qa"].value_counts(dropna=False) if (isinstance(df, pd.DataFrame) and ("qa" in df.columns)) else pd.Series(dtype=int)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total runs", int(len(df)) if isinstance(df, pd.DataFrame) else 0)
-        c2.metric("Candidates (qa=ok/migrated)", int(len(df_keep)) if isinstance(df_keep, pd.DataFrame) else 0)
-        c3.metric("Rejected (qa!=ok/migrated)", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
-        c4.metric("Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
+        c2.metric("Candidates (QA-valid)", int(len(df_keep)) if isinstance(df_keep, pd.DataFrame) else 0)
+        c3.metric("Rejected (QA-invalid)", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
+        c4.metric("Compact rows" if bool(last_run.get("is_oer")) else "Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
 
-        st.markdown("### Candidates (Deduplicated by relaxed minimum)")
+        if bool(last_run.get("is_oer")):
+            st.markdown("### OER site-level candidate rows")
+            st.caption("One lowest-energy height is retained per selected oer_cation site and intermediate. Use the OER step summary for η_OER interpretation.")
+        else:
+            st.markdown("### Candidates (Deduplicated by relaxed minimum)")
         if isinstance(df_dedup, pd.DataFrame):
             st.dataframe(build_compact_table(df_dedup, mode_label), use_container_width=True)
 
@@ -2922,6 +3095,47 @@ if last_run is not None:
             with st.expander("QA breakdown", expanded=False):
                 st.dataframe(qa_counts.rename_axis("qa").reset_index(name="count"), use_container_width=True)
 
+        # OER oxygen-intermediate summary, if produced by CHE_mode.
+        try:
+            _csvp = Path(str(last_run.get("csv_path", "")))
+            _summary_path = _csvp.parent / "results_oer_competition_summary.csv"
+            if not _summary_path.is_file():
+                _summary_path = None
+            if _summary_path is not None:
+                st.markdown("### OER step summary")
+                _sumdf = pd.read_csv(_summary_path)
+                if "results_oer_competition_summary" in str(_summary_path):
+                    st.caption("OER mode uses standard OER AEM H2O/H2 references. Recommended η uses explicit OOH only when the OOH−OH scaling sanity check passes; otherwise it uses the ΔG*OOH = ΔG*OH + 3.20 eV scaling proxy.")
+                    _summary_cols = [
+                        c for c in [
+                            "OER_site_rank_by_recommended_eta", "OER_representative_site",
+                            "oer_base_site_label", "site_label", "site",
+                            "eta_OER_recommended (V)", "eta_OER (V)",
+                            "eta_OER_explicit (V)", "eta_OER_scaling_proxy (V)",
+                            "OER_summary_source", "explicit_OOH_confidence",
+                            "benchmark_consistency_label",
+                            "ΔG_OOH_minus_ΔG_OH (eV)",
+                            "OOH_OH_scaling_deviation_from_3p20 (eV)",
+                            "OER_PDS", "OER_recommendation_basis",
+                        ] if c in _sumdf.columns
+                    ]
+                    if _summary_cols:
+                        st.dataframe(_sumdf[_summary_cols], use_container_width=True)
+                        with st.expander("Show full OER summary table", expanded=False):
+                            st.dataframe(_sumdf, use_container_width=True)
+                    else:
+                        st.dataframe(_sumdf, use_container_width=True)
+
+                st.download_button(
+                    "Download OER summary CSV",
+                    _sumdf.to_csv(index=False).encode("utf-8"),
+                    _summary_path.name,
+                    "text/csv",
+                    key=f"dl_oxygen_summary_{_summary_path.name}",
+                )
+        except Exception:
+            pass
+
         if isinstance(meta, dict) and meta.get("MIGRATION_SUMMARY"):
             mig_summary = meta.get("MIGRATION_SUMMARY") or {}
             with st.expander("Migration metadata", expanded=False):
@@ -2936,9 +3150,9 @@ if last_run is not None:
         cdl1, cdl2 = st.columns(2)
         with cdl1:
             st.download_button(
-                "Download candidates (dedup) CSV",
+                "Download OER site-level candidates CSV" if bool(last_run.get("is_oer")) else "Download candidates (dedup) CSV",
                 df_dedup.to_csv(index=False).encode("utf-8") if isinstance(df_dedup, pd.DataFrame) else b"",
-                "co2rr_candidates_dedup.csv",
+                (f"{str(mode_label).lower()}_site_level_candidates.csv" if bool(last_run.get("is_oer")) else f"{str(mode_label).lower()}_candidates_dedup.csv"),
                 "text/csv",
                 key="dl_co2rr_candidates_dedup",
             )
@@ -2946,7 +3160,7 @@ if last_run is not None:
             st.download_button(
                 "Download candidates (all) CSV",
                 df_keep.to_csv(index=False).encode("utf-8") if isinstance(df_keep, pd.DataFrame) else b"",
-                "co2rr_candidates_all.csv",
+                f"{str(mode_label).lower()}_candidates_all.csv",
                 "text/csv",
                 key="dl_co2rr_candidates_all",
             )
@@ -3025,6 +3239,9 @@ if last_run is not None:
             "Δ12 (eV)", "classification",
             "D1_site_label", "D1_binding_class", "D1_background_site_label", "D1_model",
             "D2_site_label", "D2_binding_class", "D2_final_site_kind", "D2_abs_Hreact (eV)", "D2_selection_rule",
+            "D2_initial_bridge_pair", "D2_final_bridge_pair", "D2_primary_bridge_pair", "D2_bridge_pair_classes",
+            "D2_initial_interface_like", "D2_final_interface_like",
+            "D2_initial_local_Cu_fraction", "D2_final_local_Cu_fraction",
             "D2_target_count", "D2_nearest_metal_symbol", "D2_nearest_metal_distance(Å)",
             "D2_nearest_anion_symbol", "D2_nearest_anion_distance(Å)", "D2_qc_flags",
             "D2_same_basin_as_D1", "D2_basin_note",
@@ -3034,6 +3251,56 @@ if last_run is not None:
         ]
         _summary_df = pd.DataFrame([{k: _display_ods.get(k, np.nan) for k in summary_cols}])
         st.dataframe(_summary_df, use_container_width=True)
+
+        _bridge_csv = (
+            _display_ods.get("D2_bridge_distribution_csv")
+            or meta.get("OXIDE_DESCRIPTOR_D2_BRIDGE_DISTRIBUTION_CSV", "")
+        )
+        if _bridge_csv and Path(str(_bridge_csv)).is_file():
+            st.markdown("#### D2 bridge-type-resolved HER descriptor distribution")
+            st.caption(
+                "Bridge classes are assigned from the final relaxed H* local metal environment. "
+                "The near-zero fraction counts valid D2 sites with |ΔG_H| ≤ 0.30 eV."
+            )
+            try:
+                _bridge_df = pd.read_csv(str(_bridge_csv))
+                _bridge_metric_cols = st.columns(4)
+                _bridge_metric_cols[0].metric(
+                    "Primary bridge pair",
+                    str(_display_ods.get("D2_primary_bridge_pair", "NA")),
+                )
+                _bridge_metric_cols[1].metric(
+                    "Bridge classes",
+                    str(_display_ods.get("D2_bridge_pair_classes", "NA")),
+                )
+                if "N_valid_sites" in _bridge_df.columns:
+                    _bridge_metric_cols[2].metric(
+                        "Valid D2 bridge sites",
+                        str(int(pd.to_numeric(_bridge_df["N_valid_sites"], errors="coerce").fillna(0).sum())),
+                    )
+                else:
+                    _bridge_metric_cols[2].metric("Valid D2 bridge sites", "NA")
+                if "best_abs_ΔG_H(eV)" in _bridge_df.columns and len(_bridge_df) > 0:
+                    _best_abs = pd.to_numeric(_bridge_df["best_abs_ΔG_H(eV)"], errors="coerce").min()
+                    _bridge_metric_cols[3].metric(
+                        "Best |ΔG_H|",
+                        f"{float(_best_abs):.4f} eV" if np.isfinite(_safe_float(_best_abs)) else "NA",
+                    )
+                else:
+                    _bridge_metric_cols[3].metric("Best |ΔG_H|", "NA")
+
+                st.dataframe(_bridge_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download D2 bridge distribution CSV",
+                    _bridge_df.to_csv(index=False).encode("utf-8"),
+                    "D2_bridge_distribution.csv",
+                    "text/csv",
+                    key=f"dl_d2_bridge_distribution_{uuid.uuid4().hex[:8]}",
+                )
+            except Exception as _e:
+                st.info(f"Could not load D2 bridge distribution table: {_e}")
+        elif str(_display_ods.get("D2_bridge_distribution_error", "")).strip():
+            st.info(f"D2 bridge distribution summary was not generated: {_display_ods.get('D2_bridge_distribution_error')}")
 
         _profile_points = []
         _d1 = _safe_float(_display_ods.get("D1_OH (eV)"))
@@ -3113,7 +3380,12 @@ if last_run is not None:
             extra_items=[
                 ("D2_binding_class", "binding class"),
                 ("D2_final_site_kind", "final site kind"),
+                ("D2_initial_bridge_pair", "initial bridge"),
+                ("D2_final_bridge_pair", "final bridge"),
+                ("D2_primary_bridge_pair", "primary bridge"),
                 ("D2_selection_rule", "selection rule"),
+                ("D2_initial_local_Cu_fraction", "initial local Cu fraction"),
+                ("D2_final_local_Cu_fraction", "final local Cu fraction"),
                 ("D2_nearest_metal_symbol", "nearest metal"),
                 ("D2_nearest_metal_distance(Å)", "nearest metal dist (Å)"),
                 ("D2_qc_flags", "QC flags"),
@@ -3132,6 +3404,10 @@ if last_run is not None:
 
         with st.expander("Show descriptor candidate tables", expanded=False):
             _d2_csv = _display_ods.get("D2_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D2_CANDIDATES_CSV", "")
+            _d2_bridge_csv = (
+                _display_ods.get("D2_bridge_distribution_csv")
+                or meta.get("OXIDE_DESCRIPTOR_D2_BRIDGE_DISTRIBUTION_CSV", "")
+            )
             # _d3_csv = _ods.get("D3_candidates_csv") or meta.get("OXIDE_DESCRIPTOR_D3_CANDIDATES_CSV", "")
             _d1_csv = _display_ods.get("D1_candidates_csv", "")
             if _d1_csv and Path(str(_d1_csv)).is_file():
@@ -3146,6 +3422,12 @@ if last_run is not None:
                     st.dataframe(pd.read_csv(str(_d2_csv)), use_container_width=True)
                 except Exception as _e:
                     st.info(f"Could not load D2 candidate table: {_e}")
+            if _d2_bridge_csv and Path(str(_d2_bridge_csv)).is_file():
+                st.markdown("#### D2 bridge distribution")
+                try:
+                    st.dataframe(pd.read_csv(str(_d2_bridge_csv)), use_container_width=True, hide_index=True)
+                except Exception as _e:
+                    st.info(f"Could not load D2 bridge distribution table: {_e}")
             # if _d3_csv and Path(str(_d3_csv)).is_file():
             #     st.markdown("#### D3 H₂ pairing proxy candidates")
             #     try:
@@ -3197,7 +3479,21 @@ if last_run is not None:
                 )
 
                 viewer_row = viewer_df.iloc[int(viewer_idx)]
-                viewer_path = _resolve_relaxed_structure_path(viewer_row, csv_path=last_run.get("csv_path"))
+                _has_initial_cif = bool(str(viewer_row.get("initial_structure_cif", "") or "").strip())
+                _structure_view_mode = "relaxed"
+                if _has_initial_cif:
+                    _structure_view_mode = st.radio(
+                        "Structure snapshot",
+                        ["initial", "relaxed"],
+                        index=1,
+                        horizontal=True,
+                        help="For OER diagnostics, initial shows the placed adsorbate before adsorbate relaxation; relaxed shows the post-run structure.",
+                        key=f"structure_snapshot_{viewer_source}_{viewer_idx}",
+                    )
+                if _structure_view_mode == "initial" and _has_initial_cif:
+                    viewer_path = Path(str(viewer_row.get("initial_structure_cif"))).expanduser()
+                else:
+                    viewer_path = _resolve_relaxed_structure_path(viewer_row, csv_path=last_run.get("csv_path"))
 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("site_label", str(viewer_row.get("site_label", "?")))
@@ -3211,6 +3507,10 @@ if last_run is not None:
                     "migrated", "reliability", "qa", "ΔG_H(U,pH) (eV)", "ΔG_H (eV)",
                     "ΔG_H_CHE (eV)", "ΔG_H_local (eV)", "local_thermo_corr (eV)",
                     "ΔG_ads (eV)", "ΔE_H_user (eV)", "ΔE_ads_user (eV)",
+                    "oer_diagnostic_mode", "oer_diagnostic_active", "oer_ads_relax_steps_used", "oer_ads_relax_fmax_used",
+                    "oxygen_bound_to_cation", "oxygen_anchor_target_cation_dist(Å)", "oxygen_anchor_anion_dist(Å)",
+                    "valid_for_oer_summary", "oer_state_class", "oer_state_note",
+                    "site_transition_type", "migrated_actual", "placement_mismatch", "site_family",
                     "selected_h0", "her_relaxation_scope", "z_relax_n_steps", "fine_relax_n_steps", "fine_relax_relaxed_atoms", "total_relax_n_steps",
                     "zpe_scope", "zpe_selected_atoms", "zpe_warning"
                 ]
@@ -3225,7 +3525,7 @@ if last_run is not None:
                         at_view = read(str(viewer_path))
                         show_atoms_3d(at_view, height=460, width=900, tag=f"relaxed_view_{viewer_source}_{viewer_idx}")
                         st.download_button(
-                            "Download selected relaxed CIF",
+                            f"Download selected {_structure_view_mode} CIF",
                             Path(viewer_path).read_bytes(),
                             Path(viewer_path).name,
                             "chemical/x-cif",
