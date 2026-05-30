@@ -974,7 +974,6 @@ def _run_her_che(
                 "slab_relax_drop": meta_flags["slab_relax_drop"],
                 "vac_warning": meta_flags["vac_warning"],
             },
-            "OER_SLAB_QC": oer_slab_qc,
         }
         (out_root / "meta_her.json").write_text(json.dumps(meta, indent=2))
         return str(out_csv), meta
@@ -1230,7 +1229,6 @@ def _run_her_che(
             "slab_relax_drop": meta_flags["slab_relax_drop"],
             "vac_warning": meta_flags["vac_warning"],
         },
-        "OER_SLAB_QC": oer_slab_qc,
     }
     (out_root / "meta_her.json").write_text(json.dumps(meta, indent=2))
 
