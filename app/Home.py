@@ -31,6 +31,11 @@ from ocp_app.core.anchors.CHE_mode import (
     run_metal_oer_che,    # OER competition support
     run_oxide_oer_che,    # OER competition support
 )
+from ocp_app.core.anchors.voc_mode import (
+    run_metal_voc_proxy,
+    run_oxide_voc_proxy,
+)
+from ocp_app.core.voc_registry import VOC_PRESETS, get_voc_preset
 from ocp_app.core.cifgen import (
     BulkSource,
     BulkSpec,
@@ -133,6 +138,8 @@ from ocp_app.core.slabify import (
     _recommended_step2_facets,
     _facet_choices_for_scope,
     _vacuum_target_from_ui,
+    _normalize_voc_oxide_candidate_top_surface,
+    _voc_oxide_candidate_rank_key,
     slabify_from_bulk,
 )
 from ocp_app.core.postprocess import (
@@ -142,6 +149,9 @@ from ocp_app.core.postprocess import (
     co2rr_split_by_qa,
     oxygen_apply_qa_policy,
     oxygen_split_by_qa,
+    voc_apply_qa_policy,
+    voc_split_by_qa,
+    voc_split_candidates_diagnostics_rejected,
     co2rr_dedupe_candidates,
     build_compact_table,
     annotate_site_transitions,
@@ -156,6 +166,11 @@ from ocp_app.core.preview import (
 from ocp_app.core.reporting import (
     build_llm_payload,
     call_llm_interpreter,
+)
+from ocp_app.core.co2rr_air_summary import (
+    build_co2rr_air_summary,
+    co2rr_air_summary_to_frame,
+    annotate_co2rr_air_summary,
 )
 from ocp_app.core.structure_check import validate_structure
 from ocp_app.core.ads_sites import _oxide_o_based_ads_position
@@ -203,7 +218,9 @@ except Exception as e:
 
 # ---------------- App config ----------------
 st.set_page_config(page_title="OCP App (HAPLAB)", layout="wide")
-st.title("Surface Adsorption and Geometry Evaluator(SAGE) — HER / CO₂RR / OER (HAPLAB v1.1)")
+st.title("Surface Adsorption and Geometry Evaluator(SAGE) — HER / CO₂RR / OER (HAPLAB v1.0)")
+
+# Surface Adsorption and Geometry Evaluator(SAGE) — HER / CO₂RR / OER / VOCs (HAPLAB v1.2-voc-alpha
 
 R_PH = 0.0591  # eV per pH
 GLOBAL_SEED = 42
@@ -469,20 +486,98 @@ def _format_facet_label_with_alias(hkl):
     return label
 
 
+def _viewer_safe_label(s: object) -> str:
+    """Mirror voc_mode._safe_label for post-run CIF lookup in the UI."""
+    out = str(s or "").replace("*", "star").replace("+", "__plus__")
+    out = out.replace("/", "_").replace(" ", "_").replace(":", "__")
+    return out
+
+
+
+
+def _viewer_clean_ads_token(val: object) -> str:
+    s = str(val or "").strip()
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return ""
+    return s.replace("*", "").replace("+", "__plus__").replace("/", "_").replace(" ", "_").replace(":", "__")
+
+
+def _viewer_row_expected_state_tokens(row: dict) -> list[str]:
+    """Return exact-ish state tokens expected in a relaxed CIF basename.
+
+    This prevents the relaxed-structure viewer from opening a fallback H* CIF
+    when a VOC product row such as CH3CH2OH* has no usable explicit path.
+    """
+    vals = []
+    for col in ("descriptor_state", "adsorbate", "state_label"):
+        v = str(row.get(col, "") or "").strip()
+        if v and v.lower() not in {"nan", "none", "null"}:
+            vals.append(v)
+    out = []
+    for v in vals:
+        safe = _viewer_safe_label(v)
+        clean = _viewer_clean_ads_token(v)
+        for t in (safe, clean):
+            t = str(t or "").strip().lower()
+            if t and t not in out:
+                out.append(t)
+    return out
+
+
+def _viewer_path_matches_row_state(path_obj, row: dict) -> bool:
+    """Guard against cross-linked relaxed CIFs in VOC viewer.
+
+    Older/fallback path guessing can otherwise match user_<site>_H.cif for a
+    CH3CH2OH* row because the row shares the same site_label.  For VOC rows,
+    require the CIF basename to contain the requested adsorbate/state token.
+    """
+    try:
+        name = Path(path_obj).name.lower()
+    except Exception:
+        return False
+
+    mode = str(row.get("mode", "VOC") or "VOC").strip().upper()
+    has_voc_cols = any(k in row for k in ("descriptor_state", "adsorbate", "target_voc"))
+    if mode != "VOC" and not has_voc_cols:
+        return True
+
+    tokens = _viewer_row_expected_state_tokens(row)
+    if not tokens:
+        return True
+
+    # H* is a special single-atom descriptor.  Do not allow it to satisfy or be
+    # selected for carbon-containing VOC product/intermediate rows.
+    ads_clean = _viewer_clean_ads_token(row.get("adsorbate", row.get("descriptor_state", ""))).lower()
+    if ads_clean == "h":
+        return ("_h_" in name) or name.endswith("_h.cif") or ("hstar" in name) or ("h_metal_che_like" in name)
+
+    # For normal VOC species, prefer exact safe token with 'star'.  This avoids
+    # CH3CH2O matching CH3CH2OH by substring.
+    for tok in tokens:
+        if tok.endswith("star") and tok in name:
+            return True
+
+    # Fallback to delimiter-aware clean token.
+    for tok in tokens:
+        if tok.endswith("star"):
+            continue
+        if re.search(r"(^|_)" + re.escape(tok) + r"(_|\.|$)", name):
+            return True
+
+    return False
+
 def _resolve_relaxed_structure_path(row: pd.Series | dict, csv_path: str | Path | None = None):
     """Best-effort resolver for post-run relaxed structure CIF paths.
 
     Priority:
       1) explicit row['structure_cif'] when present
-      2) infer from csv output root: <root>/sample/sites/user_<site_label>_H.cif
-      3) infer adsorbate-specific path: <root>/sample/sites/user_<site_label>_<ADS>.cif
+      2) robust relative/basename fallback against the current CSV folder
+      3) VOC/HER filename patterns generated by backend _safe_label()
+
+    This resolver must be tolerant of older CSVs because rejected VOC rows from
+    earlier builds may not include structure_cif even though the CIF was saved.
     """
     row = row if isinstance(row, dict) else dict(row)
-    explicit = row.get("structure_cif", None)
-    if explicit:
-        p = Path(str(explicit)).expanduser()
-        if p.is_file():
-            return p
 
     root = None
     if csv_path:
@@ -494,20 +589,91 @@ def _resolve_relaxed_structure_path(row: pd.Series | dict, csv_path: str | Path 
             except Exception:
                 root = None
 
-    site_label = str(row.get("site_label", "")).strip()
-    site_label_file = site_label.replace(":", "__") if site_label else ""
-    ads = str(row.get("adsorbate", "")).replace("*", "").strip().upper()
-
     candidates = []
-    if root is not None and site_label_file:
-        if ads:
-            candidates.append(root / "sample" / "sites" / f"user_{site_label_file}_{ads}.cif")
-        candidates.append(root / "sample" / "sites" / f"user_{site_label_file}_H.cif")
 
+    def _add_candidate(p):
+        if p is None:
+            return
+        try:
+            ps = str(p).strip()
+        except Exception:
+            return
+        if not ps or ps.lower() in {"nan", "none", "null"}:
+            return
+        try:
+            pp = Path(ps).expanduser()
+        except Exception:
+            return
+        candidates.append(pp)
+        if root is not None:
+            # path relative to CSV root
+            if not pp.is_absolute():
+                candidates.append(root / pp)
+            # basename fallback handles absolute paths produced in a temporary
+            # run directory when only the exported CSV was moved/copied.
+            candidates.append(root / pp.name)
+            candidates.append(root / "sample" / "sites" / pp.name)
+
+    # Explicit backend columns first.
+    for col in ("structure_cif", "relaxed_structure_cif", "final_structure_cif", "cif_path"):
+        if col in row:
+            _add_candidate(row.get(col))
+
+    site_label = str(row.get("site_label", "")).strip()
+    site_variants = []
+    if site_label:
+        site_variants.extend([site_label, site_label.replace(":", "__"), _viewer_safe_label(site_label)])
+    # de-duplicate preserving order
+    site_variants = list(dict.fromkeys([x for x in site_variants if x]))
+
+    state_vals = []
+    for col in ("descriptor_state", "adsorbate", "state_label"):
+        val = str(row.get(col, "")).strip()
+        if val:
+            state_vals.append(val)
+            state_vals.append(val.replace("*", ""))
+            state_vals.append(val.upper().replace("*", ""))
+            state_vals.append(_viewer_safe_label(val))
+    state_vals = list(dict.fromkeys([x for x in state_vals if x and x.lower() not in {"nan", "none"}]))
+
+    seed_policy = str(row.get("ech_seed_policy", "")).strip()
+    seed_suffixes = [""]
+    if seed_policy and seed_policy.lower() not in {"nan", "none", "default"}:
+        seed_suffixes.append("_" + _viewer_safe_label(seed_policy))
+
+    if root is not None and site_variants:
+        sites_dir = root / "sample" / "sites"
+        for site in site_variants:
+            for state in state_vals:
+                for suff in seed_suffixes:
+                    candidates.append(sites_dir / f"user_{site}_{state}{suff}.cif")
+            candidates.append(sites_dir / f"user_{site}_H.cif")
+            candidates.append(sites_dir / f"user_{site}_H_metal_CHE_like.cif")
+
+        # Last-resort glob fallback for legacy/sanitized names.
+        # Keep this state-specific; never fall back to all files for a site,
+        # because that can display H* for CH3CH2OH*/CH3CH2O* rows.
+        try:
+            if sites_dir.is_dir():
+                expected_tokens = _viewer_row_expected_state_tokens(row)
+                for site in site_variants:
+                    for state in expected_tokens:
+                        candidates.extend(sorted(sites_dir.glob(f"user_{site}_{state}*.cif")))
+                        if state.endswith("star"):
+                            candidates.extend(sorted(sites_dir.glob(f"user_{site}_{state.replace('star','')}*.cif")))
+        except Exception:
+            pass
+
+    seen = set()
     for p in candidates:
         try:
-            if Path(p).is_file():
-                return Path(p)
+            pp = Path(p)
+            key = str(pp)
+            if key in seen:
+                continue
+            seen.add(key)
+            if pp.is_file() and _viewer_path_matches_row_state(pp, row):
+                return pp
         except Exception:
             pass
 
@@ -524,8 +690,9 @@ def _format_relaxed_view_option(row: pd.Series | dict, is_her: bool = True) -> s
         return f"{site_label} | final={relaxed_site} | ΔG_H(U,pH)={dg:.3f} eV | {reliability}"
     ads = str(row.get("adsorbate", "?"))
     qa = str(row.get("qa", reliability or ""))
-    dg = _safe_float(row.get("ΔG_ads (eV)", np.nan))
-    return f"{ads} | {site_label} | final={relaxed_site} | ΔG_ads={dg:.3f} eV | {qa}"
+    dg = _safe_float(row.get("ΔG_ads (eV)", row.get("ΔE_proxy (eV)", row.get("ΔE_ads_user (eV)", np.nan))))
+    label = "ΔG_ads" if "ΔG_ads (eV)" in row else ("ΔE_proxy" if "ΔE_proxy (eV)" in row else "ΔE_ads")
+    return f"{ads} | {site_label} | final={relaxed_site} | {label}={dg:.3f} eV | {qa}"
 
 def _cluster_z_layers_simple(atoms, tol: float = 0.8):
     pos = np.asarray(atoms.get_positions(), dtype=float)
@@ -970,12 +1137,17 @@ with st.sidebar:
 
     reaction_mode = st.radio(
         "Reaction mode",
-        ["HER (ΔG_H)", "CO₂RR (ΔG_ads)", "OER competition (OOH/O/OH)"],
+        ["HER (ΔG_H)", "CO₂RR (ΔG_ads)", "OER competition (OOH/O/OH)", "VOCs (ΔE_proxy)"],
         horizontal=False,
-        help="HER: H* adsorption free energy | CO₂RR: COOH*/CO*/HCOO*/OCHO* | OER: OOH*/O*/OH* oxygen-intermediate CHE descriptors",
+        help=(
+            "HER: H* adsorption free energy | CO₂RR: COOH*/CO*/HCOO*/OCHO* | "
+            "OER: OOH*/O*/OH* oxygen-intermediate CHE descriptors | "
+            "VOCs: target-VOC adsorption and H*/OH* co-adsorption proximity proxies"
+        ),
     )
     is_her = reaction_mode.startswith("HER")
     is_oer = reaction_mode.startswith("OER")
+    is_voc = reaction_mode.startswith("VOCs")
     is_oxygen = is_oer
 
     relax_mode = st.selectbox(
@@ -993,6 +1165,20 @@ with st.sidebar:
         default_sites = ["fcc", "bridge", "ontop"]
 
     site_preset = tuple(default_sites)
+
+    # VOC-mode defaults are defined up front to keep Streamlit reruns stable.
+    voc_key = str(st.session_state.get("voc_target", "acetaldehyde"))
+    voc_states = []
+    voc_relaxation_policy = "normal_relax"
+    st.session_state["voc_relaxation_policy"] = voc_relaxation_policy
+    oxide_voc_site_policy = str(st.session_state.get("oxide_voc_site_policy", "geometry_representative"))
+
+    # CO2RR-air competition controls are intentionally scoped to the CO2RR branch only.
+    # They do not modify HER, OER, or VOC calculation branches.
+    co2rr_air_enabled = False
+    co2rr_air_oxygen_ads = []
+    co2rr_air_include_her = True
+    co2rr_air_oer_relaxation_mode = "short_relax"
 
     if is_her:
         co2_ads = []
@@ -1025,13 +1211,119 @@ with st.sidebar:
         else:
             oer_relaxation_mode = "short_relax"
             oer_manual_cation_indices_text = ""
+    elif is_voc:
+        co2_ads = []
+        orr_ads = []
+        voc_key = st.selectbox(
+            "Target VOC",
+            list(VOC_PRESETS.keys()),
+            index=list(VOC_PRESETS.keys()).index(st.session_state.get("voc_target", "acetaldehyde")) if st.session_state.get("voc_target", "acetaldehyde") in VOC_PRESETS else 0,
+            format_func=lambda k: VOC_PRESETS[k]["label"],
+            key="voc_target",
+            help="SAGE-VOC currently ships with an acetaldehyde preset; the registry is designed for additional VOCs later.",
+        )
+        _voc_preset = get_voc_preset(voc_key)
+        _voc_routes = dict(_voc_preset.get("routes", {}))
+        _route_order = ("reduction", "oxidation")
+        _route_keys = [k for k in _route_order if k in _voc_routes] or list(_voc_routes.keys()) or ["oxidation"]
+        _default_route = str(_voc_preset.get("default_route", "oxidation"))
+        if _default_route not in _route_keys:
+            _default_route = _route_keys[0]
+        _prev_route = st.session_state.get("_voc_route_prev", None)
+        voc_route = st.selectbox(
+            "Acetaldehyde route",
+            _route_keys,
+            index=_route_keys.index(st.session_state.get("voc_route", _default_route)) if st.session_state.get("voc_route", _default_route) in _route_keys else _route_keys.index(_default_route),
+            format_func=lambda k: _voc_routes.get(k, {}).get("label", str(k)),
+            key="voc_route",
+            help=(
+                "Direct reduction = CH3CHO-to-ethanol direct electroreduction proxies. "
+                "Oxidation = aldehyde activation + acetate/deep-oxidation proxies. "
+                "ECH/co-adsorption route is disabled in this stable branch."
+            ),
+        )
+        _route_default_states = list(_voc_routes.get(voc_route, {}).get("states", _voc_preset.get("default_states", [])))
+        _voc_state_options = list(dict.fromkeys(list(_route_default_states) + list(_voc_preset.get("optional_states", []))))
+        _current_voc_states = list(st.session_state.get("voc_states", []))
+        # Keep descriptor-state selection route-scoped.  This prevents old
+        # session values from legacy routes from leaking into the active
+        # direct-reduction or oxidation routes after code updates/reruns.
+        if (
+            _prev_route != voc_route
+            or not _current_voc_states
+            or any(str(x) not in set(_voc_state_options) for x in _current_voc_states)
+        ):
+            st.session_state["_voc_route_prev"] = voc_route
+            st.session_state["voc_states"] = list(_route_default_states)
+        voc_states = st.multiselect(
+            "VOC descriptor states",
+            _voc_state_options,
+            default=[s for s in list(st.session_state.get("voc_states", _route_default_states)) if s in _voc_state_options],
+            help=(
+                "Direct reduction default: H*, CH3CHO*, CH3CH2O*, CH3CH2OH*. "
+                "Oxidation default: OH*, CH3CHO*, CH3CO*, CH3COO*, CO*, COOH*. "
+                "O* is handled in OER mode; CH3COOH* remains optional. "
+                "ECH/co-adsorption states such as H*+CH3CHO* and H*+H* are disabled."
+            ),
+            key="voc_states",
+        )
+        # VOC descriptors are standardized to Normal relax.
+        # This removes ambiguous single-point/short-relax descriptor variants from the user workflow.
+        voc_relaxation_policy = "normal_relax"
+        st.session_state["voc_relaxation_policy"] = voc_relaxation_policy
+        st.caption("VOC relaxation policy is fixed to Normal relax (slab fixed, anchor locked).")
+        st.caption(str(_voc_preset.get("warning", "")))
+        if mtype == "oxide":
+            oxide_voc_site_policy = st.selectbox(
+                "Oxide VOC site policy",
+                ["geometry_representative", "fast_routed", "extended_scan"],
+                index=0,
+                format_func=lambda x: {
+                    "geometry_representative": "Geometry representative sites (default: Step-3 ontop/bridge/fcc)",
+                    "fast_routed": "Routed cation/anion sites (diagnostic)",
+                    "extended_scan": "Extended routed site scan (diagnostic)",
+                }.get(str(x), str(x)),
+                key="oxide_voc_site_policy",
+                help="Default keeps Step-3 ontop/bridge/fcc/hollow sites. Routed cation-only modes are diagnostic options for oxide-specific tests.",
+            )
     else:
+        voc_relaxation_policy = "normal_relax"
         co2_ads = st.multiselect(
             "CO₂RR intermediates",
             ["COOH*", "CO*", "HCOO*", "OCHO*"],
             default=["COOH*", "CO*", "HCOO*", "OCHO*"],
         )
         orr_ads = []
+        co2rr_air_enabled = st.checkbox(
+            "Append CO₂RR-air competition summary",
+            value=False,
+            key="co2rr_air_enabled",
+            help=(
+                "CO₂RR-only add-on. Runs the existing OER oxygen-intermediate engine in a separate "
+                "output folder and combines those rows with the CO₂RR HER guardrail for ORR/HER risk. "
+                "HER, OER, and VOC modes are not modified."
+            ),
+        )
+        if co2rr_air_enabled:
+            co2rr_air_oxygen_ads = st.multiselect(
+                "ORR/O₂ competition intermediates",
+                ["OOH*", "O*", "OH*"],
+                default=["OOH*", "O*", "OH*"],
+                key="co2rr_air_oxygen_ads",
+                help="Screening-only oxygen-affinity indicators for air-fed or dilute-CO₂ CO₂RR.",
+            )
+            co2rr_air_include_her = st.checkbox(
+                "Include HER guardrail in CO₂RR-air summary",
+                value=True,
+                key="co2rr_air_include_her",
+            )
+            co2rr_air_oer_relaxation_mode = st.selectbox(
+                "CO₂RR-air oxygen relaxation mode",
+                ["single_point", "short_relax", "normal_relax"],
+                index=1,
+                key="co2rr_air_oer_relaxation_mode",
+                help="Applied only to the auxiliary oxygen-intermediate run launched from CO₂RR mode.",
+            )
 
 
     if not is_oer:
@@ -1319,6 +1611,25 @@ else:
                                         # Keep them visible so the user can see why a termination is poor.
                                         norm_atoms.append(a_n)
                                         norm_meta.append(m_n)
+                                    elif bool(globals().get("is_voc", False)):
+                                        # VOC-specific termination handling:
+                                        # keep the existing HER/OER logic untouched, but for VOCs
+                                        # choose the slab orientation whose top side exposes more
+                                        # cation/mixed adsorption basins for CH3CHO*/OH*/acetate-like species.
+                                        _voc_route_for_slab = str(st.session_state.get("voc_route", "oxidation"))
+                                        a_n, m_n = _normalize_voc_oxide_candidate_top_surface(
+                                            a_i,
+                                            m_i,
+                                            route=_voc_route_for_slab,
+                                            z_window=1.8,
+                                        )
+                                        m_n["oxide_surface_mode"] = "VOC OER-like cation-accessible surface"
+                                        m_n["hydroxylation_mode"] = "Clean only"
+                                        m_n = _annotate_step2_slab_symmetry(m_n)
+                                        m_n["oxide_rank_key"] = _voc_oxide_candidate_rank_key(m_n)
+                                        m_n["oxide_plausibility_rank_key"] = _voc_oxide_candidate_rank_key(m_n)
+                                        norm_atoms.append(a_n)
+                                        norm_meta.append(m_n)
                                     else:
                                         a_n, m_n = _normalize_oxide_candidate_top_surface(a_i, m_i, z_window=1.8)
                                         m_n["oxide_surface_mode"] = mode_pref
@@ -1337,6 +1648,8 @@ else:
                                     st.info(f"Filtered out {rejected} oxide candidate(s) that failed the current clean-surface selection mode.")
                                 if bool(globals().get("is_oer", False)):
                                     st.caption("OER mode kept all generated terminations but ranked them by OER_AEM_cation suitability. Use OER-not-suitable only as diagnostic, not as a benchmark surface.")
+                                elif bool(globals().get("is_voc", False)):
+                                    st.caption("VOC mode uses an OER-like cation-accessible oxide slab processing policy and ranks symmetric slabs first. HER/OER calculation branches themselves are not modified.")
                                 if not cand_atoms:
                                     raise ValueError("No oxide slab candidates remained after family-aware clean-surface filtering. Try another facet or switch to a less restrictive clean-surface mode.")
                                 paired_ranked = sorted(
@@ -1373,6 +1686,13 @@ else:
                             basic_cols = [c for c in [
                                 "idx", "miller", "oer_slab_suitability", "oer_slab_score", "oer_best_cation_symbol", "oer_best_cation_index", "oer_best_cation_coordination", "oer_best_o_crowding_min_OO_A", "top_exposure", "surface_O_fraction_top", "slab_symmetry", "n_atoms", "vacuum_z"
                             ] if c in df_cands.columns]
+                        elif bool(globals().get("is_voc", False)):
+                            st.warning(
+                                "VOC mode: review `voc_slab_suitability`, cation accessibility, and O-only basin proxies before selecting an oxide slab. O-rich terminations can be poor CH3CHO*/OH* descriptor surfaces."
+                            )
+                            basic_cols = [c for c in [
+                                "idx", "miller", "voc_slab_suitability", "voc_surface_score", "voc_top_window_formula", "voc_top_window_cation_count", "voc_surface_O_fraction_top_window", "voc_metal_oxygen_bridge_proxy_count", "voc_oxygen_oxygen_bridge_proxy_count", "top_exposure", "slab_symmetry", "n_atoms", "vacuum_z"
+                            ] if c in df_cands.columns]
                         else:
                             st.warning(
                                 "Please review `slab_symmetry`, `surface_O_fraction_top`, `slab_usability`, and `facet_warning` before selecting an oxide slab."
@@ -1383,7 +1703,7 @@ else:
                         st.dataframe(df_cands[basic_cols], use_container_width=True)
                         with st.expander("Show detailed slab candidate metadata", expanded=False):
                             detail_cols = [c for c in [
-                                "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "oer_slab_suitability", "oer_slab_score", "oer_slab_warning", "oer_best_cation_index", "oer_best_cation_symbol", "oer_best_cation_coordination", "oer_best_cation_z_depth_A", "oer_best_open_direction_z", "oer_best_o_crowding_min_OO_A", "oer_candidate_cation_indices", "flipped_for_oer_cation_exposure", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
+                                "idx", "miller", "surface_family", "crystal_system", "spacegroup_symbol", "spacegroup_number", "voc_surface_policy", "voc_route", "voc_slab_suitability", "voc_surface_score", "voc_surface_warning", "voc_top_layer_formula", "voc_top_window_formula", "voc_top_layer_cation_count", "voc_top_window_cation_count", "voc_surface_O_fraction_top_layer", "voc_surface_O_fraction_top_window", "voc_metal_metal_bridge_proxy_count", "voc_metal_oxygen_bridge_proxy_count", "voc_oxygen_oxygen_bridge_proxy_count", "voc_metal_containing_hollow_proxy_count", "voc_oxygen_only_hollow_proxy_count", "flipped_for_voc_surface", "oer_slab_suitability", "oer_slab_score", "oer_slab_warning", "oer_best_cation_index", "oer_best_cation_symbol", "oer_best_cation_coordination", "oer_best_cation_z_depth_A", "oer_best_open_direction_z", "oer_best_o_crowding_min_OO_A", "oer_candidate_cation_indices", "flipped_for_oer_cation_exposure", "rule_validity", "rule_role", "surface_diagnostics_status", "slab_usability", "oxide_validity", "oxide_role", "top_exposure", "bottom_exposure", "surface_O_fraction_top",
                                 "surface_O_fraction_bottom", "surface_fraction_top", "surface_fraction_bottom", "slab_symmetry", "slab_symmetry_basis", "top_bottom_asymmetric", "flipped_for_oxide_top_exposure", "oxide_top_surface_ok", "facet_warning", "n_atoms",
                                 "vacuum_z", "recommend_repeat", "slab_usability_reason", "oxide_rule_notes", "surface_diagnostics_notes", "issues"
                             ] if c in df_cands.columns]
@@ -1395,6 +1715,13 @@ else:
                                 f"Auto-selected OER oxide candidate: #{auto_idx} | OER={auto_meta.get('oer_slab_suitability')} | "
                                 f"score={_safe_float(auto_meta.get('oer_slab_score', np.nan)):.2f} | best={auto_meta.get('oer_best_cation_symbol')}{auto_meta.get('oer_best_cation_index')} | "
                                 f"crowding_OO={_safe_float(auto_meta.get('oer_best_o_crowding_min_OO_A', np.nan)):.2f} Å | top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
+                            )
+                        elif bool(globals().get("is_voc", False)):
+                            st.caption(
+                                f"Auto-selected VOC oxide candidate: #{auto_idx} | VOC={auto_meta.get('voc_slab_suitability')} | "
+                                f"score={_safe_float(auto_meta.get('voc_surface_score', np.nan)):.2f} | window={auto_meta.get('voc_top_window_formula')} | "
+                                f"cations={auto_meta.get('voc_top_window_cation_count')} | Ofrac={_safe_float(auto_meta.get('voc_surface_O_fraction_top_window', np.nan)):.2f} | "
+                                f"top={auto_meta.get('top_exposure')} | atoms={auto_meta.get('n_atoms')}"
                             )
                         else:
                             st.caption(
@@ -1417,6 +1744,10 @@ else:
                                 f"#{i} | OER={cand_meta[i].get('oer_slab_suitability')} | score={_safe_float(cand_meta[i].get('oer_slab_score', np.nan)):.2f} | "
                                 f"best={cand_meta[i].get('oer_best_cation_symbol')}{cand_meta[i].get('oer_best_cation_index')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
                             ) if (mtype == "oxide" and bool(globals().get("is_oer", False))) else (
+                                f"#{i} | VOC={cand_meta[i].get('voc_slab_suitability')} | score={_safe_float(cand_meta[i].get('voc_surface_score', np.nan)):.2f} | "
+                                f"window={cand_meta[i].get('voc_top_window_formula')} | cations={cand_meta[i].get('voc_top_window_cation_count')} | "
+                                f"top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
+                            ) if (mtype == "oxide" and bool(globals().get("is_voc", False))) else (
                                 f"#{i} | {cand_meta[i].get('slab_symmetry', '?')} | {cand_meta[i].get('slab_usability')} | rule={cand_meta[i].get('rule_validity')}/{cand_meta[i].get('rule_role')} | top={cand_meta[i].get('top_exposure')} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
                             ) if mtype == "oxide" else
                             f"#{i} | vac_z={cand_meta[i].get('vacuum_z', np.nan):.2f} Å | atoms={cand_meta[i].get('n_atoms')} | {cand_meta[i].get('formula')}"
@@ -1453,6 +1784,16 @@ else:
                                 "oer_best_cation_coordination": cand_meta[sel_idx].get("oer_best_cation_coordination"),
                                 "oer_best_o_crowding_min_OO_A": cand_meta[sel_idx].get("oer_best_o_crowding_min_OO_A"),
                                 "oer_slab_warning": cand_meta[sel_idx].get("oer_slab_warning"),
+                                "voc_surface_policy": cand_meta[sel_idx].get("voc_surface_policy"),
+                                "voc_route": cand_meta[sel_idx].get("voc_route"),
+                                "voc_slab_suitability": cand_meta[sel_idx].get("voc_slab_suitability"),
+                                "voc_surface_score": cand_meta[sel_idx].get("voc_surface_score"),
+                                "voc_surface_warning": cand_meta[sel_idx].get("voc_surface_warning"),
+                                "voc_top_layer_formula": cand_meta[sel_idx].get("voc_top_layer_formula"),
+                                "voc_top_window_formula": cand_meta[sel_idx].get("voc_top_window_formula"),
+                                "voc_top_window_cation_count": cand_meta[sel_idx].get("voc_top_window_cation_count"),
+                                "voc_surface_O_fraction_top_window": cand_meta[sel_idx].get("voc_surface_O_fraction_top_window"),
+                                "flipped_for_voc_surface": cand_meta[sel_idx].get("flipped_for_voc_surface"),
                             },
                         )
                         try:
@@ -2066,6 +2407,8 @@ else:
                     preview_ads_options = ["H*"]
                 elif is_oxygen:
                     preview_ads_options = orr_ads if orr_ads else ["OOH*", "O*", "OH*"]
+                elif is_voc:
+                    preview_ads_options = voc_states if voc_states else ["CH3CHO*", "H*", "CH3CH2O*", "CH3CH2OH*"]
                 else:
                     preview_ads_options = co2_ads if co2_ads else ["COOH*", "CO*"]
                 preview_ads = st.selectbox("Preview adsorbate", preview_ads_options, index=0, key="preview_ads_geom")
@@ -2168,7 +2511,7 @@ else:
                 )
 
                 sig = _atoms_signature(atoms_for_sites_screen)
-                active_ads_for_key = (orr_ads if is_oxygen else co2_ads)
+                active_ads_for_key = (orr_ads if is_oxygen else (voc_states if is_voc else co2_ads))
                 key = _make_ml_screen_key(
                     sig,
                     mtype,
@@ -2372,6 +2715,8 @@ else:
                         else:
                             if is_oxygen:
                                 ads0 = (orr_ads[0] if orr_ads else "OOH*")
+                            elif is_voc:
+                                ads0 = (voc_states[0] if voc_states else "CH3CHO*")
                             else:
                                 ads0 = (co2_ads[0] if co2_ads else "COOH*")
                             atoms_prev = build_adsorbate_preview_slab(atoms_for_sites_eff, s, ads0, dz=1.8, ref_dir="ref_gas")
@@ -2498,40 +2843,15 @@ else:
             )
 
     if (not is_her):
-        st.caption("Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. OER writes a step-wise oxygen-intermediate summary; OER mode additionally writes results_oer_competition_summary.csv.")
+        st.caption(
+            "Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. "
+            "OER writes a step-wise oxygen-intermediate summary. VOC mode reports UMA/OCP ΔE_proxy and "
+            "co-adsorption proximity proxies, not electrochemical ΔG."
+        )
 
 
-    # Defaults (so variables exist regardless of mode)
-    co2rr_her_guardrail = False
-    her_site_pref = "ontop"
-    her_use_net_corr = True
-
-    # Optional companion HER guardrail for CO2RR (single-site, capped steps)
-    if (not is_her) and (not is_oer):
-        st.markdown("### Optional companion: HER guardrail")
-        cHG1, cHG2, cHG3 = st.columns([1.6, 1.0, 1.0])
-        with cHG1:
-            co2rr_her_guardrail = st.checkbox(
-                "Also compute HER guardrail (single site, capped steps)",
-                value=True,
-                help="Adds one H* relaxation on a preferred site. Designed to avoid compute blow-up.",
-                key="co2rr_her_guardrail",
-            )
-        with cHG2:
-            her_site_pref = st.selectbox(
-                "HER site preference",
-                ["ontop", "bridge", "fcc", "hcp"],
-                index=0,
-                disabled=(not co2rr_her_guardrail),
-                key="co2rr_her_site_pref",
-            )
-        with cHG3:
-            her_use_net_corr = st.checkbox(
-                "Apply NET correction (0.24 eV)",
-                value=True,
-                disabled=(not co2rr_her_guardrail),
-                key="co2rr_her_use_net_corr",
-            )
+    # H*/HER guardrail was removed from non-HER workflows.
+    # CO2RR and VOC runs now execute only their selected descriptor states.
 
     # Auto-selected sites for calculation (applies to both HER/CO2RR)
     use_auto_sites_for_calc = st.checkbox(
@@ -2676,6 +2996,10 @@ else:
         write(slab_path, atoms_for_calc_run, format="cif")
 
         oxide_her_calc_audit = None
+        co2rr_air_summary = None
+        co2rr_air_summary_csv = None
+        co2rr_air_oxygen_csv = None
+        co2rr_air_oxygen_meta = None
         if is_her and (mtype == "oxide"):
             oxide_her_calc_audit = _oxide_her_pre_run_audit(
                 atoms_for_calc_run,
@@ -2777,11 +3101,43 @@ else:
                             oer_relaxation_mode=str(st.session_state.get("oer_relaxation_mode", "short_relax")),
                             oer_manual_cation_indices=tuple(_manual_indices) if _manual_indices else None,
                         )
+            elif is_voc:
+                # ── VOC proxy branch ─────────────────────────────────────
+                _voc_key = str(st.session_state.get("voc_target", voc_key or "acetaldehyde"))
+                _voc_states = tuple(st.session_state.get("voc_states", voc_states or []))
+                if not _voc_states:
+                    _voc_states = tuple(get_voc_preset(_voc_key).get("default_states", []))
+
+                if mtype == "metal":
+                    csv_path, meta = run_metal_voc_proxy(
+                        str(slab_path),
+                        sites=manual_sites,
+                        relax_mode=relax_mode,
+                        user_ads_sites=final_user_sites if final_user_sites else None,
+                        target_voc=_voc_key,
+                        descriptor_states=_voc_states,
+                        voc_relaxation_policy="normal_relax",
+                        oxide_voc_site_policy=str(st.session_state.get("oxide_voc_site_policy", oxide_voc_site_policy)),
+                    )
+                else:
+                    csv_path, meta = run_oxide_voc_proxy(
+                        str(slab_path),
+                        sites=manual_sites,
+                        relax_mode=relax_mode,
+                        user_ads_sites=final_user_sites if final_user_sites else None,
+                        target_voc=_voc_key,
+                        descriptor_states=_voc_states,
+                        voc_relaxation_policy="normal_relax",
+                        oxide_voc_site_policy=str(st.session_state.get("oxide_voc_site_policy", oxide_voc_site_policy)),
+                    )
             else:
                 # ── CO2RR branch ───────────────────────────────────────
                 if not co2_ads:
                     co2_ads = ["COOH*", "CO*"]
                 adspecies = tuple(co2_ads)
+
+                _co2rr_air_on = bool(co2rr_air_enabled)
+                _co2rr_air_her_guard = bool(_co2rr_air_on and co2rr_air_include_her)
 
                 if mtype == "metal":
                     csv_path, meta = run_metal_co2rr_che(
@@ -2790,9 +3146,7 @@ else:
                         relax_mode=relax_mode,
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         adspecies=adspecies,
-                        her_guardrail=bool(co2rr_her_guardrail),
-                        her_site_preference=str(her_site_pref),
-                        her_use_net_corr=bool(her_use_net_corr),
+                        her_guardrail=_co2rr_air_her_guard,
                     )
                 else:
                     csv_path, meta = run_oxide_co2rr_che(
@@ -2801,10 +3155,44 @@ else:
                         relax_mode=relax_mode,
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         adspecies=adspecies,
-                        her_guardrail=bool(co2rr_her_guardrail),
-                        her_site_preference=str(her_site_pref),
-                        her_use_net_corr=bool(her_use_net_corr),
+                        her_guardrail=_co2rr_air_her_guard,
                     )
+
+                # CO2RR-air add-on: auxiliary oxygen-intermediate run.
+                # This deliberately calls the existing OER engine from inside CO2RR mode and
+                # stores the output separately; the standalone OER branch above is unchanged.
+                if _co2rr_air_on:
+                    _oxygen_adspecies = tuple(co2rr_air_oxygen_ads) if co2rr_air_oxygen_ads else ("OOH*", "O*", "OH*")
+                    _oxygen_out_root = Path(csv_path).resolve().parent / "co2rr_air_oxygen"
+                    try:
+                        if mtype == "metal":
+                            co2rr_air_oxygen_csv, co2rr_air_oxygen_meta = run_metal_oer_che(
+                                str(slab_path),
+                                out_root=_oxygen_out_root,
+                                sites=manual_sites,
+                                relax_mode=relax_mode,
+                                user_ads_sites=final_user_sites if final_user_sites else None,
+                                adspecies=_oxygen_adspecies,
+                                orr_u=0.0,
+                                oer_relaxation_mode=str(co2rr_air_oer_relaxation_mode),
+                            )
+                        else:
+                            _air_site_cap = len(final_user_sites) if isinstance(final_user_sites, dict) and final_user_sites else int(st.session_state.get("max_sites_kind", 2))
+                            _air_oer_sites = tuple(f"co2rr_air_oer_cation_{i}" for i in range(max(1, int(_air_site_cap))))
+                            co2rr_air_oxygen_csv, co2rr_air_oxygen_meta = run_oxide_oer_che(
+                                str(slab_path),
+                                out_root=_oxygen_out_root,
+                                sites=_air_oer_sites,
+                                relax_mode=relax_mode,
+                                user_ads_sites=final_user_sites if final_user_sites else None,
+                                adspecies=_oxygen_adspecies,
+                                orr_u=0.0,
+                                oer_relaxation_mode=str(co2rr_air_oer_relaxation_mode),
+                            )
+                    except Exception as _e:
+                        co2rr_air_oxygen_csv = None
+                        co2rr_air_oxygen_meta = {"error": str(_e), "mode": "CO2RR_AIR_OXYGEN_AUX"}
+                        st.warning(f"CO₂RR-air auxiliary oxygen run failed: {_e}")
 
         st.success("Calculation Complete!")
 
@@ -2816,7 +3204,7 @@ else:
             if is_her and (mtype == "oxide") and isinstance(oxide_her_calc_audit, dict):
                 df = _append_oxide_her_audit_columns(df, oxide_her_calc_audit)
 
-        mode_label = "HER" if is_her else ("OER" if is_oer else "CO2RR")
+        mode_label = "HER" if is_her else ("OER" if is_oer else ("VOC" if is_voc else "CO2RR"))
 
         if is_her and "ΔG_H (eV)" in df.columns:
             df["ΔG_H(U,pH) (eV)"] = df["ΔG_H (eV)"] - float(U_input) - R_PH * float(pH_input)
@@ -2850,21 +3238,60 @@ else:
             # surface-bound and valid_for_oer_summary=True.
             if is_oxygen:
                 df = oxygen_apply_qa_policy(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
+            elif is_voc:
+                df = voc_apply_qa_policy(df, disp_thresh=1.20)
             else:
                 df = co2rr_apply_qa_policy(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
             df = annotate_site_transitions(df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
+            df_diag = pd.DataFrame()
             if is_oxygen:
                 df_keep, df_reject = oxygen_split_by_qa(df)
+            elif is_voc:
+                df_keep, df_diag, df_reject = voc_split_candidates_diagnostics_rejected(df)
             else:
                 df_keep, df_reject = co2rr_split_by_qa(df)
 
-            # Set reliability consistent with QA policy
+            # Set reliability consistent with QA policy.  VOC/ECH diagnostic
+            # rows are neither ordinary candidates nor rejected failures.
             df["reliability"] = "unreliable"
-            df.loc[df_keep.index, "reliability"] = "reliable"
+            if isinstance(df_keep, pd.DataFrame) and (not df_keep.empty):
+                df.loc[df_keep.index, "reliability"] = "reliable"
+            if bool(is_voc) and isinstance(df_diag, pd.DataFrame) and (not df_diag.empty):
+                df.loc[df_diag.index, "reliability"] = "diagnostic_valid"
 
             # Backwards-compatible names for downstream UI blocks
             df_rel, df_unrel = df_keep, df_reject
             migration_summary = summarize_site_transitions(df)
+
+            # CO2RR-air summary is a CO2RR-only post-processing add-on.
+            # It consumes the already-produced CO2RR rows, an optional auxiliary
+            # oxygen-intermediate CSV, and optional CO2RR HER guardrail metadata.
+            if (not is_oxygen) and (not is_voc) and bool(co2rr_air_enabled):
+                _oxygen_df = None
+                if co2rr_air_oxygen_csv:
+                    try:
+                        _oxygen_df = pd.read_csv(co2rr_air_oxygen_csv)
+                        _oxygen_df = oxygen_apply_qa_policy(_oxygen_df, disp_thresh=CO2RR_MIGRATION_DISP_THRESH_A)
+                        _oxygen_keep, _oxygen_reject = oxygen_split_by_qa(_oxygen_df)
+                    except Exception as _e:
+                        _oxygen_df = None
+                        if isinstance(meta, dict):
+                            meta = dict(meta)
+                            meta["CO2RR_AIR_OXYGEN_POSTPROCESS_ERROR"] = str(_e)
+                _her_guard = meta.get("HER_GUARDRAIL") if isinstance(meta, dict) else None
+                co2rr_air_summary = build_co2rr_air_summary(
+                    df,
+                    oxygen_df=_oxygen_df,
+                    her_guard=_her_guard,
+                )
+                df = annotate_co2rr_air_summary(df, co2rr_air_summary)
+                df_rel = annotate_co2rr_air_summary(df_rel, co2rr_air_summary)
+                df_unrel = annotate_co2rr_air_summary(df_unrel, co2rr_air_summary)
+                try:
+                    co2rr_air_summary_csv = Path(csv_path).resolve().parent / "results_co2rr_air_summary.csv"
+                    co2rr_air_summary_to_frame(co2rr_air_summary).to_csv(co2rr_air_summary_csv, index=False, float_format="%.6f")
+                except Exception:
+                    co2rr_air_summary_csv = None
 
         try:
             if isinstance(df, pd.DataFrame):
@@ -2881,12 +3308,19 @@ else:
                 meta["OXIDE_HER_PRE_RUN_AUDIT"] = oxide_her_calc_audit
             if migration_summary is not None:
                 meta["MIGRATION_SUMMARY"] = migration_summary
+            if co2rr_air_summary is not None:
+                meta["CO2RR_AIR_SUMMARY"] = dict(co2rr_air_summary)
+                meta["CO2RR_AIR_SUMMARY_CSV"] = str(co2rr_air_summary_csv) if co2rr_air_summary_csv is not None else None
+                meta["CO2RR_AIR_OXYGEN_CSV"] = str(co2rr_air_oxygen_csv) if co2rr_air_oxygen_csv is not None else None
+                meta["CO2RR_AIR_OXYGEN_META"] = co2rr_air_oxygen_meta
 
         st.session_state["last_run"] = {
             "is_her": bool(is_her),
             "is_oer": bool(is_oer),
+            "is_voc": bool(is_voc),
             "is_orr": False,
             "is_oxygen": bool(is_oxygen),
+            "is_co2rr_air": bool(co2rr_air_enabled) if ((not is_her) and (not is_oer) and (not is_voc)) else False,
             "mtype": str(mtype),
             "reaction_mode": str(reaction_mode),
             "mode_label": str(mode_label),
@@ -2895,6 +3329,7 @@ else:
             "df": df,
             "df_rel": df_rel,
             "df_unrel": df_unrel,
+            "df_diag": df_diag if bool(is_voc) else pd.DataFrame(),
             "U_input": float(U_input),
             "pH_input": float(pH_input),
         }
@@ -2958,8 +3393,9 @@ if last_run is not None:
     df = last_run.get("df")
     df_rel = last_run.get("df_rel")
     df_unrel = last_run.get("df_unrel")
+    df_diag = last_run.get("df_diag") if bool(last_run.get("is_voc")) else pd.DataFrame()
     meta = last_run.get("meta") or {}
-    mode_label = last_run.get("mode_label", "HER" if last_run.get("is_her") else "CO2RR")
+    mode_label = last_run.get("mode_label", "HER" if last_run.get("is_her") else ("VOC" if last_run.get("is_voc") else "CO2RR"))
     U_disp = float(last_run.get("U_input", 0.0))
     pH_disp = float(last_run.get("pH_input", 0.0))
 
@@ -2969,56 +3405,6 @@ if last_run is not None:
             rh.render_selected_run_details()
     except Exception:
         pass
-
-    # --- Optional: HER guardrail summary (CO2RR companion) ---
-    her_guard = None
-    try:
-        her_guard = meta.get("HER_GUARDRAIL") if isinstance(meta, dict) else None
-    except Exception:
-        her_guard = None
-
-    if her_guard is not None and isinstance(her_guard, dict):
-        st.markdown("### HER guardrail (single-site)")
-        try:
-            dG = float(her_guard.get("ΔG_H (eV)", np.nan))
-        except Exception:
-            dG = np.nan
-
-        dG_uph = dG - U_disp - R_PH * pH_disp if np.isfinite(dG) else np.nan
-
-        g1, g2, g3, g4 = st.columns(4)
-        g1.metric("Site", f"{her_guard.get('site','?')} / {her_guard.get('site_label','?')}")
-        g2.metric("ΔG_H (eV)", f"{dG:.3f}" if np.isfinite(dG) else "n/a")
-        g3.metric("ΔG_H(U,pH) (eV)", f"{dG_uph:.3f}" if np.isfinite(dG_uph) else "n/a")
-        try:
-            disp_val = float(her_guard.get("H_lateral_disp(Å)", np.nan))
-        except Exception:
-            disp_val = np.nan
-        g4.metric("H lateral disp (Å)", f"{disp_val:.2f}" if np.isfinite(disp_val) else "n/a")
-
-        # download HER guardrail row
-        try:
-            hg_df = pd.DataFrame([her_guard])
-            st.download_button(
-                "Download HER guardrail CSV",
-                hg_df.to_csv(index=False).encode("utf-8"),
-                "her_guardrail.csv",
-                "text/csv",
-                key="dl_her_guardrail_csv",
-            )
-        except Exception:
-            pass
-
-        # optional structure preview if cif exists (best-effort)
-        try:
-            cifp = her_guard.get("structure_cif", None)
-            if cifp and Path(str(cifp)).is_file():
-                with st.expander("Preview HER guardrail structure", expanded=False):
-                    at_hg = read(str(cifp))
-                    show_atoms_3d(at_hg, height=420, width=900, tag="her_guardrail")
-        except Exception:
-            pass
-
     # --- Lightweight warnings (do not gate rendering) ---
     if bool(last_run.get("is_her")) and isinstance(df, pd.DataFrame) and ("is_duplicate" in df.columns):
         try:
@@ -3032,7 +3418,7 @@ if last_run is not None:
         try:
             n_blow = int((pd.to_numeric(df["ΔE_ads_user (eV)"], errors="coerce").abs() > 50.0).sum())
             if n_blow > 0:
-                st.warning(f"{n_blow} CO2RR points show |ΔE_ads_user| > 50 eV (likely bad placement/unstable relax).")
+                st.warning(f"{n_blow} {mode_label} points show |ΔE_ads_user| > 50 eV (likely bad placement/unstable relax).")
         except Exception:
             pass
 
@@ -3069,23 +3455,36 @@ if last_run is not None:
 
         qa_counts = df["qa"].value_counts(dropna=False) if (isinstance(df, pd.DataFrame) and ("qa" in df.columns)) else pd.Series(dtype=int)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total runs", int(len(df)) if isinstance(df, pd.DataFrame) else 0)
-        c2.metric("Candidates (QA-valid)", int(len(df_keep)) if isinstance(df_keep, pd.DataFrame) else 0)
-        c3.metric("Rejected (QA-invalid)", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
-        c4.metric("Compact rows" if bool(last_run.get("is_oer")) else "Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
+        if bool(last_run.get("is_voc")):
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Total runs", int(len(df)) if isinstance(df, pd.DataFrame) else 0)
+            c2.metric("Candidates", int(len(df_keep)) if isinstance(df_keep, pd.DataFrame) else 0)
+            c3.metric("Diagnostic", int(len(df_diag)) if isinstance(df_diag, pd.DataFrame) else 0)
+            c4.metric("Rejected", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
+            c5.metric("Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total runs", int(len(df)) if isinstance(df, pd.DataFrame) else 0)
+            c2.metric("Candidates (QA-valid)", int(len(df_keep)) if isinstance(df_keep, pd.DataFrame) else 0)
+            c3.metric("Rejected (QA-invalid)", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
+            c4.metric("Compact rows" if bool(last_run.get("is_oer")) else "Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
 
         if bool(last_run.get("is_oer")):
             st.markdown("### OER site-level candidate rows")
             st.caption("One lowest-energy height is retained per selected oer_cation site and intermediate. Use the OER step summary for η_OER interpretation.")
         else:
-            st.markdown("### Candidates (Deduplicated by relaxed minimum)")
+            st.markdown("### VOC proxy candidates" if bool(last_run.get("is_voc")) else "### Candidates (Deduplicated by relaxed minimum)")
         if isinstance(df_dedup, pd.DataFrame):
             st.dataframe(build_compact_table(df_dedup, mode_label), use_container_width=True)
 
         with st.expander("Show all candidate attempts (including duplicates)", expanded=False):
             if isinstance(df_keep, pd.DataFrame):
                 st.dataframe(build_compact_table(df_keep, mode_label), use_container_width=True)
+
+        if bool(last_run.get("is_voc")) and isinstance(df_diag, pd.DataFrame) and (not df_diag.empty):
+            with st.expander("Show ECH diagnostic attempts", expanded=False):
+                st.caption("These rows are descriptor diagnostics, not ordinary ranking candidates and not QA-invalid rejected rows.")
+                st.dataframe(build_compact_table(df_diag, mode_label), use_container_width=True)
 
         if isinstance(df_reject, pd.DataFrame) and (not df_reject.empty):
             with st.expander("Show rejected attempts (qa-based)", expanded=False):
@@ -3094,6 +3493,48 @@ if last_run is not None:
         if qa_counts is not None and (not qa_counts.empty):
             with st.expander("QA breakdown", expanded=False):
                 st.dataframe(qa_counts.rename_axis("qa").reset_index(name="count"), use_container_width=True)
+
+        if isinstance(meta, dict) and meta.get("CO2RR_AIR_SUMMARY"):
+            st.markdown("### CO₂RR-air competition summary")
+            _air_sum = co2rr_air_summary_to_frame(meta.get("CO2RR_AIR_SUMMARY"))
+            _air_cols = [
+                c for c in [
+                    "co2rr_pathway_preference",
+                    "her_competition_risk",
+                    "orr_competition_risk",
+                    "co_poisoning_risk",
+                    "air_tolerance_index",
+                    "ΔG_COOH_best (eV)",
+                    "ΔG_OCHO_best (eV)",
+                    "ΔG_CO_best (eV)",
+                    "ΔG_H_guardrail (eV)",
+                    "ΔG_OOH_best (eV)",
+                    "ΔG_O_best (eV)",
+                    "ΔG_OH_best (eV)",
+                ] if c in _air_sum.columns
+            ]
+            if _air_cols:
+                st.dataframe(_air_sum[_air_cols], use_container_width=True)
+            else:
+                st.dataframe(_air_sum, use_container_width=True)
+            st.caption(
+                "This is a screening-only CO₂RR add-on for air-fed/dilute-CO₂ conditions. "
+                "It does not replace kinetic ORR modeling."
+            )
+            _air_csv = meta.get("CO2RR_AIR_SUMMARY_CSV")
+            if _air_csv:
+                try:
+                    _air_path = Path(str(_air_csv))
+                    if _air_path.is_file():
+                        st.download_button(
+                            "Download CO₂RR-air summary CSV",
+                            _air_path.read_bytes(),
+                            _air_path.name,
+                            "text/csv",
+                            key="dl_co2rr_air_summary",
+                        )
+                except Exception:
+                    pass
 
         # OER oxygen-intermediate summary, if produced by CHE_mode.
         try:
@@ -3440,6 +3881,7 @@ if last_run is not None:
     df_dedup = locals().get("df_dedup", pd.DataFrame())
     df_keep = locals().get("df_keep", pd.DataFrame())
     df_reject = locals().get("df_reject", pd.DataFrame())
+    df_diag = locals().get("df_diag", pd.DataFrame())
 
     if bool(last_run.get("is_her")):
         if isinstance(df_rel, pd.DataFrame) and (not df_rel.empty):
@@ -3453,6 +3895,8 @@ if last_run is not None:
             viewer_frames["Candidates (dedup)"] = df_dedup
         if isinstance(df_keep, pd.DataFrame) and (not df_keep.empty):
             viewer_frames["All candidate attempts"] = df_keep
+        if bool(last_run.get("is_voc")) and isinstance(df_diag, pd.DataFrame) and (not df_diag.empty):
+            viewer_frames["Diagnostic attempts"] = df_diag
         if isinstance(df_reject, pd.DataFrame) and (not df_reject.empty):
             viewer_frames["Rejected attempts"] = df_reject
         if (not viewer_frames) and isinstance(df, pd.DataFrame) and (not df.empty):
@@ -3534,7 +3978,7 @@ if last_run is not None:
                     except Exception as e:
                         st.warning(f"Could not render relaxed CIF: {e}")
                 else:
-                    st.info("Relaxed CIF path could not be resolved for this row. If needed, add 'structure_cif' to the exported result rows in CHE_mode.")
+                    st.info("Relaxed CIF path could not be resolved for this row, or the available CIF basename does not match the selected adsorbate/state. This prevents accidental cross-linking such as opening H* for a CH3CH2OH* row. Re-run with the latest VOC exporter if the row should have a relaxed CIF.")
 
     # download full results
     try:
