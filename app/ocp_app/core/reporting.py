@@ -177,6 +177,42 @@ def pick_representative_sites_co2rr(df: pd.DataFrame):
     }
 
 
+def pick_representative_sites_voc(df: pd.DataFrame):
+    """Representative rows for SAGE-VOC proxy descriptors.
+
+    This uses ΔE_proxy / ΔE_ads_user as a ranking proxy only.  It does not
+    imply electrochemical free-energy optimality.
+    """
+    col = None
+    for c in ["ΔE_proxy (eV)", "ΔE_ads_user (eV)", "ΔE_proximity_proxy (eV)"]:
+        if c in df.columns:
+            col = c
+            break
+    if col is None:
+        return {}
+    work = df.copy()
+    if "qa" in work.columns:
+        work = work[work["qa"].astype(str).str.lower().isin(["ok", "migrated"])].copy()
+    e = pd.to_numeric(work[col], errors="coerce").dropna()
+    if e.empty:
+        return {"column_used": col, "note": "No finite VOC proxy values available."}
+
+    def _row(i):
+        return {
+            "site_label": str(work.loc[i].get("site_label", i)),
+            "descriptor_state": str(work.loc[i].get("descriptor_state", work.loc[i].get("adsorbate", ""))),
+            "value": float(work.loc[i][col]),
+            "criterion": "minimum_proxy_energy",
+            "terminology_note": "VOC mode values are UMA/OCP screening proxies, not electrochemical ΔG values.",
+        }
+    i_min = e.idxmin()
+    return {
+        "proxy_minimum": _row(i_min),
+        "column_used": col,
+        "stable_filter": "qa in {ok, migrated}",
+    }
+
+
 def build_llm_payload(last_run: dict, mp_api_key: str | None = None):
     df = last_run.get("df")
     meta = last_run.get("meta") or {}
@@ -209,6 +245,7 @@ def build_llm_payload(last_run: dict, mp_api_key: str | None = None):
     payload["mp_meta"] = fetch_mp_meta(mp_id, mp_api_key) if mp_id else None
 
     is_her = bool(last_run.get("is_her"))
+    is_voc = bool(last_run.get("is_voc")) or str(last_run.get("mode_label", "")).upper() == "VOC"
     if is_her:
         payload["definitions"]["sign_convention"] = {
             "column": "ΔG_H(U,pH) (eV) if present, else ΔG_H (eV)",
@@ -217,6 +254,15 @@ def build_llm_payload(last_run: dict, mp_api_key: str | None = None):
         payload["definitions"]["filters"] = {
             "reliable_rows": "Use rows from df_rel (energy/displacement-based reliable split).",
             "unreliable_rows": "Rows in df_unrel are not used for representative recommendations.",
+        }
+    elif is_voc:
+        payload["definitions"]["sign_convention"] = {
+            "column": "ΔE_proxy (eV), ΔE_VOC_ads_proxy (eV), or ΔE_proximity_proxy (eV)",
+            "meaning": "SAGE-VOC proxy descriptor. Negative values indicate stronger co-adsorption/interaction under the chosen proxy reference; these are not definitive electrochemical ΔG values.",
+        }
+        payload["definitions"]["filters"] = {
+            "candidates": "Use qa in {ok, migrated} as candidate rows; rows with qa outside that set are rejected.",
+            "interpretation_limit": "VOC mode is a UMA/OCP pre-screening proxy for adsorption/proximity, not a kinetic or electrochemical free-energy model.",
         }
     else:
         payload["definitions"]["sign_convention"] = {
@@ -232,6 +278,8 @@ def build_llm_payload(last_run: dict, mp_api_key: str | None = None):
     if isinstance(df, pd.DataFrame) and not df.empty:
         if bool(last_run.get("is_her")):
             payload["rules"] = pick_representative_sites_her(df)
+        elif bool(last_run.get("is_voc")) or str(last_run.get("mode_label", "")).upper() == "VOC":
+            payload["rules"] = pick_representative_sites_voc(df)
         else:
             payload["rules"] = pick_representative_sites_co2rr(df)
 
@@ -248,6 +296,10 @@ def build_llm_payload(last_run: dict, mp_api_key: str | None = None):
             "ads_lateral_disp(Å)", "H_lateral_disp(Å)",
             "ΔG_H(U,pH) (eV)", "ΔG_H (eV)", "ΔE_H_user (eV)",
             "ΔE_ads_user (eV)", "ΔG_ads (eV)",
+            "target_voc", "descriptor_state", "state_type", "ΔE_proxy (eV)",
+            "ΔE_VOC_ads_proxy (eV)", "ΔE_H_VOC_proximity_proxy (eV)",
+            "ΔE_OH_VOC_proximity_proxy (eV)", "ΔE_proximity_proxy (eV)",
+            "qa_note", "proxy_warning",
             "surfactant_class", "surfactant_chgnet_prerelax_slab",
         ]
         keep_cols = [c for c in keep_cols if c in df.columns]
@@ -299,7 +351,7 @@ def call_llm_interpreter(payload: dict, *, api_key: str, model_name: str = "gpt-
     client = OpenAI(api_key=api_key)
 
     developer_instructions = """
-You are a scientific assistant that interprets electrocatalysis screening results (HER or CO2RR).
+You are a scientific assistant that interprets electrocatalysis screening results (HER, CO2RR, OER, or VOC proxy mode).
 
 Use ONLY the provided JSON payload as evidence.
 Do not use outside knowledge, unstated assumptions, or inferred values not supported by the payload.
@@ -345,6 +397,11 @@ You MUST populate recommended_for_paper with two tracks.
 For HER:
 - strong_binding_track = most negative ΔG_H among stable sites
 - balanced_binding_track = stable site with minimum |ΔG_H|
+
+For VOC proxy mode:
+- Treat all VOC values as screening proxies only, not electrochemical ΔG.
+- Prefer payload["rules"]["proxy_minimum"] when present.
+- Do not claim catalytic activity, selectivity, kinetics, or conversion based only on VOC proxy values.
 
 For CO2RR:
 - If any stable site has ΔE_ads < 0:
