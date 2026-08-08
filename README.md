@@ -540,13 +540,14 @@ See `requirements.txt` for the full dependency list.
 
 ## Citation
 
-If you use SAGE in your research, please cite the software repository.
+If you use SAGE in your research, please cite the publication.
 
 ```text
-Junhe Park. Surface Adsorption and Geometry Evaluator (SAGE), v1.1.0. GitHub repository.
+Park, J., S. Kim, and D. Kim, Surface Adsorption and Geometry Evaluator (SAGE): An Interactive Workflow Platform fors tandardized Surface Adsorption Screening. Journal of Chemical Information and Modeling, 2026.
+
+http://pubs.acs.org/doi/abs/10.1021/acs.jcim.6c01690
 ```
 
-A manuscript citation will be added here after publication.
 
 ---
 
