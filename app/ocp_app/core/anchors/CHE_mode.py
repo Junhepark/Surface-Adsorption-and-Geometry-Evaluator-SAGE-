@@ -14,6 +14,21 @@ from ase.optimize import BFGS
 from ase.geometry import find_mic
 
 from ocp_app.core.gas_refs import get_h2_ref
+from ocp_app.core.co2rr_registry import (
+    CO2RRBindingVariant,
+    CO2RR_TEMPLATE_FILES,
+    co2rr_migration_threshold,
+    co2rr_product_reference_energy,
+    co2rr_site_allowed,
+    co2rr_reference_energy,
+    get_co2rr_adsorbate_spec,
+    get_co2rr_binding_variants,
+    get_co2rr_product_spec,
+    is_supported_co2rr_adsorbate,
+    required_co2rr_products,
+)
+from ocp_app.core.co2rr_geometry import orient_co2rr_template
+from ocp_app.core.co2rr_placement import place_co2rr_adsorbate
 from ocp_app.core.ads_sites import (
     AdsSite,
     detect_metal_111_sites,
@@ -55,7 +70,8 @@ from ocp_app.core.anchors.oxide_her import (
 # =====================================================================
 # Unified CHE workflow (Metal & Oxide)
 #  - HER: ΔG_H (H* adsorption)
-#  - CO2RR: ΔG_ads for COOH*, CO*, HCOO*, OCHO* (reaction-descriptor based)
+#  - CO2RR: reaction-network cumulative state energies (ΔE by default;
+#           corrected CHE when thermo_CO2RR.json supplies corrections)
 #  - OER: stepwise free energies for OOH*, O*, OH* (4e⁻ Norskov CHE)
 # =====================================================================
 
@@ -74,22 +90,95 @@ THREE_STAGE_OXIDE_HER_CAUTION = (
 DESCRIPTOR_D1_DISP_THRESH_A = 1.20
 DESCRIPTOR_D2_DISP_THRESH_A = 1.00
 
-# --- CO2RR adsorbate-specific constant shifts (ZPE + TΔS lumped) ---
-# Defaults used when thermo_CO2RR.json is missing or cannot be parsed
+# Resolve ref_gas from the installed SAGE package, not from Streamlit's current
+# working directory and not from a hard-coded container root.  For the normal
+# deployment layout
+#   <app>/ocp_app/core/anchors/CHE_mode.py
+# this evaluates to <app>/ref_gas (for example,
+# /home/junhee/projects/app/ref_gas or /app/ref_gas).
+_SAGE_APP_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_REF_DIR = _SAGE_APP_ROOT / "ref_gas"
+
+
+def _candidate_ref_dirs(ref_dir: str | Path = DEFAULT_REF_DIR) -> Tuple[Path, ...]:
+    """Return de-duplicated reference directories in lookup order.
+
+    A deployment may expose a package-local ``ref_gas`` directory and mount
+    the complete reference library at ``/app/ref_gas``.  Directory-level
+    resolution alone is therefore insufficient: the first directory can
+    exist while a newly added template is present only in a later one.
+    """
+    path = Path(ref_dir).expanduser()
+    requested = path if path.is_absolute() else (Path.cwd() / path)
+    candidates = [
+        requested,
+        DEFAULT_REF_DIR,
+        Path("/app/ref_gas"),
+        Path.cwd() / "ref_gas",
+        Path.cwd() / "app" / "ref_gas",
+    ]
+    seen: set[str] = set()
+    resolved_dirs: List[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        marker = str(resolved)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        resolved_dirs.append(resolved)
+    return tuple(resolved_dirs)
+
+
+def _resolve_ref_dir(ref_dir: str | Path = DEFAULT_REF_DIR) -> Path:
+    """Return the first existing reference-data directory."""
+    candidates = _candidate_ref_dirs(ref_dir)
+    for resolved in candidates:
+        if resolved.is_dir():
+            return resolved
+
+    # Preserve a deterministic error path when no candidate exists.  The
+    # caller will raise FileNotFoundError for the exact missing template.
+    return candidates[0]
+
+
+def _resolve_ref_file(
+    filename: str | Path,
+    ref_dir: str | Path = DEFAULT_REF_DIR,
+) -> Path:
+    """Resolve one reference file across all supported ``ref_gas`` roots."""
+    name = Path(filename).expanduser()
+    if name.is_absolute():
+        return name.resolve()
+    candidates = _candidate_ref_dirs(ref_dir)
+    for directory in candidates:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    # Deterministic missing-file path for a clear FileNotFoundError.
+    return candidates[0] / name
+
+# Legacy CO2RR thermochemical values remain loadable for backward-compatible
+# metadata, but pathway screening reports registry-driven electronic ΔE only.
 DEFAULT_ADS_CORR: Dict[str, float] = {
     "COOH": 0.0,
     "CO": 0.0,
     "HCOO": 0.0,
     "OCHO": 0.0,
+    "CHO": 0.0,
+    "COH": 0.0,
+    "CHOH": 0.0,
+    "CH2O": 0.0,
+    "CH3O": 0.0,
+    "CH2OH": 0.0,
+    "CH": 0.0,
+    "CH2": 0.0,
+    "CH3": 0.0,
 }
 
 # Adsorbate template file names in ref_gas/
 ADS_TEMPLATE_FILES: Dict[str, str] = {
-    "CO": "CO_box.cif",
-    "COOH": "COOH_box.cif",
-    "HCOO": "HCOO_box.cif",
-    "OCHO": "OCHO_box.cif",
-    # ── ORR intermediates ──
+    **CO2RR_TEMPLATE_FILES,
+    # ── OER intermediates ──
     "OH":  "OH_box.cif",
     "OOH": "OOH_box.cif",
     "O":   "O_box.cif",
@@ -149,14 +238,16 @@ def _safe_float(x, default=np.nan) -> float:
 
 
 
-def _load_ads_corr(ref_dir: str | Path = "ref_gas") -> Dict[str, float]:
+def _load_ads_corr(ref_dir: str | Path = DEFAULT_REF_DIR) -> Dict[str, float]:
     """
-    Load per-adsorbate ZPE correction values from the ΔZPE_ads block in
-    thermo_CO2RR.json.  Falls back to DEFAULT_ADS_CORR if file is missing
-    or cannot be parsed.
+    Load per-state CO2RR free-energy corrections from thermo_CO2RR.json.
+
+    A complete free-energy correction block is preferred.  The legacy
+    ΔZPE_ads block remains supported, but its presence alone is reported as
+    a partial correction by the metadata generated below.
     """
-    ref_dir = Path(ref_dir)
-    thermo_path = ref_dir / THERMO_CO2RR_NAME
+    ref_dir = _resolve_ref_dir(ref_dir)
+    thermo_path = _resolve_ref_file(THERMO_CO2RR_NAME, ref_dir)
 
     corr = DEFAULT_ADS_CORR.copy()
     if not thermo_path.is_file():
@@ -167,25 +258,65 @@ def _load_ads_corr(ref_dir: str | Path = "ref_gas") -> Dict[str, float]:
     except Exception:
         return corr
 
-    zpe_block = (
-        data.get("ΔZPE_ads (eV)")
+    correction_block = (
+        data.get("state_corrections_eV")
+        or data.get("G_correction (eV)")
+        or data.get("ΔG_correction (eV)")
+        or data.get("dG_correction (eV)")
+        or data.get("CO2RR_state_corrections_eV")
+        or data.get("ΔZPE_ads (eV)")
         or data.get("dZPE_ads (eV)")
         or data.get("dZPE_ads")
         or {}
     )
 
     for key in corr.keys():
-        if key in zpe_block:
+        if key in correction_block:
             try:
-                corr[key] = float(zpe_block[key])
+                corr[key] = float(correction_block[key])
             except Exception:
                 pass
 
     return corr
 
 
+def _co2rr_correction_level(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return "electronic_energy_only"
+    full_keys = (
+        "state_corrections_eV", "G_correction (eV)",
+        "ΔG_correction (eV)", "dG_correction (eV)",
+        "CO2RR_state_corrections_eV",
+    )
+    if any(isinstance(data.get(key), dict) for key in full_keys):
+        return "corrected_CHE"
+    zpe_keys = ("ΔZPE_ads (eV)", "dZPE_ads (eV)", "dZPE_ads")
+    if any(isinstance(data.get(key), dict) for key in zpe_keys):
+        return "partial_ZPE_only"
+    return "electronic_energy_only"
+
+
+def _co2rr_product_corrections(data: Optional[dict]) -> Dict[str, float]:
+    if not isinstance(data, dict):
+        return {}
+    block = (
+        data.get("product_corrections_eV")
+        or data.get("product_G_correction (eV)")
+        or data.get("CO2RR_product_corrections_eV")
+        or {}
+    )
+    out: Dict[str, float] = {}
+    if isinstance(block, dict):
+        for key, value in block.items():
+            try:
+                out[str(key).strip().lower()] = float(value)
+            except Exception:
+                pass
+    return out
+
+
 def _load_co2rr_thermo(
-    ref_dir: str | Path = "ref_gas",
+    ref_dir: str | Path = DEFAULT_REF_DIR,
 ) -> Tuple[Optional[dict], Dict[str, float], Path]:
     """
     Load CO2RR thermodynamic data and per-adsorbate corrections.
@@ -194,8 +325,8 @@ def _load_co2rr_thermo(
     -------
     (thermo_data or None, ads_corr dict, thermo_path)
     """
-    ref_dir = Path(ref_dir)
-    thermo_path = ref_dir / THERMO_CO2RR_NAME
+    ref_dir = _resolve_ref_dir(ref_dir)
+    thermo_path = _resolve_ref_file(THERMO_CO2RR_NAME, ref_dir)
 
     if not thermo_path.is_file():
         return None, DEFAULT_ADS_CORR.copy(), thermo_path
@@ -208,15 +339,15 @@ def _load_co2rr_thermo(
     ads_corr = _load_ads_corr(ref_dir)
     return data, ads_corr, thermo_path
 
-def _load_orr_thermo(ref_dir: str | Path = "ref_gas") -> Dict[str, float]:
+def _load_orr_thermo(ref_dir: str | Path = DEFAULT_REF_DIR) -> Dict[str, float]:
     """
     Load per-adsorbate ZPE+TΔS corrections for ORR intermediates from
     thermo_ORR.json.  Falls back to DEFAULT_ORR_CORR if file is missing
     or cannot be parsed.
     """
-    ref_dir = Path(ref_dir)
+    ref_dir = _resolve_ref_dir(ref_dir)
     corr = DEFAULT_ORR_CORR.copy()
-    p = ref_dir / THERMO_ORR_NAME
+    p = _resolve_ref_file(THERMO_ORR_NAME, ref_dir)
     if not p.is_file():
         return corr
     try:
@@ -241,7 +372,7 @@ def _load_orr_thermo(ref_dir: str | Path = "ref_gas") -> Dict[str, float]:
 def _get_ads_box_energies(
     adspecies: tuple[str, ...],
     calc,
-    ref_dir: str | Path = "ref_gas",
+    ref_dir: str | Path = DEFAULT_REF_DIR,
     steps: int = 200,
     fmax: float = 0.05,
     GROOT: Optional[Path] = None,
@@ -253,7 +384,7 @@ def _get_ads_box_energies(
     relaxes each in a periodic box using the provided calculator, and returns
     a dict of {adsorbate_name: energy_eV}.
     """
-    ref_dir = Path(ref_dir)
+    ref_dir = _resolve_ref_dir(ref_dir)
     E_ads_box: dict[str, float] = {}
 
     unique_ads = {a.replace("*", "").upper() for a in adspecies}
@@ -262,7 +393,7 @@ def _get_ads_box_energies(
             continue
 
         cif_name = ADS_TEMPLATE_FILES[ads_clean]
-        cif_path = ref_dir / cif_name
+        cif_path = _resolve_ref_file(cif_name, ref_dir)
         if not cif_path.is_file():
             # OCHO box energy is not used in the current code path; skip if
             # template is missing.  Add the same fallback as _load_ads_template
@@ -299,6 +430,12 @@ GAS_REF_FILES: Dict[str, str] = {
     "H2O": "H2O_box.cif",
     "CO": "CO_box.cif",
     "H2": "H2_box.cif",
+    "HCOOH": "HCOOH_box.cif",
+    # Neutral CH2O is formaldehyde.  It may be used as an HCHO(g) endpoint,
+    # but is no longer a required adsorbed intermediate in the default route.
+    "HCHO": "CH2O_box.cif",
+    "CH3OH": "CH3OH_box.cif",
+    "CH4": "CH4_box.cif",
 }
 
 
@@ -314,22 +451,23 @@ def _box_molecule(at, cell: float = 15.0):
 def _get_gas_box_energies(
     species: Iterable[str],
     calc,
-    ref_dir: str | Path = "ref_gas",
+    ref_dir: str | Path = DEFAULT_REF_DIR,
     steps: int = 200,
     fmax: float = 0.05,
     cell: float = 15.0,
     GROOT: Optional[Path] = None,
+    allow_ase_fallback: bool = True,
 ) -> Dict[str, float]:
     """
     Compute gas-phase reference energies (CO2, H2O, etc.) in a large box using the same calculator.
 
     Priority:
       1) ref_gas/*_box.cif if present (reproducible references)
-      2) ASE built-in molecules (fallback)
+      2) ASE built-in molecules, only when ``allow_ase_fallback`` is True
     """
     from ase.build import molecule  # type: ignore
 
-    ref_dir = Path(ref_dir)
+    ref_dir = _resolve_ref_dir(ref_dir)
     out: Dict[str, float] = {}
 
     for sp in species:
@@ -338,12 +476,23 @@ def _get_gas_box_energies(
 
         cif_name = GAS_REF_FILES.get(sp_u)
         if cif_name is not None:
-            cif_path = ref_dir / cif_name
+            cif_path = _resolve_ref_file(cif_name, ref_dir)
             if cif_path.is_file():
                 try:
                     mol = read(cif_path).copy()
                 except Exception:
                     mol = None
+
+        if mol is None and not bool(allow_ase_fallback):
+            expected = (
+                str(_resolve_ref_file(cif_name, ref_dir))
+                if cif_name is not None else f"{ref_dir}/{sp_u}_box.cif"
+            )
+            raise FileNotFoundError(
+                f"Explicit gas endpoint reference not found or unreadable: {expected}. "
+                "Add the energy to thermo_CO2RR.json or provide the CIF; no automatic "
+                "molecular fallback is used for product endpoints."
+            )
 
         if mol is None:
             # ASE molecule() expects names like 'CO2', 'H2O', 'H2', 'CO'
@@ -384,10 +533,12 @@ def _load_or_compute_gas_refs(
     required: Iterable[str],
     calc,
     GROOT: Path,
-    ref_dir: str | Path = "ref_gas",
+    ref_dir: str | Path = DEFAULT_REF_DIR,
     steps: int = 200,
     fmax: float = 0.05,
     cell: float = 15.0,
+    allow_ase_fallback: bool = True,
+    use_cache: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, str]]:
     """Load cached gas refs from GROOT/gas_refs.json; compute missing with _get_gas_box_energies."""
     required_u = [str(s).upper() for s in required]
@@ -395,7 +546,7 @@ def _load_or_compute_gas_refs(
     gas_E: Dict[str, float] = {}
     src: Dict[str, str] = {}
 
-    if cache_path.is_file():
+    if bool(use_cache) and cache_path.is_file():
         try:
             cached = json.loads(cache_path.read_text())
             if isinstance(cached, dict):
@@ -418,14 +569,16 @@ def _load_or_compute_gas_refs(
             fmax=fmax,
             cell=cell,
             GROOT=GROOT,
+            allow_ase_fallback=allow_ase_fallback,
         )
         for k, v in computed.items():
             gas_E[str(k).upper()] = float(v)
             src[str(k).upper()] = "computed"
-        try:
-            cache_path.write_text(json.dumps(gas_E, indent=2))
-        except Exception:
-            pass
+        if bool(use_cache):
+            try:
+                cache_path.write_text(json.dumps(gas_E, indent=2))
+            except Exception:
+                pass
 
     return gas_E, src
 
@@ -661,120 +814,203 @@ def _build_target_sites(
     slab_u_rel,
     sites: Iterable[str],
     user_ads_sites: Optional[Mapping[str, object]],
+    reaction_mode: str = "HER",
 ) -> List[Dict[str, object]]:
     """
-    Build the final list of target-site records.
+    Build reaction-aware target-site records.
 
-    Each record preserves the human-facing site label together with the seed
-    metadata needed for post-relaxation tracking.
+    Site policy
+    -----------
+    Metal:
+        Preserve Step-3 geometry sites when supplied. Otherwise use the
+        existing metal geometry defaults.
+
+    Oxide HER:
+        Preserve the legacy lattice-O/O-top projection policy.
+
+    Oxide CO2RR:
+        Preserve Step-3 geometry sites directly. Do not project them through
+        the HER-specific O-top routine. When no usable Step-3 site survives,
+        fall back to the generic oxide surface-site detector.
+
+    Oxide OER:
+        This function supplies a preliminary list only. _run_co2rr_che later
+        replaces it with the dedicated exposed-cation AEM site policy.
     """
+    # SAGE_OXIDE_CO2RR_SITE_ROUTING_V2
     target_sites: List[Dict[str, object]] = []
-    mtype_norm = str(mtype).lower()
+    mtype_norm = str(mtype).strip().lower()
+    reaction_mode_norm = str(reaction_mode or "HER").strip().upper()
     site_names = [str(s) for s in (sites or ())]
 
-    if user_ads_sites:
-        projected_sites = user_ads_sites
-        if mtype_norm == "oxide":
-            projected_sites = _project_oxide_her_sites_to_otop(
-                slab_u_rel,
-                user_ads_sites,
-                dz=0.0,
-                extra_z=0.0,
+    def _append_site(label: str, site, seed_source: str) -> None:
+        try:
+            kind = str(getattr(site, "kind", "unknown"))
+            pos = np.asarray(getattr(site, "position", []), dtype=float).reshape(-1)
+            if pos.size < 2 or not np.isfinite(pos[:2]).all():
+                return
+
+            raw_indices = tuple(
+                int(i) for i in (getattr(site, "surface_indices", ()) or ())
             )
-        for label, site in projected_sites.items():
-            kind = getattr(site, "kind", "unknown")
-            pos = np.asarray(getattr(site, "position", []), dtype=float)
-            surface_indices = tuple(int(i) for i in getattr(site, "surface_indices", ()) or ())
-            if pos.shape[0] < 2:
-                continue
+            surface_indices = tuple(
+                i for i in raw_indices if 0 <= int(i) < len(slab_u_rel)
+            )
             xyz = (
                 np.asarray(pos[:3], dtype=float)
-                if pos.shape[0] >= 3
+                if pos.size >= 3
                 else np.asarray([pos[0], pos[1], np.nan], dtype=float)
             )
             target_sites.append({
                 "site_label": str(label),
-                "site_kind": str(kind),
+                "site_kind": kind,
                 "xy": np.asarray(pos[:2], dtype=float),
                 "initial_xyz": xyz,
                 "surface_indices": surface_indices,
-                "seed_source": "user_ads_sites_projected" if mtype_norm == "oxide" else "user_ads_sites",
+                "seed_source": str(seed_source),
+                "reaction_mode": reaction_mode_norm,
             })
-        return target_sites
+        except Exception:
+            return
 
-    if mtype_norm == "metal":
-        xy_map = site_xy_by_layers_metal(slab_u_rel)
-        sites_iter = list(site_names)
-        if not sites_iter:
-            sites_iter = ["ontop", "bridge", "hollow"]
-        for site_name in sites_iter:
-            if site_name in xy_map:
-                xy = np.asarray(xy_map[site_name], dtype=float)
-                target_sites.append({
-                    "site_label": str(site_name),
-                    "site_kind": str(site_name),
-                    "xy": xy,
-                    "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
-                    "surface_indices": tuple(),
-                    "seed_source": "geometry_default",
-                })
-        return target_sites
+    # Step-3/manual sites are the source of truth when usable.
+    if user_ads_sites:
+        source_sites = user_ads_sites
+        source_label = "user_ads_sites"
 
-    if mtype_norm == "oxide":
-        max_sites = max(1, len(site_names)) if site_names else 6
-        oxide_sites = _generate_oxide_her_oanchor_sites(
-            slab_u_rel,
-            max_sites=int(max_sites),
-        )
-        oxide_sites = _project_oxide_her_sites_to_otop(
-            slab_u_rel,
-            oxide_sites,
-            dz=0.0,
-            extra_z=0.0,
-        )
-
-        for idx, site in enumerate(oxide_sites or [], start=1):
-            pos = np.asarray(getattr(site, "position", []), dtype=float)
-            if pos.shape[0] < 2:
-                continue
-            xyz = (
-                np.asarray(pos[:3], dtype=float)
-                if pos.shape[0] >= 3
-                else np.asarray([pos[0], pos[1], np.nan], dtype=float)
+        # HER alone uses the lattice-O/O-top projection.
+        if mtype_norm == "oxide" and reaction_mode_norm == "HER":
+            try:
+                source_sites = _project_oxide_her_sites_to_otop(
+                    slab_u_rel,
+                    user_ads_sites,
+                    dz=0.0,
+                    extra_z=0.0,
+                )
+                source_label = "user_ads_sites_projected_her_o_top"
+            except Exception:
+                source_sites = {}
+        elif mtype_norm == "oxide":
+            source_label = (
+                f"user_ads_sites_{reaction_mode_norm.lower()}_geometry_direct"
             )
-            target_sites.append({
-                "site_label": f"o_top_{idx}",
-                "site_kind": str(getattr(site, "kind", "o_top")),
-                "xy": np.asarray(pos[:2], dtype=float),
-                "initial_xyz": xyz,
-                "surface_indices": tuple(int(i) for i in getattr(site, "surface_indices", ()) or ()),
-                "seed_source": "oxide_o_anchor",
-            })
+
+        for label, site in (source_sites or {}).items():
+            _append_site(str(label), site, source_label)
 
         if target_sites:
             return target_sites
+        # Do not return an empty list here. Continue to the reaction-specific
+        # automatic detector when the supplied sites could not be converted.
 
-        xy_map = site_xy_by_layers_oxide(slab_u_rel)
-        for site_name in site_names:
+    if mtype_norm == "metal":
+        xy_map = site_xy_by_layers_metal(slab_u_rel)
+        sites_iter = list(site_names) or ["ontop", "bridge", "hollow"]
+        for site_name in sites_iter:
             if site_name not in xy_map:
                 continue
             xy = np.asarray(xy_map[site_name], dtype=float)
+            if xy.size < 2 or not np.isfinite(xy[:2]).all():
+                continue
             target_sites.append({
                 "site_label": str(site_name),
                 "site_kind": str(site_name),
-                "xy": xy,
+                "xy": np.asarray(xy[:2], dtype=float),
                 "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
                 "surface_indices": tuple(),
-                "seed_source": "geometry_default_fallback",
+                "seed_source": "geometry_default",
+                "reaction_mode": reaction_mode_norm,
+            })
+        return target_sites
+
+    if mtype_norm == "oxide":
+        # Keep the historical O-anchor policy isolated to HER.
+        if reaction_mode_norm == "HER":
+            max_sites = max(1, len(site_names)) if site_names else 6
+            oxide_sites = _generate_oxide_her_oanchor_sites(
+                slab_u_rel,
+                max_sites=int(max_sites),
+            )
+            oxide_sites = _project_oxide_her_sites_to_otop(
+                slab_u_rel,
+                oxide_sites,
+                dz=0.0,
+                extra_z=0.0,
+            )
+            for idx, site in enumerate((oxide_sites or {}).values(), start=1):
+                _append_site(
+                    f"o_top_{idx}",
+                    site,
+                    "oxide_her_o_anchor",
+                )
+            if target_sites:
+                return target_sites
+
+        else:
+            # CO2RR uses general oxide geometry sites, not HER O-top sites.
+            requested = {
+                str(name).strip().lower()
+                for name in site_names
+                if str(name).strip()
+            }
+            detector_limit = max(6, len(site_names) * 3 if site_names else 6)
+            try:
+                oxide_sites = list(detect_oxide_surface_sites(
+                    slab_u_rel,
+                    add_cation_ontop=True,
+                    max_cation_sites=max(2, int(detector_limit)),
+                    include_bridge=True,
+                    include_hollow=True,
+                ) or [])
+            except Exception:
+                oxide_sites = []
+
+            if requested:
+                matched = [
+                    site for site in oxide_sites
+                    if str(getattr(site, "kind", "")).strip().lower() in requested
+                ]
+                # Use the requested kinds only when the detector actually
+                # produced a match. Otherwise retain all detected oxide sites.
+                if matched:
+                    oxide_sites = matched
+
+            max_return = max(12, int(detector_limit))
+            for idx, site in enumerate(oxide_sites[:max_return], start=1):
+                kind = str(getattr(site, "kind", "oxide_site"))
+                _append_site(
+                    f"{kind}_{idx}",
+                    site,
+                    f"oxide_{reaction_mode_norm.lower()}_surface_detector",
+                )
+            if target_sites:
+                return target_sites
+
+        # Last-resort legacy XY fallback. This is QA-visible through seed_source.
+        xy_map = site_xy_by_layers_oxide(slab_u_rel)
+        sites_iter = list(site_names) or list(xy_map.keys())
+        for site_name in sites_iter:
+            if site_name not in xy_map:
+                continue
+            xy = np.asarray(xy_map[site_name], dtype=float)
+            if xy.size < 2 or not np.isfinite(xy[:2]).all():
+                continue
+            target_sites.append({
+                "site_label": str(site_name),
+                "site_kind": str(site_name),
+                "xy": np.asarray(xy[:2], dtype=float),
+                "initial_xyz": np.asarray([xy[0], xy[1], np.nan], dtype=float),
+                "surface_indices": tuple(),
+                "seed_source": (
+                    "oxide_her_geometry_default_fallback"
+                    if reaction_mode_norm == "HER"
+                    else f"oxide_{reaction_mode_norm.lower()}_geometry_default_fallback"
+                ),
+                "reaction_mode": reaction_mode_norm,
             })
         return target_sites
 
     raise ValueError(f"Unknown mtype='{mtype}'.")
-
-
-# ---------------------------------------------------------------------
-# HER mode
-# ---------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------
@@ -828,7 +1064,13 @@ def _run_her_che(
     rows: List[Dict[str, object]] = []
     final_h_positions: List[dict[str, object] | np.ndarray] = []
 
-    target_sites = _build_target_sites(mtype, slab_u_rel, sites, user_ads_sites)
+    target_sites = _build_target_sites(
+        mtype,
+        slab_u_rel,
+        sites,
+        user_ads_sites,
+        reaction_mode="HER",
+    )
 
     if not target_sites:
         raise RuntimeError(f"No target adsorption sites were built for mtype='{mtype}'.")
@@ -1238,7 +1480,11 @@ def _run_her_che(
 # ---------------------------------------------------------------------
 # CO2RR / ORR: adsorbate template loading and slab placement
 # ---------------------------------------------------------------------
-def _load_ads_template(ads: str, ref_dir: str | Path = "ref_gas"):
+def _load_ads_template(
+    ads: str,
+    ref_dir: str | Path = DEFAULT_REF_DIR,
+    binding_variant: CO2RRBindingVariant | None = None,
+):
     """
     Load an adsorbate template CIF from ref_gas/ and normalize its
     coordinates so that the anchor atom sits at the origin.
@@ -1258,12 +1504,20 @@ def _load_ads_template(ads: str, ref_dir: str | Path = "ref_gas"):
     if ads_clean not in ADS_TEMPLATE_FILES:
         raise ValueError(f"Unsupported adsorbate '{ads}'")
 
-    ref_dir = Path(ref_dir)
-    cif_path = ref_dir / ADS_TEMPLATE_FILES[ads_clean]
+    ref_dir = _resolve_ref_dir(ref_dir)
+    template_name = (
+        str(binding_variant.template)
+        if binding_variant is not None
+        else ADS_TEMPLATE_FILES[ads_clean]
+    )
+    cif_path = _resolve_ref_file(template_name, ref_dir)
 
     # --- OCHO fallback: if OCHO template missing, reuse HCOO_box and reorder to O-C-H-O ---
     if ads_clean == "OCHO" and (not cif_path.is_file()):
-        fallback = ref_dir / ADS_TEMPLATE_FILES.get("HCOO", "HCOO_box.cif")
+        fallback = _resolve_ref_file(
+            ADS_TEMPLATE_FILES.get("HCOO", "HCOO_box.cif"),
+            ref_dir,
+        )
         if not fallback.is_file():
             raise FileNotFoundError(
                 f"Adsorbate template not found: {cif_path} (and no HCOO fallback at {fallback})"
@@ -1281,6 +1535,24 @@ def _load_ads_template(ads: str, ref_dir: str | Path = "ref_gas"):
         if not cif_path.is_file():
             raise FileNotFoundError(f"Adsorbate template not found: {cif_path}")
         a = read(cif_path).copy()
+
+    # All registered CO2RR species use one species-aware rigid-body
+    # orientation path.  Returning here avoids the legacy CO/formate-only
+    # anchor logic below and prevents per-atom z folding of CHx/CHOx species.
+    if is_supported_co2rr_adsorbate(ads_clean):
+        a, anchor_indices, anchor_mode = orient_co2rr_template(
+            a,
+            ads_clean,
+            anchor_mode_override=(
+                binding_variant.anchor_mode
+                if binding_variant is not None
+                else None
+            ),
+        )
+        a.info = dict(getattr(a, "info", {}) or {})
+        a.info["anchor_mode"] = anchor_mode
+        a.info["anchor_indices"] = list(anchor_indices)
+        return a
 
     pos = a.get_positions()
     symbols = a.get_chemical_symbols()
@@ -1470,9 +1742,13 @@ def _build_adsorbate_on_site(
     xy: np.ndarray,
     ads: str,
     dz: float = 1.8,
-    ref_dir: str | Path = "ref_gas",
+    ref_dir: str | Path = DEFAULT_REF_DIR,
     target_anchor_xyz: np.ndarray | None = None,
     target_anchor_dir: np.ndarray | None = None,
+    site_kind: str = "ontop",
+    surface_indices: tuple[int, ...] = (),
+    mtype: str | None = None,
+    binding_variant: CO2RRBindingVariant | None = None,
 ):
     """
     Place an adsorbate template on the slab at the given xy position,
@@ -1491,10 +1767,20 @@ def _build_adsorbate_on_site(
     pos = slab.get_positions()
     z_top = float(pos[:, 2].max())
 
-    # species-specific dz
+    # Species-specific initial clearance from the central CO2RR registry.
     dz_eff = float(dz)
-    if ads_clean in ("HCOO", "OCHO"):
-        dz_eff = min(dz_eff, 1.4)
+    if is_supported_co2rr_adsorbate(ads_clean):
+        try:
+            dz_eff = min(
+                dz_eff,
+                float(
+                    binding_variant.initial_clearance_A
+                    if binding_variant is not None
+                    else get_co2rr_adsorbate_spec(ads_clean).initial_clearance_A
+                ),
+            )
+        except Exception:
+            pass
 
     if target_anchor_xyz is not None:
         taa = np.asarray(target_anchor_xyz, dtype=float).reshape(3)
@@ -1502,7 +1788,40 @@ def _build_adsorbate_on_site(
     else:
         base = np.array([float(xy[0]), float(xy[1]), z_top + dz_eff], dtype=float)
 
-    ads_atoms = _load_ads_template(ads_clean, ref_dir=ref_dir)
+    ads_atoms = _load_ads_template(
+        ads_clean,
+        ref_dir=ref_dir,
+        binding_variant=binding_variant,
+    )
+
+    if is_supported_co2rr_adsorbate(ads_clean):
+        # Map the registry-defined molecular anchor onto explicit support atoms.
+        # This is the same placement engine used by preview and ML screening.
+        support_z = float(z_top)
+        try:
+            _sids = tuple(int(i) for i in (surface_indices or ()))
+            if _sids:
+                support_z = float(np.max(pos[np.asarray(_sids, dtype=int), 2]))
+        except Exception:
+            _sids = tuple()
+        site_obj = AdsSite(
+            kind=str(site_kind or "ontop"),
+            position=(float(xy[0]), float(xy[1]), float(support_z)),
+            surface_indices=_sids,
+        )
+        placed = place_co2rr_adsorbate(
+            slab,
+            site_obj,
+            ads_clean,
+            ads_atoms,
+            mtype=mtype,
+            binding_variant=binding_variant,
+        )
+        combined = slab + placed.adsorbate_atoms
+        combined.info = dict(getattr(slab, "info", {}) or {})
+        combined.info["co2rr_placement"] = placed.as_dict()
+        return combined
+
     ads_atoms.set_cell(slab.get_cell())
     ads_atoms.set_pbc(slab.get_pbc())
 
@@ -1595,12 +1914,40 @@ def _relax_slab_ads(
 
 
 def _co2rr_anchor_xy(
-    ads_coords3: np.ndarray, ads_symbols: list[str], ads_clean: str
+    ads_coords3: np.ndarray,
+    ads_symbols: list[str],
+    ads_clean: str,
+    anchor_mode_override: str | None = None,
 ) -> tuple[np.ndarray, float, str]:
-    """Return (anchor_xy, anchor_z, anchor_mode) for migration/QA metrics."""
+    """Return the registry-defined anchor coordinate for migration/QA metrics."""
     ads_clean = ads_clean.upper()
     if ads_coords3.shape[0] == 0:
         return np.array([np.nan, np.nan], dtype=float), float("nan"), "none"
+
+    if is_supported_co2rr_adsorbate(ads_clean):
+        mode = str(
+            anchor_mode_override
+            or get_co2rr_adsorbate_spec(ads_clean).anchor_mode
+        )
+        c_idx = [i for i, s in enumerate(ads_symbols) if s == "C"]
+        o_idx = [i for i, s in enumerate(ads_symbols) if s == "O"]
+        if mode == "o_o_midpoint" and len(o_idx) >= 2:
+            pts = ads_coords3[o_idx[:2]]
+            return pts[:, :2].mean(axis=0), float(pts[:, 2].min()), "O2_mid"
+        if mode in {"o_atom", "o_min_z"} and o_idx:
+            oi = (
+                int(o_idx[int(np.argmin(ads_coords3[np.asarray(o_idx, int), 2]))])
+                if mode == "o_min_z" and len(o_idx) > 1
+                else int(o_idx[0])
+            )
+            return (
+                ads_coords3[oi, :2],
+                float(ads_coords3[oi, 2]),
+                "O(min_z)" if mode == "o_min_z" else "O",
+            )
+        if c_idx:
+            ci = int(c_idx[0])
+            return ads_coords3[ci, :2], float(ads_coords3[ci, 2]), "C"
 
     if ads_clean == "HCOO":
         o_idx = [i for i, s in enumerate(ads_symbols) if s == "O"]
@@ -1659,13 +2006,39 @@ def _co2rr_anchor_xy(
 def _co2rr_internal_broken(
     ads_coords3: np.ndarray, ads_symbols: list[str], ads_clean: str
 ) -> bool:
-    """Very lightweight bond-sanity checks to catch obvious fragmentation."""
+    """Composition and bond-sanity checks for registered intermediates."""
     ads_clean = ads_clean.upper()
     if ads_coords3.shape[0] < 2:
         return True
 
     def dist(i, j) -> float:
         return float(np.linalg.norm(ads_coords3[i] - ads_coords3[j]))
+
+    if is_supported_co2rr_adsorbate(ads_clean):
+        spec = get_co2rr_adsorbate_spec(ads_clean)
+        counts = {s: ads_symbols.count(s) for s in set(ads_symbols)}
+        if any(
+            int(counts.get(sym, 0)) != int(n)
+            for sym, n in spec.composition
+        ):
+            return True
+        for sym_a, sym_b, required_count, max_dist in spec.bond_requirements:
+            ia = [i for i, s in enumerate(ads_symbols) if s == sym_a]
+            ib = [i for i, s in enumerate(ads_symbols) if s == sym_b]
+            distances = sorted(
+                dist(i, j)
+                for i in ia
+                for j in ib
+                if i != j
+            )
+            if len(distances) < int(required_count):
+                return True
+            if any(
+                float(d) > float(max_dist)
+                for d in distances[: int(required_count)]
+            ):
+                return True
+        return False
 
     idx_C = [i for i, s in enumerate(ads_symbols) if s == "C"]
     idx_O = [i for i, s in enumerate(ads_symbols) if s == "O"]
@@ -2436,7 +2809,8 @@ def _run_co2rr_che(
     """
     Reaction-descriptor based ΔE/ΔG screening for CO2RR or oxygen intermediates.
 
-    CO2RR adsorbates: COOH*, CO*, HCOO*, OCHO*
+    CO2RR adsorbates are defined centrally in ``co2rr_registry.py`` and may
+    include CO/formate/methanol/methane pathway intermediates.
     OER adsorbates: OOH*, O*, OH*
 
     When reaction_mode is "OER", the oxygen-intermediate reference scheme
@@ -2448,6 +2822,13 @@ def _run_co2rr_che(
     _is_oxygen = _rxn_mode in {"OER", "OER_COMPETITION", "OXYGEN"}
     _is_orr = False
     _is_oer = _rxn_mode in {"OER", "OER_COMPETITION", "OXYGEN"}
+    _requested_ads = [str(a).replace("*", "").upper() for a in adspecies]
+    _unsupported_ads = [a for a in _requested_ads if a not in ADS_TEMPLATE_FILES]
+    if _unsupported_ads:
+        raise ValueError(
+            "Unsupported adsorbates reached CHE calculation: "
+            + ", ".join(_unsupported_ads)
+        )
     _oer_relax_mode = str(oer_relaxation_mode or DEFAULT_OER_RELAXATION_MODE).strip().lower()
     if _oer_relax_mode not in OER_RELAXATION_MODES:
         _oer_relax_mode = DEFAULT_OER_RELAXATION_MODE
@@ -2470,7 +2851,21 @@ def _run_co2rr_che(
         UROOT,
     ) = _prepare_slab(user_slab_cif, out_root, vac_z, relax_mode)
 
-    target_sites = _build_target_sites(mtype, slab_u_rel, sites, user_ads_sites)
+    target_sites = _build_target_sites(
+        mtype,
+        slab_u_rel,
+        sites,
+        user_ads_sites,
+        reaction_mode=_rxn_mode,
+    )
+
+    if not target_sites:
+        raise RuntimeError(
+            f"No target adsorption sites were built for "
+            f"mtype='{mtype}', reaction_mode='{_rxn_mode}'. "
+            "For oxide CO2RR, Step-3 geometry sites were preserved "
+            "directly and generic oxide surface detection was also attempted."
+        )
 
     # OER on oxides requires a different slab/site policy from oxide-HER.
     # HER uses lattice-O/O-anchor sites; AEM OER requires exposed cation sites
@@ -2548,7 +2943,7 @@ def _run_co2rr_che(
     if _is_oxygen:
         ads_corr = _load_orr_thermo()
         thermo_data = None
-        thermo_path = Path("ref_gas") / THERMO_ORR_NAME
+        thermo_path = _resolve_ref_file(THERMO_ORR_NAME, DEFAULT_REF_DIR)
     else:
         thermo_data, ads_corr, thermo_path = _load_co2rr_thermo()
     gas_E: Dict[str, float] = {}
@@ -2578,7 +2973,7 @@ def _run_co2rr_che(
             missing_required,
             calc,
             GROOT=GROOT,
-            ref_dir="ref_gas",
+            ref_dir=DEFAULT_REF_DIR,
             steps=min(200, max(0, int(free_steps))),
             fmax=0.05,
             cell=15.0,
@@ -2604,6 +2999,97 @@ def _run_co2rr_che(
     E_CO2 = gas_E.get("CO2", 0.0)   # Not used in ORR mode
     E_H2 = gas_E["H2"]
     E_H2O = gas_E["H2O"]
+
+    # Build explicit molecular endpoint energies for the requested CO2RR
+    # network.  They share the same CO2/H2/H2O reference as the adsorbed
+    # states, so endpoint release steps can be included in PDS/U_L analysis.
+    # A missing endpoint never aborts the expensive surface calculation; the
+    # corresponding product path is reported as incomplete instead.
+    co2rr_product_states: Dict[str, Dict[str, object]] = {}
+    co2rr_endpoint_errors: Dict[str, str] = {}
+    co2rr_corr_level = (
+        "oxygen_intermediate"
+        if _is_oxygen
+        else _co2rr_correction_level(thermo_data)
+    )
+    if not _is_oxygen:
+        product_corr = _co2rr_product_corrections(thermo_data)
+        for product_key in required_co2rr_products(tuple(adspecies)):
+            spec_product = get_co2rr_product_spec(product_key)
+            gas_key = str(spec_product.gas_key).upper()
+            if gas_key not in gas_E or not np.isfinite(gas_E.get(gas_key, np.nan)):
+                try:
+                    endpoint_E, endpoint_src = _load_or_compute_gas_refs(
+                        [gas_key],
+                        calc,
+                        GROOT=GROOT,
+                        ref_dir=DEFAULT_REF_DIR,
+                        steps=min(200, max(0, int(free_steps))),
+                        fmax=0.05,
+                        cell=15.0,
+                        # Product endpoints must be auditable. In particular,
+                        # do not invent CH3OH from ASE when CH3OH_box.cif and a
+                        # thermo_CO2RR.json energy are both absent.
+                        allow_ase_fallback=False,
+                        use_cache=False,
+                    )
+                    if gas_key in endpoint_E and np.isfinite(endpoint_E[gas_key]):
+                        gas_E[gas_key] = float(endpoint_E[gas_key])
+                        gas_src[gas_key] = str(endpoint_src.get(gas_key, "computed"))
+                except Exception as exc:
+                    co2rr_endpoint_errors[product_key] = str(exc)
+
+            available = gas_key in gas_E and np.isfinite(gas_E.get(gas_key, np.nan))
+            if available:
+                product_ref, product_ref_rxn = co2rr_product_reference_energy(
+                    product_key,
+                    E_CO2=E_CO2,
+                    E_H2=E_H2,
+                    E_H2O=E_H2O,
+                )
+                electronic_energy = float(gas_E[gas_key] - product_ref)
+                corr_candidates = (
+                    str(product_key).lower(),
+                    str(spec_product.gas_key).lower(),
+                    str(spec_product.state_id).lower(),
+                )
+                correction_key = next(
+                    (key for key in corr_candidates if key in product_corr),
+                    None,
+                )
+                correction = float(product_corr.get(correction_key, 0.0))
+                correction_applied = correction_key is not None
+                co2rr_product_states[product_key] = {
+                    "state_id": spec_product.state_id,
+                    "label": spec_product.label,
+                    "available": True,
+                    "electronic_energy_eV": electronic_energy,
+                    "free_energy_eV": float(electronic_energy + correction),
+                    "correction_eV": correction,
+                    "correction_applied": bool(correction_applied),
+                    "thermochemistry_level": (
+                        "corrected_CHE"
+                        if correction_applied
+                        else "electronic_energy_only"
+                    ),
+                    "gas_reference_source": gas_src.get(gas_key, "unknown"),
+                    "reference_reaction": product_ref_rxn,
+                    "warning": spec_product.warning,
+                }
+            else:
+                co2rr_product_states[product_key] = {
+                    "state_id": spec_product.state_id,
+                    "label": spec_product.label,
+                    "available": False,
+                    "electronic_energy_eV": None,
+                    "free_energy_eV": None,
+                    "correction_applied": False,
+                    "thermochemistry_level": "unavailable",
+                    "warning": co2rr_endpoint_errors.get(
+                        product_key,
+                        f"Gas endpoint reference {gas_key} is unavailable.",
+                    ),
+                }
 
     # --- Optional companion: HER guardrail (single-site; cheap) ---
     her_guard = None
@@ -2638,6 +3124,7 @@ def _run_co2rr_che(
             her_guard = {"mode": "HER_GUARDRAIL", "error": str(e)}
 
     rows: List[Dict[str, object]] = []
+    placement_failures: List[Dict[str, object]] = []
 
     for site_seed in target_sites:
         label = str(site_seed.get("site_label", "unknown"))
@@ -2645,8 +3132,6 @@ def _run_co2rr_che(
         xy = np.asarray(site_seed.get("xy", [np.nan, np.nan]), dtype=float)
         for ads in adspecies:
             ads_clean = ads.replace("*", "").upper()
-            if ads_clean not in ADS_TEMPLATE_FILES:
-                continue
 
             seed_variants = [{
                 "site_label": str(label),
@@ -2722,15 +3207,91 @@ def _run_co2rr_che(
                             "active_cation_symbol": site_seed.get("active_cation_symbol"),
                         })
 
+            # Expand alternative initial binding geometries while retaining a
+            # single chemical-state identity. CH2OH receives both C-bound and
+            # O-bound seeds. Legacy/custom CH2O seeds remain readable but are
+            # excluded from the default product network.
+            if (not _is_oxygen) and is_supported_co2rr_adsorbate(ads_clean):
+                binding_variants = get_co2rr_binding_variants(ads_clean)
+            else:
+                binding_variants = (None,)
+            expanded_seed_variants = []
+            for seed0 in seed_variants:
+                base_site_label = str(seed0.get("site_label", label))
+                for binding_variant in binding_variants:
+                    seed1 = dict(seed0)
+                    seed1["binding_base_site_label"] = base_site_label
+                    seed1["binding_variant"] = binding_variant
+                    if binding_variant is not None and len(binding_variants) > 1:
+                        seed1["site_label"] = (
+                            f"{base_site_label}:{binding_variant.key}"
+                        )
+                    expanded_seed_variants.append(seed1)
+            seed_variants = expanded_seed_variants
+
             for seed in seed_variants:
-                slab_ads = _build_adsorbate_on_site(
-                    slab_u_rel,
-                    np.asarray(seed["xy"], float),
-                    ads_clean,
-                    dz=1.8,
-                    ref_dir="ref_gas",
-                    target_anchor_xyz=seed["target_anchor_xyz"],
-                    target_anchor_dir=seed.get("target_anchor_dir"),
+                # Registry-enforced site routing.  In particular, bidentate
+                # HCOO* is evaluated only on bridge/cation-pair sites.
+                if (
+                    not _is_oxygen
+                    and is_supported_co2rr_adsorbate(ads_clean)
+                    and not co2rr_site_allowed(
+                        ads_clean,
+                        seed.get("site_kind", kind),
+                        binding_variant=seed.get("binding_variant"),
+                    )
+                ):
+                    continue
+                try:
+                    slab_ads = _build_adsorbate_on_site(
+                        slab_u_rel,
+                        np.asarray(seed["xy"], float),
+                        ads_clean,
+                        dz=1.8,
+                        ref_dir=DEFAULT_REF_DIR,
+                        target_anchor_xyz=seed["target_anchor_xyz"],
+                        target_anchor_dir=seed.get("target_anchor_dir"),
+                        site_kind=str(seed.get("site_kind", kind)),
+                        surface_indices=tuple(
+                            int(i) for i in seed.get("surface_indices", ()) or ()
+                        ),
+                        mtype=str(mtype),
+                        binding_variant=seed.get("binding_variant"),
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    if _is_oxygen:
+                        raise
+                    # A product-competition run must not abort merely because
+                    # one adsorbate/site combination is geometrically
+                    # inaccessible.  This is common for bidentate HCOO* on an
+                    # oxide bridge that is not an exposed coplanar cation pair.
+                    # Preserve the diagnostic and continue with alternative
+                    # sites/binding modes (for formate, OCHO* remains valid).
+                    binding_variant = seed.get("binding_variant")
+                    placement_failures.append({
+                        "adsorbate": ads_clean,
+                        "site_label": str(seed.get("site_label", label)),
+                        "binding_base_site_label": str(
+                            seed.get("binding_base_site_label", label)
+                        ),
+                        "site_kind": str(seed.get("site_kind", kind)),
+                        "binding_variant": (
+                            str(getattr(binding_variant, "key", "default"))
+                            if binding_variant is not None
+                            else "default"
+                        ),
+                        "surface_indices": ",".join(
+                            str(int(i))
+                            for i in seed.get("surface_indices", ()) or ()
+                        ),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "action": "skipped_inaccessible_seed",
+                    })
+                    continue
+
+                placement_meta = dict(
+                    getattr(slab_ads, "info", {}).get("co2rr_placement", {}) or {}
                 )
 
                 site_label_file = str(seed["site_label"]).replace(":", "__")
@@ -2791,14 +3352,29 @@ def _run_co2rr_che(
                 ads_coords3 = coords[n_slab:, :]
                 ads_symbols = list(symbols_all[n_slab:])
                 anchor_xy, anchor_z, anchor_mode = _co2rr_anchor_xy(
-                    ads_coords3, ads_symbols, ads_clean
+                    ads_coords3,
+                    ads_symbols,
+                    ads_clean,
+                    anchor_mode_override=(
+                        seed["binding_variant"].anchor_mode
+                        if seed.get("binding_variant") is not None
+                        else None
+                    ),
                 )
                 slab_only = slab_ads_rel[:n_slab]
 
                 migrate_thr = (
-                    float(MIGRATE_THR)
-                    if ads_clean == "CO"
-                    else float(max(MIGRATE_THR, 2.5))
+                    float(
+                        co2rr_migration_threshold(
+                            ads_clean, fallback=max(MIGRATE_THR, 2.5)
+                        )
+                    )
+                    if not _is_oxygen
+                    else (
+                        float(MIGRATE_THR)
+                        if ads_clean == "O"
+                        else float(max(MIGRATE_THR, 2.5))
+                    )
                 )
                 tracking = _resolve_site_tracking(
                     slab_only=slab_only,
@@ -2916,19 +3492,15 @@ def _run_co2rr_che(
                     qc_flags.append("broken_adsorbate")
 
                 # --- reaction descriptor ---
-                # CO2(g) + H+ + e- → COOH*
-                # CO2(g) + 2H+ + 2e- → CO* + H2O(l)
-                # CO2(g) + H+ + e- → HCOO* / OCHO*
-                # ORR (Norskov CHE): E_O2_eff = 2·E_H2O - 2·E_H2 + 4×1.23 eV
-                if ads_clean == "COOH":
-                    E_reagents = E_CO2 + 0.5 * E_H2
-                    ref_rxn = "CO2 + 1/2 H2"
-                elif ads_clean == "CO":
-                    E_reagents = E_CO2 + E_H2 - E_H2O
-                    ref_rxn = "CO2 + H2 - H2O"
-                elif ads_clean in ("HCOO", "OCHO"):
-                    E_reagents = E_CO2 + 0.5 * E_H2
-                    ref_rxn = "CO2 + 1/2 H2"
+                # Registry-driven CO2RR stoichiometry:
+                # CO2 + a H2 - b H2O -> intermediate*.
+                if (not _is_oxygen) and is_supported_co2rr_adsorbate(ads_clean):
+                    E_reagents, ref_rxn = co2rr_reference_energy(
+                        ads_clean,
+                        E_CO2=E_CO2,
+                        E_H2=E_H2,
+                        E_H2O=E_H2O,
+                    )
                 # ── ORR/OER oxygen intermediates ─────────────────────────────
                 elif ads_clean == "OOH":
                     if _is_oer:
@@ -2970,14 +3542,35 @@ def _run_co2rr_che(
     
                 dE_raw = float(E_slab_ads - E_slab_u)
                 dE_ads = float(E_slab_ads - E_slab_u - E_reagents)
-                g_corr = float(ads_corr.get(ads_clean, 0.0))
-                dG_ads = float(dE_ads + g_corr)
+
+                # OER retains its established correction. CO2RR applies a
+                # registry-state correction only when thermo_CO2RR.json
+                # explicitly supplies one; otherwise ΔE remains the primary
+                # provisional network energy.
+                if _is_oxygen:
+                    g_corr = float(ads_corr.get(ads_clean, 0.0))
+                    dG_ads = float(dE_ads + g_corr)
+                elif co2rr_corr_level in {"corrected_CHE", "partial_ZPE_only"}:
+                    g_corr = float(ads_corr.get(ads_clean, 0.0))
+                    dG_ads = float(dE_ads + g_corr)
+                else:
+                    g_corr = None
+                    dG_ads = None
     
                 row: Dict[str, object] = {
                     "mode": ("OER" if _is_oer else "CO2RR"),
                     "adsorbate": ads_clean,
                     "site": seed["site_kind"],
                     "site_label": seed["site_label"],
+                    "binding_base_site_label": seed.get(
+                        "binding_base_site_label", seed["site_label"]
+                    ),
+                    "binding_variant": placement_meta.get(
+                        "binding_variant_key", "default"
+                    ),
+                    "binding_variant_label": placement_meta.get(
+                        "binding_variant_label", ""
+                    ),
                     "seed_source": seed.get("seed_source"),
                     "seed_site_kind": tracking["seed_site_kind"],
                     "initial_site_kind": tracking["initial_site_kind"],
@@ -3008,10 +3601,25 @@ def _run_co2rr_che(
                     "ΔE_ads_user (eV)": float(dE_ads),
                     "ΔE_raw(slab+ads - slab) (eV)": float(dE_raw),
                     "E_ref_reagents (eV)": float(E_reagents),
-                    "G_correction (eV)": float(g_corr),
                     "ref_rxn": ref_rxn,
-                    "ΔG_ads (eV)": float(dG_ads) if export_absolute else None,
-                    "ΔG_ads_raw_reference_applied (eV)": float(dG_ads) if export_absolute else None,
+                    "descriptor_scope": (
+                        "OER thermochemically corrected descriptor"
+                        if _is_oxygen
+                        else (
+                            "CO2RR corrected reaction-state free energy"
+                            if co2rr_corr_level == "corrected_CHE"
+                            else "CO2RR partially corrected reaction-state energy"
+                            if co2rr_corr_level == "partial_ZPE_only"
+                            else "CO2RR reaction-referenced electronic energy"
+                        )
+                    ),
+                    "thermochemical_correction_applied": bool(
+                        _is_oxygen
+                        or co2rr_corr_level in {"corrected_CHE", "partial_ZPE_only"}
+                    ),
+                    "CO2RR_thermochemistry_level": (
+                        None if _is_oxygen else co2rr_corr_level
+                    ),
                     "OER_reference_scheme": ("standard_OER_AEM_H2O_H2" if _is_oer and ads_clean in {"OH", "O", "OOH"} else "other"),
                     "oxygen_intermediate_role": ("OER_AEM" if _is_oer and ads_clean in {"OH", "O", "OOH"} else "other"),
                     "initial_anchor_x(Å)": tracking["initial_anchor_x(Å)"],
@@ -3027,6 +3635,36 @@ def _run_co2rr_che(
                     "oer_base_site_label": seed.get("oer_base_site_label"),
                     "oer_start_height_A": seed.get("oer_start_height_A"),
                     "ads_anchor_mode": anchor_mode,
+                    "initial_binding_mode": placement_meta.get("binding_mode"),
+                    "initial_surface_anchor_family": placement_meta.get(
+                        "surface_anchor_family"
+                    ),
+                    "initial_molecular_anchor_indices": ",".join(
+                        str(i)
+                        for i in placement_meta.get("molecular_anchor_indices", [])
+                    ),
+                    "initial_surface_support_indices": ",".join(
+                        str(i)
+                        for i in placement_meta.get("surface_support_indices", [])
+                    ),
+                    "initial_target_bond_length(Å)": placement_meta.get(
+                        "target_bond_length_A"
+                    ),
+                    "initial_support_distances(Å)": ",".join(
+                        f"{float(x):.4f}"
+                        for x in placement_meta.get(
+                            "achieved_support_distances_A", []
+                        )
+                    ),
+                    "initial_min_nonanchor_slab_dist(Å)": placement_meta.get(
+                        "minimum_adsorbate_slab_distance_A"
+                    ),
+                    "initial_azimuth_deg": placement_meta.get("azimuth_deg"),
+                    "initial_seed_valid": placement_meta.get("seed_valid"),
+                    "initial_seed_validation": json.dumps(
+                        placement_meta.get("seed_validation", {}),
+                        ensure_ascii=False,
+                    ),
                     "ads_anchor_z_above_top(Å)": float(anchor_z_above_top),
                     "ads_min_slab_dist(Å)": float(min_slab_dist),
                     "migrate_thr(Å)": float(migrate_thr),
@@ -3040,30 +3678,104 @@ def _run_co2rr_che(
                     "slab_relax_drop": meta_flags["slab_relax_drop"],
                     "vac_warning": meta_flags["vac_warning"],
                 }
+                if _is_oxygen or dG_ads is not None:
+                    row.update({
+                        "G_correction (eV)": float(g_corr),
+                        "ΔG_ads (eV)": (
+                            float(dG_ads) if export_absolute else None
+                        ),
+                        "ΔG_ads_raw_reference_applied (eV)": (
+                            float(dG_ads) if export_absolute else None
+                        ),
+                    })
                 rows.append(row)
 
-    # Write metadata even when no rows are produced
+
+    placement_failure_csv = None
+    if placement_failures:
+        try:
+            placement_failure_csv = out_root / "results_co2rr_placement_failures.csv"
+            pd.DataFrame(placement_failures).to_csv(
+                placement_failure_csv,
+                index=False,
+            )
+        except Exception:
+            placement_failure_csv = None
+
+    # Write diagnostic metadata even when no adsorbate rows are produced.
     if not rows:
-        _out_name = ("results_sites_oer.csv" if _is_oer else ("results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv"))
+        _out_name = (
+            "results_sites_oer.csv"
+            if _is_oer
+            else ("results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv")
+        )
         out_csv = out_root / _out_name
-        pd.DataFrame([]).to_csv(out_csv, index=False)
-        _mode_str = ("OER" if _is_oer else "CO2RR")
+
+        # Header-only output is intentionally parseable. A one-byte/headerless
+        # CSV previously hid the actual no-row condition behind EmptyDataError.
+        _empty_columns = [
+            "mode",
+            "status",
+            "reason",
+            "site_label",
+            "site_kind",
+            "seed_source",
+            "adsorbate",
+            "qa",
+        ]
+        pd.DataFrame(columns=_empty_columns).to_csv(out_csv, index=False)
+
+        _mode_str = "OER" if _is_oer else "CO2RR"
+        _site_labels = [
+            str(site.get("site_label", "unknown"))
+            for site in target_sites
+        ]
+        _site_kinds = [
+            str(site.get("site_kind", "unknown"))
+            for site in target_sites
+        ]
+        _site_sources = [
+            str(site.get("seed_source", "unknown"))
+            for site in target_sites
+        ]
         meta = {
             "mode": _mode_str,
             "user_slab": str(Path(user_slab_cif).resolve()),
             "relax_mode": relax_mode,
             "steps": {"slab": slab_steps, "ads": free_steps},
             "adspecies": list(adspecies),
+            "TARGET_SITE_COUNT": int(len(target_sites)),
+            "TARGET_SITE_LABELS": _site_labels,
+            "TARGET_SITE_KINDS": _site_kinds,
+            "TARGET_SITE_SOURCES": _site_sources,
+            "NO_ROWS_REASON": (
+                "target_sites_built_but_no_supported_adsorbate_rows_generated"
+                if target_sites
+                else "no_target_sites"
+            ),
             "OER_RELAXATION_MODE": str(_oer_relax_mode) if _is_oer else None,
             "OER_MANUAL_CATION_INDICES": list(_manual_oer_cations) if _is_oer else [],
-            "ADS_CORR_effective (eV)": ads_corr,
             "THERMO_FILE": str(thermo_path.resolve()),
             "GAS_REF_E_USED (eV)": gas_E,
             "GAS_REF_SOURCE": gas_src,
             "HER_GUARDRAIL": her_guard,
+            "CO2RR_PLACEMENT_FAILURE_COUNT": int(len(placement_failures)),
+            "CO2RR_PLACEMENT_FAILURES": placement_failures,
+            "CO2RR_PLACEMENT_FAILURES_CSV": (
+                str(placement_failure_csv.resolve())
+                if placement_failure_csv is not None
+                else None
+            ),
+            "CO2RR_PLACEMENT_FAILURE_POLICY": (
+                "skip geometrically inaccessible adsorbate/site seeds and "
+                "continue alternative sites, variants, and product branches"
+            ),
             "DISP_METRIC": "anchor_xy",
             "MIGRATE_THR_CO(Å)": float(MIGRATE_THR),
-            "MIGRATE_THR_COOH_HCOO_OCHO(Å)": float(max(MIGRATE_THR, 2.5)),
+            "CO2RR_MIGRATION_THRESHOLDS_A": {
+                k: float(get_co2rr_adsorbate_spec(k).migration_threshold_A)
+                for k in CO2RR_TEMPLATE_FILES
+            },
             "Model": MODEL_NAME,
             "Device": DEVICE,
             "warnings": {
@@ -3071,9 +3783,26 @@ def _run_co2rr_che(
                 "vac_warning": meta_flags["vac_warning"],
             },
         }
+        if _is_oxygen:
+            meta["ADS_CORR_effective (eV)"] = ads_corr
+        else:
+            meta["CO2RR_DESCRIPTOR"] = (
+                "reaction-network cumulative state energy"
+            )
+            meta["CO2RR_THERMOCHEMISTRY"] = co2rr_corr_level
+            meta["THERMOCHEMICAL_CORRECTION_APPLIED"] = bool(
+                co2rr_corr_level in {"corrected_CHE", "partial_ZPE_only"}
+            )
+            meta["ADS_CORR_effective (eV)"] = ads_corr
+            meta["CO2RR_PRODUCT_STATE_ENERGIES"] = co2rr_product_states
+            meta["CO2RR_PRODUCT_ENDPOINT_ERRORS"] = co2rr_endpoint_errors
         if thermo_data is not None:
             meta["THERMO_RAW"] = thermo_data
-        _meta_name_empty = ("meta_oer.json" if _is_oer else ("meta_orr.json" if _is_orr else "meta_co2rr.json"))
+        _meta_name_empty = (
+            "meta_oer.json"
+            if _is_oer
+            else ("meta_orr.json" if _is_orr else "meta_co2rr.json")
+        )
         (out_root / _meta_name_empty).write_text(json.dumps(meta, indent=2))
         return str(out_csv), meta
 
@@ -3085,6 +3814,46 @@ def _run_co2rr_che(
         else "ΔE_ads_user (eV)"
     )
     df = df.assign(abs_val=lambda x: x[key].abs()).sort_values(["abs_val"])
+
+    # For each surface site and chemical state, select the lowest-energy
+    # relaxed structure that remains physically bound. Alternative CH2OH C/O
+    # seeds are therefore compared on equal stoichiometric footing, while
+    # desorbed/broken/crashed rows remain available only as diagnostics.
+    co2rr_summary_csv = None
+    if not _is_oxygen:
+        df["selected_for_co2rr_summary"] = False
+        valid_bound = pd.Series(True, index=df.index, dtype=bool)
+        for invalid_col in ("desorbed", "broken", "crashed"):
+            if invalid_col in df.columns:
+                valid_bound &= ~df[invalid_col].fillna(False).astype(bool)
+        if "initial_seed_valid" in df.columns:
+            valid_bound &= df["initial_seed_valid"].fillna(False).astype(bool)
+        numeric_energy = pd.to_numeric(df[key], errors="coerce")
+        valid_bound &= np.isfinite(numeric_energy)
+        group_cols = [
+            c
+            for c in ("binding_base_site_label", "adsorbate")
+            if c in df.columns
+        ]
+        if group_cols:
+            candidates = df.loc[valid_bound].copy()
+            candidates["_selection_energy"] = numeric_energy.loc[candidates.index]
+            if not candidates.empty:
+                selected_indices = candidates.groupby(
+                    group_cols, dropna=False
+                )["_selection_energy"].idxmin()
+                df.loc[list(selected_indices), "selected_for_co2rr_summary"] = True
+        co2rr_summary = df.loc[
+            df["selected_for_co2rr_summary"]
+        ].drop(columns=["abs_val"], errors="ignore")
+        co2rr_summary_csv = (
+            out_root / "results_co2rr_selected_bound_states.csv"
+        )
+        co2rr_summary.to_csv(
+            co2rr_summary_csv,
+            index=False,
+            float_format="%.6f",
+        )
 
     _out_name2 = ("results_sites_oer.csv" if _is_oer else ("results_sites_orr.csv" if _is_orr else "results_sites_co2rr.csv"))
     out_csv = out_root / _out_name2
@@ -3111,15 +3880,38 @@ def _run_co2rr_che(
         "relax_mode": relax_mode,
         "steps": {"slab": slab_steps, "ads": free_steps},
         "adspecies": list(adspecies),
-        "ADS_CORR_effective (eV)": ads_corr,
         "THERMO_FILE": str(thermo_path.resolve()),
         "GAS_REF_E_USED (eV)": gas_E,
         "GAS_REF_SOURCE": gas_src,
         "HER_GUARDRAIL": her_guard,
+        "CO2RR_PLACEMENT_FAILURE_COUNT": int(len(placement_failures)),
+        "CO2RR_PLACEMENT_FAILURES": placement_failures,
+        "CO2RR_PLACEMENT_FAILURES_CSV": (
+            str(placement_failure_csv.resolve())
+            if placement_failure_csv is not None
+            else None
+        ),
+        "CO2RR_PLACEMENT_FAILURE_POLICY": (
+            "skip geometrically inaccessible adsorbate/site seeds and "
+            "continue alternative sites, variants, and product branches"
+        ),
         "OXYGEN_SUMMARY_CSV": str(orr_summary_csv) if orr_summary_csv is not None else None,
+        "CO2RR_SELECTED_BOUND_STATES_CSV": (
+            str(co2rr_summary_csv) if co2rr_summary_csv is not None else None
+        ),
+        "CO2RR_BINDING_VARIANT_SELECTION": (
+            "minimum reaction-referenced electronic energy among finite, "
+            "seed-valid, non-desorbed, non-broken, non-crashed rows for each "
+            "surface site and adsorbate"
+            if not _is_oxygen
+            else None
+        ),
         "DISP_METRIC": "anchor_xy",
         "MIGRATE_THR_CO(Å)": float(MIGRATE_THR),
-        "MIGRATE_THR_COOH_HCOO_OCHO(Å)": float(max(MIGRATE_THR, 2.5)),
+        "CO2RR_MIGRATION_THRESHOLDS_A": {
+            k: float(get_co2rr_adsorbate_spec(k).migration_threshold_A)
+            for k in CO2RR_TEMPLATE_FILES
+        },
         "Model": MODEL_NAME,
         "Device": DEVICE,
         "warnings": {
@@ -3127,6 +3919,17 @@ def _run_co2rr_che(
             "vac_warning": meta_flags["vac_warning"],
         },
     }
+    if _is_oxygen:
+        meta["ADS_CORR_effective (eV)"] = ads_corr
+    else:
+        meta["CO2RR_DESCRIPTOR"] = "reaction-network cumulative state energy"
+        meta["CO2RR_THERMOCHEMISTRY"] = co2rr_corr_level
+        meta["THERMOCHEMICAL_CORRECTION_APPLIED"] = bool(
+            co2rr_corr_level in {"corrected_CHE", "partial_ZPE_only"}
+        )
+        meta["ADS_CORR_effective (eV)"] = ads_corr
+        meta["CO2RR_PRODUCT_STATE_ENERGIES"] = co2rr_product_states
+        meta["CO2RR_PRODUCT_ENDPOINT_ERRORS"] = co2rr_endpoint_errors
     if thermo_data is not None:
         meta["THERMO_RAW"] = thermo_data
 

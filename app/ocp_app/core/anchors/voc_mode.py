@@ -3415,6 +3415,7 @@ def _run_voc_proxy(
     relax_mode: str,
     user_ads_sites: Optional[Mapping[str, object]],
     target_voc: str = "acetaldehyde",
+    voc_route: str | None = None,
     descriptor_states: Iterable[str] | None = None,
     ref_dir: str | Path = "ref_gas",
     voc_relaxation_policy: str = "normal_relax",
@@ -3426,7 +3427,10 @@ def _run_voc_proxy(
     descriptor_states = tuple(normalize_voc_state(s) for s in descriptor_states if str(s).strip())
     if not descriptor_states:
         descriptor_states = tuple(preset.get("default_states", ()))
-    placement_route = _infer_voc_placement_route(descriptor_states)
+    route_key = str(voc_route or "").strip().lower()
+    if route_key not in dict(preset.get("routes", {})):
+        route_key = _infer_voc_placement_route(descriptor_states)
+    placement_route = route_key if route_key in {"reduction", "oxidation"} else _infer_voc_placement_route(descriptor_states)
 
     (
         slab_u_rel,
@@ -3519,6 +3523,8 @@ def _run_voc_proxy(
                 "mode": "VOC",
                 "target_voc": str(target_voc),
                 "target_voc_label": str(preset.get("label", target_voc)),
+                "voc_route": str(route_key),
+                "pathway_state_id": state_label,
                 "descriptor_state": state_label,
                 "adsorbate": state_label,
                 "state_type": "proximity" if len(comps) > 1 else "single_adsorbate",
@@ -3785,7 +3791,7 @@ def _run_voc_proxy(
     df = pd.DataFrame(out_rows)
     if isinstance(df, pd.DataFrame) and df.empty and len(df.columns) == 0:
         df = pd.DataFrame(columns=[
-            "mode", "target_voc", "target_voc_label", "descriptor_state", "adsorbate", "state_type",
+            "mode", "target_voc", "target_voc_label", "voc_route", "pathway_state_id", "descriptor_state", "adsorbate", "state_type",
             "site_label", "site", "site_kind", "oxide_site_class", "oxide_site_label", "oxide_site_elements",
             "oxide_site_policy", "site_taxonomy_warning", "seed_source", "qa", "qa_note", "reliability",
             "ΔE_proxy (eV)", "ΔE_ads_user (eV)", "ΔE_VOC_ads_proxy (eV)",
@@ -3806,6 +3812,7 @@ def _run_voc_proxy(
         "mode": "VOC",
         "target_voc": str(target_voc),
         "target_voc_label": str(preset.get("label", target_voc)),
+        "voc_route": str(route_key),
         "descriptor_states": list(descriptor_states),
         "interpretation": str(preset.get("interpretation", "")),
         "warning": VOC_PROXY_WARNING,
@@ -3837,6 +3844,7 @@ def run_metal_voc_proxy(
     relax_mode: str = "Normal",
     user_ads_sites: Optional[Mapping[str, object]] = None,
     target_voc: str = "acetaldehyde",
+    voc_route: str | None = None,
     descriptor_states: Iterable[str] | None = None,
     ref_dir: str | Path = "ref_gas",
     voc_relaxation_policy: str = "normal_relax",
@@ -3852,6 +3860,7 @@ def run_metal_voc_proxy(
         relax_mode=relax_mode,
         user_ads_sites=user_ads_sites,
         target_voc=target_voc,
+        voc_route=voc_route,
         descriptor_states=descriptor_states,
         ref_dir=ref_dir,
         voc_relaxation_policy=voc_relaxation_policy,
@@ -3865,6 +3874,7 @@ def run_oxide_voc_proxy(
     relax_mode: str = "Normal",
     user_ads_sites: Optional[Mapping[str, object]] = None,
     target_voc: str = "acetaldehyde",
+    voc_route: str | None = None,
     descriptor_states: Iterable[str] | None = None,
     ref_dir: str | Path = "ref_gas",
     voc_relaxation_policy: str = "normal_relax",
@@ -3880,6 +3890,7 @@ def run_oxide_voc_proxy(
         relax_mode=relax_mode,
         user_ads_sites=user_ads_sites,
         target_voc=target_voc,
+        voc_route=voc_route,
         descriptor_states=descriptor_states,
         ref_dir=ref_dir,
         voc_relaxation_policy=voc_relaxation_policy,
