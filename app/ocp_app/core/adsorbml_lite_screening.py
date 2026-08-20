@@ -14,6 +14,10 @@ from ase.optimize import FIRE
 from ase.io import read as ase_read
 from ase.geometry import find_mic
 
+from .co2rr_registry import CO2RR_TEMPLATE_FILES, get_co2rr_adsorbate_spec, is_supported_co2rr_adsorbate
+from .co2rr_geometry import orient_co2rr_template
+from .co2rr_placement import place_co2rr_adsorbate
+
 from .ads_sites import (
     AdsSite,
     add_adsorbate_on_site,
@@ -446,10 +450,7 @@ def relax_slab_chgnet(
 # ------------------------ CO2RR template placement ------------------------
 
 _ADS_TEMPLATE_FILES = {
-    "CO": "CO_box.cif",
-    "COOH": "COOH_box.cif",
-    "HCOO": "HCOO_box.cif",
-    "OCHO": "OCHO_box.cif",
+    **CO2RR_TEMPLATE_FILES,
     "O": "O_box.cif",
     "OH": "OH_box.cif",
     "OOH": "OOH_box.cif",
@@ -460,32 +461,34 @@ def _load_ads_template(ref_dir: str, ads: str) -> Atoms:
     ads_clean = ads.replace("*", "").upper()
     if ads_clean not in _ADS_TEMPLATE_FILES:
         raise ValueError(f"Unsupported adsorbate template: {ads}")
-    cif_path = f"{ref_dir}/{_ADS_TEMPLATE_FILES[ads_clean]}"
+    a = ase_read(f"{ref_dir}/{_ADS_TEMPLATE_FILES[ads_clean]}").copy()
 
-    a = ase_read(cif_path).copy()
+    if is_supported_co2rr_adsorbate(ads_clean):
+        a, anchor_indices, anchor_mode = orient_co2rr_template(a, ads_clean)
+        a.info = dict(getattr(a, "info", {}) or {})
+        a.info["anchor_indices"] = list(anchor_indices)
+        a.info["anchor_mode"] = anchor_mode
+        return a
 
+    # OER oxygen intermediates retain proximal-O anchoring without per-atom
+    # coordinate reflection.
     syms = a.get_chemical_symbols()
+    pos = np.asarray(a.get_positions(), dtype=float)
+    o_idx = [i for i, symbol in enumerate(syms) if symbol == "O"]
     anchor_idx = 0
-    if ads_clean in {"O", "OH", "OOH"}:
-        o_idx = [i for i, s in enumerate(syms) if s == "O"]
-        if o_idx:
-            pos0 = a.get_positions()
-            if ads_clean == "OOH" and len(o_idx) > 1:
-                anchor_idx = int(o_idx[int(np.argmin(pos0[np.asarray(o_idx, int), 2]))])
-            else:
-                anchor_idx = int(o_idx[0])
-    else:
-        for i, s in enumerate(syms):
-            if s == "C":
-                anchor_idx = i
-                break
-
-    pos = a.get_positions()
-    pos -= pos[anchor_idx].copy()
-    # Keep oxygen intermediates above the anchor plane.  This makes OH*/O*/OOH*
-    # placement explicit and avoids a CO2RR C-anchor fallback.
-    pos[:, 2] = np.abs(pos[:, 2])
+    anchor_mode = "atom0"
+    if o_idx:
+        if ads_clean == "OOH" and len(o_idx) > 1:
+            anchor_idx = int(o_idx[int(np.argmin(pos[np.asarray(o_idx, dtype=int), 2]))])
+            anchor_mode = "O_prox(min_z)"
+        else:
+            anchor_idx = int(o_idx[0])
+            anchor_mode = "O"
+    pos = pos - pos[int(anchor_idx)]
     a.set_positions(pos)
+    a.info = dict(getattr(a, "info", {}) or {})
+    a.info["anchor_indices"] = [int(anchor_idx)]
+    a.info["anchor_mode"] = anchor_mode
     return a
 
 
@@ -496,7 +499,8 @@ def _build_slab_ads_co2rr(
     settings: ScreeningSettings,
     ref_dir: str,
     oxide_anchor_mode_override: Optional[OxideAnchorMode] = None,
-) -> Tuple[Atoms, int, np.ndarray, str]:
+    mtype: str | None = None,
+) -> Tuple[Atoms, Tuple[int, ...], np.ndarray, str]:
     slab0 = slab.copy()
     pos_slab = slab0.get_positions()
     z_top_global = float(pos_slab[:, 2].max())
@@ -537,27 +541,26 @@ def _build_slab_ads_co2rr(
 
     syms = ads_atoms.get_chemical_symbols()
     ads_clean = str(ads).replace("*", "").upper()
-    anchor_local = 0
-    if ads_clean in {"O", "OH", "OOH"}:
-        pos_tmp = ads_atoms.get_positions()
-        o_idx = [i for i, s in enumerate(syms) if s == "O"]
-        if o_idx:
-            if ads_clean == "OOH" and len(o_idx) > 1:
-                anchor_local = int(o_idx[int(np.argmin(pos_tmp[np.asarray(o_idx, int), 2]))])
-            else:
-                anchor_local = int(o_idx[0])
-    else:
-        for i, s in enumerate(syms):
-            if s == "C":
-                anchor_local = i
-                break
 
-    pos_ads = ads_atoms.get_positions()
-    z_min_ads = float(pos_ads[:, 2].min())
+    if is_supported_co2rr_adsorbate(ads_clean):
+        placed = place_co2rr_adsorbate(
+            slab0, site, ads_clean, ads_atoms, mtype=mtype
+        )
+        ads_atoms = placed.adsorbate_atoms
+        slab_ads = slab0 + ads_atoms
+        slab_ads.info = dict(getattr(slab0, "info", {}) or {})
+        slab_ads.info["co2rr_placement"] = placed.as_dict()
+        anchor_globals = tuple(n_slab + int(i) for i in placed.molecular_anchor_indices)
+        init_anchor_xy = slab_ads.get_positions()[list(anchor_globals), :2].mean(axis=0)
+        return slab_ads, anchor_globals, init_anchor_xy, str(placed.binding_mode)
 
-    # base Z: for explicit oxide oxygen-intermediate seeds, place the anchor
-    # exactly at the channel-specific coordinate.  Otherwise retain legacy
-    # CO2RR clearance behavior.
+    anchor_local_indices = tuple(int(i) for i in (ads_atoms.info.get("anchor_indices", [0]) or [0]))
+
+    pos_ads = np.asarray(ads_atoms.get_positions(), dtype=float)
+    anchor_local_center = pos_ads[list(anchor_local_indices)].mean(axis=0)
+
+    # Place the registry-defined anchor itself at the target coordinate.  The
+    # old min-z placement silently shifted bidentate and tilted templates.
     if explicit_anchor:
         target_z_base = float(z)
     else:
@@ -565,18 +568,18 @@ def _build_slab_ads_co2rr(
         if z > z_top_global - 0.5:
             target_z_base = max(target_z_base, float(z))
 
-    base_z = target_z_base - z_min_ads
-    base = np.array([float(x), float(y), float(base_z)], dtype=float)
+    target_anchor = np.array([float(x), float(y), float(target_z_base)], dtype=float)
+    base = target_anchor - anchor_local_center
 
     ads_atoms.set_cell(slab0.get_cell())
     ads_atoms.set_pbc(slab0.get_pbc())
     ads_atoms.translate(base)
 
     slab_ads = slab0 + ads_atoms
-    anchor_global = n_slab + anchor_local
-    init_anchor_xy = slab_ads.get_positions()[anchor_global][:2].copy()
+    anchor_globals = tuple(n_slab + int(i) for i in anchor_local_indices)
+    init_anchor_xy = slab_ads.get_positions()[list(anchor_globals), :2].mean(axis=0)
 
-    return slab_ads, anchor_global, init_anchor_xy, str(anchor_mode)
+    return slab_ads, anchor_globals, init_anchor_xy, str(ads_atoms.info.get("anchor_mode", anchor_mode))
 
 
 # ------------------------ robust helpers ------------------------
@@ -742,12 +745,13 @@ def screen_sites_adsorbml_lite(
                         mode = "default" if mtype == "metal" else "oxide_o"
                         atoms0 = add_adsorbate_on_site(slab, site, symbol="H", dz=0.0, mode=mode)
                         n_slab = len(slab)
-                        anchor_global = len(atoms0) - 1
-                        anchor_xy0 = atoms0.get_positions()[anchor_global][:2].copy()
+                        anchor_globals = (len(atoms0) - 1,)
+                        anchor_xy0 = atoms0.get_positions()[list(anchor_globals), :2].mean(axis=0)
                         anchor_mode_used = ""
                     else:
-                        atoms0, anchor_global, anchor_xy0, anchor_mode_used = _build_slab_ads_co2rr(
-                            slab, site, ads=ads, settings=settings, ref_dir=ref_dir, oxide_anchor_mode_override=am
+                        atoms0, anchor_globals, anchor_xy0, anchor_mode_used = _build_slab_ads_co2rr(
+                            slab, site, ads=ads, settings=settings, ref_dir=ref_dir,
+                            oxide_anchor_mode_override=am, mtype=str(mtype)
                         )
                         n_slab = len(slab)
 
@@ -766,7 +770,8 @@ def screen_sites_adsorbml_lite(
 
                     # Adsorbate lateral displacement (xy) + site tracking
                     pos = atoms.get_positions()
-                    anchor_xy1 = pos[anchor_global][:2].copy()
+                    anchor_xyz1 = pos[list(anchor_globals)].mean(axis=0)
+                    anchor_xy1 = anchor_xyz1[:2].copy()
                     disp = _lateral_disp(anchor_xy0, anchor_xy1, atoms.get_cell(), atoms.get_pbc())
                     tracking = _resolve_site_tracking(
                         slab_only=atoms[:n_slab],
@@ -788,7 +793,7 @@ def screen_sites_adsorbml_lite(
 
                     base_kwargs = dict(
                         atoms_relaxed=atoms if return_raw else None,
-                        anchor_pos=tuple(pos[anchor_global]),
+                        anchor_pos=tuple(anchor_xyz1),
                         dmin=dmin,
                         e_per_atom=e_pa,
                         converged=converged,

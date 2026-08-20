@@ -246,6 +246,84 @@ ACETALDEHYDE_BOTH_STATES: List[str] = _dedupe_states(
 )
 
 
+# -----------------------------------------------------------------------------
+# Deterministic VOC pathway display registry
+# -----------------------------------------------------------------------------
+# These definitions provide only a layout for registered descriptor states.
+# Node colors are assigned later from selected QA-valid ΔE_proxy values. The
+# registry does not infer products, selectivity, reaction barriers, or step energies.
+ACETALDEHYDE_REDUCTION_PATHWAY: dict = {
+    "lane_labels": {
+        0: "Registered reduction sequence",
+        1: "Auxiliary reduction descriptor",
+    },
+    "nodes": [
+        {"id": "CH3CHO*", "state": "CH3CHO*", "label": "CH₃CHO*", "role": "reactant", "group": "main", "level": 0, "lane": 0},
+        {"id": "CH3CH2O*", "state": "CH3CH2O*", "label": "CH₃CH₂O*", "role": "intermediate", "group": "main", "level": 1, "lane": 0},
+        {"id": "CH3CH2OH*", "state": "CH3CH2OH*", "label": "CH₃CH₂OH*", "role": "registered_state", "group": "main", "level": 2, "lane": 0},
+        {"id": "H*", "state": "H*", "label": "H*", "role": "auxiliary_descriptor", "group": "auxiliary", "level": 1, "lane": 1},
+    ],
+    "edges": [
+        {"from": "CH3CHO*", "to": "CH3CH2O*", "edge_type": "registered_sequence"},
+        {"from": "CH3CH2O*", "to": "CH3CH2OH*", "edge_type": "registered_sequence"},
+        {"from": "H*", "to": "CH3CH2O*", "edge_type": "co_reactant_support"},
+    ],
+    "products": [],
+}
+
+
+ACETALDEHYDE_OXIDATION_PATHWAY: dict = {
+    "lane_labels": {
+        0: "Registered C₂ oxidation sequence",
+        1: "Auxiliary oxidation descriptor",
+        2: "Independent C₁ formation descriptors",
+    },
+    "nodes": [
+        {"id": "CH3CHO*", "state": "CH3CHO*", "label": "CH₃CHO*", "role": "reactant", "group": "main", "level": 0, "lane": 0},
+        {"id": "CH3CO*", "state": "CH3CO*", "label": "CH₃CO*", "role": "intermediate", "group": "main", "level": 1, "lane": 0},
+        {"id": "CH3COO*", "state": "CH3COO*", "label": "CH₃COO*", "role": "registered_state", "group": "main", "level": 2, "lane": 0},
+        {"id": "OH*", "state": "OH*", "label": "OH*", "role": "auxiliary_descriptor", "group": "auxiliary", "level": 1, "lane": 1},
+        {"id": "CO*", "state": "CO*", "label": "CO*", "role": "independent_descriptor", "group": "independent_c1", "level": 0, "lane": 2},
+        {"id": "COOH*", "state": "COOH*", "label": "COOH*", "role": "independent_descriptor", "group": "independent_c1", "level": 1, "lane": 2},
+    ],
+    "edges": [
+        {"from": "CH3CHO*", "to": "CH3CO*", "edge_type": "registered_sequence"},
+        {"from": "CH3CO*", "to": "CH3COO*", "edge_type": "registered_sequence"},
+        {"from": "OH*", "to": "CH3CO*", "edge_type": "co_reactant_support"},
+    ],
+    "products": [],
+}
+
+
+def _merge_pathway_definitions(*defs: dict) -> dict:
+    """Merge small registry graphs while preserving first-seen order."""
+    nodes, edges, products = [], [], []
+    seen_nodes, seen_edges, seen_products = set(), set(), set()
+    for definition in defs:
+        for node in definition.get("nodes", []):
+            key = str(node.get("id", ""))
+            if key and key not in seen_nodes:
+                seen_nodes.add(key)
+                nodes.append(dict(node))
+        for edge in definition.get("edges", []):
+            key = (str(edge.get("from", "")), str(edge.get("to", "")), str(edge.get("edge_type", "")))
+            if key not in seen_edges:
+                seen_edges.add(key)
+                edges.append(dict(edge))
+        for product in definition.get("products", []):
+            key = str(product.get("id", ""))
+            if key and key not in seen_products:
+                seen_products.add(key)
+                products.append(dict(product))
+    return {"nodes": nodes, "edges": edges, "products": products}
+
+
+ACETALDEHYDE_BOTH_PATHWAY: dict = _merge_pathway_definitions(
+    ACETALDEHYDE_REDUCTION_PATHWAY,
+    ACETALDEHYDE_OXIDATION_PATHWAY,
+)
+
+
 VOC_PRESETS: Dict[str, dict] = {
     "acetaldehyde": {
         "label": "Acetaldehyde (CH₃CHO)",
@@ -254,18 +332,21 @@ VOC_PRESETS: Dict[str, dict] = {
         "routes": {
             "both": {
                 "label": "Both routes: reduction + oxidation",
-                "description": "Union of ethanol-route and acetate/CO2-route proxy descriptors.",
+                "description": "Union of the registered ethanol-side reduction states and C2 oxidation/C1 descriptor states.",
                 "states": ACETALDEHYDE_BOTH_STATES,
+                **ACETALDEHYDE_BOTH_PATHWAY,
             },
             "reduction": {
-                "label": "Direct reduction route: CH3CHO → ethanol proxy",
-                "description": "Direct acetaldehyde electroreduction proxy using H*, CH3CHO*, ethoxy-like, and ethanol-like states.",
+                "label": "Acetaldehyde reduction state-energy map",
+                "description": "Selected QA-valid ΔE_proxy values for the registered direct-reduction states; H* is shown separately as an auxiliary descriptor.",
                 "states": ACETALDEHYDE_REDUCTION_STATES,
+                **ACETALDEHYDE_REDUCTION_PATHWAY,
             },
             "oxidation": {
-                "label": "Oxidation route: CH3CHO → acetate → CO2 proxy",
-                "description": "Aldehyde activation, acetate-like intermediate formation, and deep oxidation using CO*/COOH* C1 proxies. O* is handled in OER mode.",
+                "label": "Acetaldehyde oxidation state-energy map",
+                "description": "Selected QA-valid ΔE_proxy values for the registered C2 states. CO* and COOH* are displayed separately as independent C1 descriptors; no product or CO2 prediction is made.",
                 "states": ACETALDEHYDE_OXIDATION_STATES,
+                **ACETALDEHYDE_OXIDATION_PATHWAY,
             },
         },
         "reduction_states": ACETALDEHYDE_REDUCTION_STATES,
@@ -279,7 +360,7 @@ VOC_PRESETS: Dict[str, dict] = {
         "all_states": _dedupe_states(ACETALDEHYDE_BOTH_STATES + ACETALDEHYDE_OPTIONAL_STATES),
         "interpretation": (
             "UMA/OCP-based acetaldehyde route proxy descriptors. Reduction uses direct ethanol-route proxies; "
-            "oxidation uses aldehyde activation, acetate-like binding, and CO*/COOH* deep-oxidation proxies."
+            "oxidation uses a C2 sequence to acetate-like binding plus independent CO*/COOH* C1 formation descriptors."
         ),
         "warning": (
             "SAGE-VOC reports ΔE_proxy and route/proximity descriptors. These are not definitive electrochemical ΔG values and do not explicitly resolve "
@@ -307,6 +388,20 @@ def get_voc_preset(key: str) -> dict:
     if k not in VOC_PRESETS:
         raise KeyError(f"Unsupported VOC preset: {key!r}")
     return VOC_PRESETS[k]
+
+
+def get_voc_route(key: str, route: str | None = None) -> dict:
+    """Return a route definition with deterministic fallback to the preset default."""
+    preset = get_voc_preset(key)
+    routes = dict(preset.get("routes", {}))
+    route_key = str(route or preset.get("default_route", "reduction")).strip().lower()
+    if route_key not in routes:
+        route_key = str(preset.get("default_route", "reduction")).strip().lower()
+    if route_key not in routes:
+        raise KeyError(f"Unsupported VOC route {route!r} for preset {key!r}")
+    out = dict(routes[route_key])
+    out["key"] = route_key
+    return out
 
 
 def state_components(state: str) -> Tuple[str, ...]:

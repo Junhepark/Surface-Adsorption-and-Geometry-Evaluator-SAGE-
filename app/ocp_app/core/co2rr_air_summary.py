@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 
-CO2RR_AIR_CO2_ADS = {"COOH", "CO", "OCHO", "HCOO"}
+CO2RR_AIR_CO2_ADS = {"COOH", "CO", "OCHO", "HCOO", "CHO", "COH", "CH2O", "CH3O", "CH2OH", "CH", "CH2", "CH3"}
 CO2RR_AIR_OXYGEN_ADS = {"OOH", "O", "OH"}
 
 
@@ -214,8 +214,13 @@ def build_co2rr_air_summary(
             co_poisoning_risk = "low"
         co_poisoning_basis = f"best CO* ΔG={dg_co:.3f} eV"
 
+    deep_keys = ("CHO", "COH", "CH2O", "CH3O", "CH2OH", "CH", "CH2", "CH3")
+    deep_available = [k for k in deep_keys if np.isfinite(_best_ads_energy(co2, k))]
+
     return {
         "co2rr_pathway_preference": pathway,
+        "co2rr_initial_branch_preference": pathway,
+        "deep_reduction_states_available": ",".join(deep_available),
         "co2rr_pathway_basis": pathway_basis,
         "her_competition_risk": her_risk,
         "her_competition_score": her_score,

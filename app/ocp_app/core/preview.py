@@ -6,24 +6,29 @@ from ase.io import read
 
 from ocp_app.core.structure_ops import atoms_to_cif_bytes
 from ocp_app.core.ads_sites import oxide_surface_seed_position, expand_oxide_channels_for_adsorbate, ANION_SYMBOLS
+from ocp_app.core.co2rr_registry import (
+    CO2RR_TEMPLATE_FILES,
+    get_co2rr_adsorbate_spec,
+    is_supported_co2rr_adsorbate,
+)
+from ocp_app.core.co2rr_geometry import orient_co2rr_template
+from ocp_app.core.co2rr_placement import place_co2rr_adsorbate
 
 ADS_TEMPLATE_FILES = {
-    "CO":   "CO_box.cif",
-    "COOH": "COOH_box.cif",
-    "HCOO": "HCOO_box.cif",
-    "OCHO": "OCHO_box.cif",
+    **CO2RR_TEMPLATE_FILES,
     # ORR/OER intermediates
-    "O":    "O_box.cif",
-    "OH":   "OH_box.cif",
-    "OOH":  "OOH_box.cif",
+    "O": "O_box.cif",
+    "OH": "OH_box.cif",
+    "OOH": "OOH_box.cif",
     # SAGE-VOC acetaldehyde preset templates
-    "CH3CHO":   "CH3CHO_box.cif",
-    "CH3CO":    "CH3CO_box.cif",
-    "CH3CH2O":  "CH3CH2O_box.cif",
-    "CH3COO":   "CH3COO_box.cif",
+    "CH3CHO": "CH3CHO_box.cif",
+    "CH3CO": "CH3CO_box.cif",
+    "CH3CH2O": "CH3CH2O_box.cif",
+    "CH3COO": "CH3COO_box.cif",
     "CH3CH2OH": "CH3CH2OH_box.cif",
-    "CH3COOH":  "CH3COOH_box.cif",
+    "CH3COOH": "CH3COOH_box.cif",
 }
+
 
 
 def _candidate_ref_gas_dirs(ref_dir: str | Path = "ref_gas") -> list[Path]:
@@ -313,6 +318,16 @@ def _preview_anchor_indices_and_position(mol, ads: str):
     if ads_clean == "H":
         return np.asarray([0.0, 0.0, 0.0], dtype=float), (0,), "H_atom"
 
+    if is_supported_co2rr_adsorbate(ads_clean):
+        # CO2RR templates are rigidly normalized by orient_co2rr_template();
+        # use the stored anchor indices instead of re-inferring a nearest atom.
+        stored = tuple(int(i) for i in (getattr(mol, "info", {}) or {}).get("co2rr_anchor_indices", ()))
+        if not stored:
+            _tmp, stored, mode = orient_co2rr_template(mol, ads_clean)
+        else:
+            mode = str((getattr(mol, "info", {}) or {}).get("co2rr_anchor_mode", "registry_anchor"))
+        return pos[list(stored)].mean(axis=0), stored, mode
+
     if ads_clean == "CH3CHO":
         oi = nearest_o_to_c()
         if oi is not None:
@@ -389,6 +404,19 @@ def _preview_direction_position_for_upright(mol, ads: str, anchor_indices):
             return None
         d = np.linalg.norm(pos[indices] - anchor_center[None, :], axis=1)
         return int(indices[int(np.argmin(d))])
+
+    if is_supported_co2rr_adsorbate(ads_clean):
+        mode = get_co2rr_adsorbate_spec(ads_clean).anchor_mode
+        if mode in {"o_atom", "o_min_z", "o_o_midpoint"}:
+            ci = nearest(c_idx)
+            if ci is not None:
+                return pos[ci].copy()
+        if mode == "c_atom":
+            oi = nearest(o_idx)
+            if oi is not None:
+                return pos[oi].copy()
+            if h_idx:
+                return pos[h_idx].mean(axis=0)
 
     if ads_clean == "CH3CHO":
         # O-down aldehyde seed: carbonyl C should point away from the surface.
@@ -510,10 +538,12 @@ def _preview_height_for_ads(ads: str, default: float = 1.25) -> float:
         return 1.00
     if ads_clean == "OH":
         return 1.15
-    if ads_clean in {"CH3COO", "CH3COOH", "COOH"}:
+    if ads_clean in {"CH3COO", "CH3COOH", "COOH", "HCOO", "OCHO"}:
         return 1.25
-    if ads_clean in {"O", "CO", "CH3CO"}:
+    if ads_clean in {"O", "CO", "CH3CO", "CH", "CH2", "CH3"}:
         return 1.15
+    if ads_clean in {"CHO", "COH", "CH2O", "CH3O", "CH2OH"}:
+        return 1.35
     if ads_clean == "CH3CH2OH":
         # Product ethanol is seeded as a weak retention/desorption proxy, not as
         # an ethoxy-like two-point chemisorbed adsorbate.
@@ -559,17 +589,25 @@ def _lift_preview_adsorbate_clear_of_slab(slab, ads_atoms, *, min_dist_A=1.35, s
 
 
 def _place_preview_component(slab, site, ads: str, dz: float, ref_dir: str | Path, xy_override=None):
+    import numpy as np
     ads_clean = ads.replace("*", "").upper()
     ads_atoms = load_ads_template_preview(ads, ref_dir=ref_dir)
 
-    target = _preview_target_xyz(slab, site, ads_clean, dz=dz, xy_override=xy_override)
-    _anchor_pos0, anchor_idx, _anchor_mode = _preview_anchor_indices_and_position(ads_atoms, ads_clean)
-    ads_atoms = _orient_preview_adsorbate_upright(ads_atoms, ads_clean, anchor_idx, normal=(0.0, 0.0, 1.0))
-    anchor_pos, _anchor_idx, _anchor_mode = _preview_anchor_indices_and_position(ads_atoms, ads_clean)
-
-    ads_atoms.set_cell(slab.get_cell())
-    ads_atoms.set_pbc(slab.get_pbc())
-    ads_atoms.translate(target - anchor_pos)
+    if is_supported_co2rr_adsorbate(ads_clean):
+        # Shared molecular-anchor <-> explicit surface-support placement.
+        # Preview, ML screening, and CHE now start from the same seed geometry.
+        placed = place_co2rr_adsorbate(
+            slab, site, ads_clean, ads_atoms, mtype=None
+        )
+        ads_atoms = placed.adsorbate_atoms
+    else:
+        target = _preview_target_xyz(slab, site, ads_clean, dz=dz, xy_override=xy_override)
+        _anchor_pos0, anchor_idx, _anchor_mode = _preview_anchor_indices_and_position(ads_atoms, ads_clean)
+        ads_atoms = _orient_preview_adsorbate_upright(ads_atoms, ads_clean, anchor_idx, normal=(0.0, 0.0, 1.0))
+        anchor_pos, _anchor_idx, _anchor_mode = _preview_anchor_indices_and_position(ads_atoms, ads_clean)
+        ads_atoms.set_cell(slab.get_cell())
+        ads_atoms.set_pbc(slab.get_pbc())
+        ads_atoms.translate(target - anchor_pos)
     if ads_clean == "CH3CH2OH":
         ads_atoms = _lift_preview_adsorbate_clear_of_slab(
             slab,
@@ -579,6 +617,32 @@ def _place_preview_component(slab, site, ads: str, dz: float, ref_dir: str | Pat
             max_lift_A=2.50,
         )
     return ads_atoms
+
+
+def _center_preview_site_xy(atoms, site):
+    """Center the selected periodic site in x/y for visualization only.
+
+    Geometry representative sites often lie on a unit-cell boundary.  A finite
+    py3Dmol view then makes a correctly oriented adsorbate look attached to the
+    side of the slab.  This function applies one periodic x/y recentering to the
+    complete preview structure; calculation coordinates are not affected.
+    """
+    import numpy as np
+    out = atoms.copy()
+    try:
+        cell = np.asarray(out.get_cell(), dtype=float)
+        inv_cell = np.linalg.inv(cell.T)
+        site_frac = inv_cell @ np.asarray(site.position, dtype=float).reshape(3)
+        shift_frac = np.asarray([0.5 - site_frac[0], 0.5 - site_frac[1], 0.0], dtype=float)
+        shift_cart = shift_frac @ cell
+        out.translate(shift_cart)
+        scaled = np.asarray(out.get_scaled_positions(wrap=False), dtype=float)
+        scaled[:, 0] = np.mod(scaled[:, 0], 1.0)
+        scaled[:, 1] = np.mod(scaled[:, 1], 1.0)
+        out.set_scaled_positions(scaled)
+    except Exception:
+        return atoms.copy()
+    return out
 
 
 def build_adsorbate_preview_slab(slab_atoms, site, ads: str, dz: float = 1.8, ref_dir: str | Path = "ref_gas"):
@@ -617,15 +681,31 @@ def build_adsorbate_preview_slab(slab_atoms, site, ads: str, dz: float = 1.8, re
                     out = out + _place_preview_reduction_ch3cho(slab, site, dz=1.35, ref_dir=ref_dir)
                 else:
                     out = out + _place_preview_component(slab, site, part, dz=dz + 0.10 * i, ref_dir=ref_dir, xy_override=xy)
-        return out
+        return _center_preview_site_xy(out, site)
 
     if ads_s.replace("*", "").upper() == "H":
         from ase import Atoms
         target = _surface_h_position_for_preview(slab, site, prefer_adjacent=False, oh_length=0.98)
-        return slab + Atoms("H", positions=[tuple(float(x) for x in target)], cell=slab.get_cell(), pbc=slab.get_pbc())
+        return _center_preview_site_xy(
+            slab + Atoms("H", positions=[tuple(float(x) for x in target)], cell=slab.get_cell(), pbc=slab.get_pbc()),
+            site,
+        )
 
     ads_atoms = _place_preview_component(slab, site, ads_s, dz=dz, ref_dir=ref_dir)
-    return slab + ads_atoms
+    combined = slab + ads_atoms
+    combined.info = dict(getattr(slab, "info", {}) or {})
+    if is_supported_co2rr_adsorbate(ads_s.replace("*", "").upper()):
+        combined.info["co2rr_placement"] = {
+            "binding_mode": ads_atoms.info.get("co2rr_binding_mode"),
+            "surface_anchor_family": ads_atoms.info.get("co2rr_surface_anchor_family"),
+            "surface_support_indices": ads_atoms.info.get("co2rr_surface_support_indices", []),
+            "target_bond_length_A": ads_atoms.info.get("co2rr_target_bond_length_A"),
+            "achieved_support_distances_A": ads_atoms.info.get("co2rr_support_distances_A", []),
+            "azimuth_deg": ads_atoms.info.get("co2rr_azimuth_deg"),
+        }
+    centered = _center_preview_site_xy(combined, site)
+    centered.info = dict(getattr(combined, "info", {}) or {})
+    return centered
 
 
 def export_zip_of_struct_map(struct_map: dict, symprec: float = 0.1) -> BytesIO:
