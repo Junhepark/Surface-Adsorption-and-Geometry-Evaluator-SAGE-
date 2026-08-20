@@ -12,15 +12,18 @@
     "COOH": -23.363462716358157,
     "HCOO": -23.30369010569379
   },
-  "\u0394ZPE_ads (eV)": {
+  "ΔZPE_ads (eV)": {
     "COOH": 0.64,
     "HCOO": 0.62,
     "CO": 0.21
   },
-  "T\u0394S_gas (eV)": {
+  "TΔS_gas (eV)": {
     "H2": 0.4,
     "CO2": 0.66,
     "CO": 0.61,
     "H2O": 0.6
-  }
+  },
+  "correction_scope": "species_constant_deltaZPE_only",
+  "correction_note": "Values under ΔZPE_ads (eV) are applied as species-level ZPE-only corrections. They are not complete Gibbs corrections; entropy, solvation, and interfacial-field effects are not included. Species absent from this block are reported with ΔG_ads = null/NaN.",
+  "canonical_filename": "thermo_CO2RR.json"
 }

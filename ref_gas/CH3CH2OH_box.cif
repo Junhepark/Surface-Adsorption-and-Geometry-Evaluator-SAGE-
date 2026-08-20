@@ -1,0 +1,34 @@
+data_CH3CH2OH_box
+_chemical_formula_structural       CH3CH2OH
+_chemical_formula_sum              "O1 C2 H6"
+_cell_length_a       15.000000
+_cell_length_b       15.000000
+_cell_length_c       15.000000
+_cell_angle_alpha    90.000000
+_cell_angle_beta     90.000000
+_cell_angle_gamma    90.000000
+
+_space_group_name_H-M_alt    "P 1"
+_space_group_IT_number       1
+
+loop_
+  _space_group_symop_operation_xyz
+  'x, y, z'
+
+loop_
+  _atom_site_type_symbol
+  _atom_site_label
+  _atom_site_symmetry_multiplicity
+  _atom_site_fract_x
+  _atom_site_fract_y
+  _atom_site_fract_z
+  _atom_site_occupancy
+  C   C1      1.0  0.441984046096  0.489054852719  0.487805137996  1.0000
+  C   C2      1.0  0.528034890432  0.529786563529  0.521448016379  1.0000
+  O   O1      1.0  0.596377750530  0.464282830177  0.523040501076  1.0000
+  H   H1      1.0  0.450532861431  0.462860491353  0.420207107211  1.0000
+  H   H2      1.0  0.388343292297  0.538423992285  0.487218974767  1.0000
+  H   H3      1.0  0.421943931109  0.432917519960  0.529941618725  1.0000
+  H   H4      1.0  0.549393581921  0.584874407508  0.478664638813  1.0000
+  H   H5      1.0  0.519409116092  0.555304390699  0.589215388106  1.0000
+  H   H6      1.0  0.603980530092  0.442494951771  0.462458616927  1.0000
