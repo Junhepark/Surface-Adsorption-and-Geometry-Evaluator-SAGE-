@@ -16,6 +16,7 @@ import numpy as np
 from ase import Atoms
 from ase.io import read, write
 from ase.constraints import FixAtoms
+from ase.data import chemical_symbols
 import py3Dmol
 import streamlit.components.v1 as components
 
@@ -36,6 +37,31 @@ from ocp_app.core.anchors.voc_mode import (
     run_oxide_voc_proxy,
 )
 from ocp_app.core.voc_registry import VOC_PRESETS, get_voc_preset
+from ocp_app.core.co2rr_registry import (
+    CO2RR_PATHWAY_ORDER,
+    CO2RR_WARNING,
+    all_co2rr_states,
+    co2rr_site_allowed,
+    co2rr_state_label,
+    get_co2rr_preset,
+)
+from ocp_app.core.co2rr_pathway import (
+    build_co2rr_pathway_summary,
+    edge_summary_to_frame as co2rr_edge_summary_to_frame,
+    pathway_summary_to_frame as co2rr_pathway_summary_to_frame,
+    product_summary_to_frame as co2rr_product_summary_to_frame,
+    write_co2rr_pathway_summary,
+)
+from ocp_app.core.voc_pathway import (
+    select_voc_state_minima,
+    build_voc_pathway_summary,
+    pathway_summary_to_frame,
+    write_voc_pathway_summary,
+)
+from ocp_app.ui.voc_pathway_view import (
+    render_voc_pathway,
+    render_pathway_support_table,
+)
 from ocp_app.core.cifgen import (
     BulkSource,
     BulkSpec,
@@ -105,27 +131,7 @@ from ocp_app.core.oxide_surface_rules import (
     _oxide_oer_candidate_rank_key,
     _oxide_oer_cation_metrics,
 )
-from ocp_app.core.surface_families import (
-    INTERFACE_FACET_PRESETS,
-    THICKNESS_ALLOCATION_OPTIONS,
-    _infer_interface_surface_family,
-    _get_interface_facet_options,
-    _recommended_interface_facet_labels,
-    _facet_labels_for_mode,
-)
-from ocp_app.core.interface_builder import (
-    _allocation_to_thicknesses,
-    _inplane_metrics,
-    _auto_max_xy_repeat,
-    _find_best_xy_repeat_pair,
-    _scale_film_to_substrate_xy,
-    _auto_initial_gap,
-    _stack_interface_pair,
-    _registry_candidates_auto,
-    _geometry_prefilter_interface_work,
-    _select_best_slab_for_facet,
-    _build_interface_candidates_from_bulks,
-)
+from ocp_app.core.surface_families import _infer_interface_surface_family
 from ocp_app.core.slabify import (
     _DEFAULT_SLAB_MIN_THICKNESS,
     _DEFAULT_SLAB_MAX_CANDIDATES,
@@ -173,6 +179,29 @@ from ocp_app.core.co2rr_air_summary import (
     annotate_co2rr_air_summary,
 )
 from ocp_app.core.structure_check import validate_structure
+from ocp_app.core.structure_engineering import (
+    analyze_parent_slab,
+    build_adatom_candidate_at_site,
+    build_substitution_candidate_at_index,
+    build_vacancy_candidate_at_index,
+    candidate_summary_records,
+    detect_selectable_adatom_sites,
+    enumerate_adatom_candidates,
+    enumerate_substitution_candidates,
+    enumerate_vacancy_candidates,
+    export_engineered_candidates_zip,
+    structure_content_signature,
+    substitution_radius_diagnostics,
+    infer_structure_material_class,
+    oxidation_state_options,
+    suggested_substitution_oxidation_states,
+    substitution_geometry_diagnostics,
+)
+from ocp_app.ui.structure_picker import (
+    eligible_atom_indices,
+    render_adatom_site_picker,
+    render_atom_picker,
+)
 from ocp_app.core.ads_sites import _oxide_o_based_ads_position
 from ocp_app.core.ads_sites import oxide_surface_seed_position, expand_oxide_channels_for_adsorbate, ANION_SYMBOLS, detect_oxide_oer_cation_sites
 from ocp_app.core.ads_sites import (
@@ -254,6 +283,120 @@ def _safe_float(val, default=np.nan):
         return float(val)
     except Exception:
         return float(default)
+
+
+def _read_result_csv_safely(csv_path, *, context: str = "result"):
+    """Read a SAGE CSV without allowing empty/incomplete files to crash the UI.
+
+    Returns
+    -------
+    (dataframe, diagnostic)
+        dataframe is None when the file is missing, zero-byte, headerless, or
+        unreadable. A header-only CSV returns an empty DataFrame with a
+        diagnostic so the caller can report that no calculation rows survived.
+    """
+    diagnostic = {
+        "context": str(context),
+        "csv_path": "" if csv_path is None else str(csv_path),
+        "exists": False,
+        "is_file": False,
+        "size_bytes": None,
+        "status": "unknown",
+        "error": None,
+    }
+
+    if csv_path is None or not str(csv_path).strip():
+        diagnostic["status"] = "missing_path"
+        diagnostic["error"] = "The calculation backend did not return a CSV path."
+        return None, diagnostic
+
+    try:
+        p = Path(str(csv_path)).expanduser()
+        diagnostic["csv_path"] = str(p)
+        diagnostic["exists"] = bool(p.exists())
+        diagnostic["is_file"] = bool(p.is_file())
+        if not p.is_file():
+            diagnostic["status"] = "missing_file"
+            diagnostic["error"] = "The returned CSV path does not point to a file."
+            return None, diagnostic
+
+        size = int(p.stat().st_size)
+        diagnostic["size_bytes"] = size
+        if size <= 0:
+            diagnostic["status"] = "zero_byte_file"
+            diagnostic["error"] = "The result CSV exists but contains zero bytes."
+            return None, diagnostic
+
+        try:
+            df = pd.read_csv(p)
+        except pd.errors.EmptyDataError as exc:
+            diagnostic["status"] = "no_columns"
+            diagnostic["error"] = str(exc) or "No columns to parse from the result CSV."
+            return None, diagnostic
+        except pd.errors.ParserError as exc:
+            diagnostic["status"] = "parser_error"
+            diagnostic["error"] = str(exc)
+            return None, diagnostic
+        except Exception as exc:
+            diagnostic["status"] = "read_error"
+            diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            return None, diagnostic
+
+        diagnostic["n_rows"] = int(len(df))
+        diagnostic["n_columns"] = int(len(df.columns))
+        diagnostic["columns"] = [str(c) for c in df.columns]
+
+        if len(df.columns) == 0:
+            diagnostic["status"] = "no_columns"
+            diagnostic["error"] = "The CSV was read but no columns were present."
+            return None, diagnostic
+
+        if df.empty:
+            diagnostic["status"] = "header_only"
+            diagnostic["error"] = (
+                "The CSV contains column headers but no result rows. "
+                "All candidate attempts may have failed or been filtered out."
+            )
+            return df, diagnostic
+
+        diagnostic["status"] = "ok"
+        return df, diagnostic
+
+    except Exception as exc:
+        diagnostic["status"] = "inspection_error"
+        diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+        return None, diagnostic
+
+
+def _render_empty_result_diagnostic(csv_diag, *, meta=None):
+    """Render a concise diagnostic panel for missing or empty calculation CSVs."""
+    diag = dict(csv_diag or {})
+    status = str(diag.get("status", "unknown"))
+    path_text = str(diag.get("csv_path", "") or "(not returned)")
+    size_text = diag.get("size_bytes")
+    size_label = "unknown" if size_text is None else f"{int(size_text)} bytes"
+
+    st.error(
+        "The calculation backend did not produce a readable result table. "
+        "The app stopped before post-processing instead of raising a pandas EmptyDataError."
+    )
+    st.write(f"- CSV status: **{status}**")
+    st.write(f"- CSV path: `{path_text}`")
+    st.write(f"- File size: **{size_label}**")
+    if diag.get("error"):
+        st.write(f"- Diagnostic: {diag.get('error')}")
+
+    st.info(
+        "This usually means that no candidate row was written: every site may have "
+        "failed during placement/relaxation, all rows may have been rejected upstream, "
+        "the run may have been interrupted, or a stale output file may have been reused."
+    )
+
+    with st.expander("Show backend metadata and CSV diagnostic", expanded=False):
+        st.json({
+            "csv_diagnostic": _jsonable(diag),
+            "backend_meta": _jsonable(meta) if isinstance(meta, dict) else meta,
+        })
 
 
 def _coerce_bool_series(s: pd.Series, default: bool = False) -> pd.Series:
@@ -690,9 +833,13 @@ def _format_relaxed_view_option(row: pd.Series | dict, is_her: bool = True) -> s
         return f"{site_label} | final={relaxed_site} | ΔG_H(U,pH)={dg:.3f} eV | {reliability}"
     ads = str(row.get("adsorbate", "?"))
     qa = str(row.get("qa", reliability or ""))
-    dg = _safe_float(row.get("ΔG_ads (eV)", row.get("ΔE_proxy (eV)", row.get("ΔE_ads_user (eV)", np.nan))))
-    label = "ΔG_ads" if "ΔG_ads (eV)" in row else ("ΔE_proxy" if "ΔE_proxy (eV)" in row else "ΔE_ads")
-    return f"{ads} | {site_label} | final={relaxed_site} | {label}={dg:.3f} eV | {qa}"
+    if str(row.get("mode", "")).upper() == "CO2RR":
+        value = _safe_float(row.get("ΔE_ads_user (eV)", np.nan))
+        label = "ΔE_ads"
+    else:
+        value = _safe_float(row.get("ΔG_ads (eV)", row.get("ΔE_proxy (eV)", row.get("ΔE_ads_user (eV)", np.nan))))
+        label = "ΔG_ads" if "ΔG_ads (eV)" in row else ("ΔE_proxy" if "ΔE_proxy (eV)" in row else "ΔE_ads")
+    return f"{ads} | {site_label} | final={relaxed_site} | {label}={value:.3f} eV | {qa}"
 
 def _cluster_z_layers_simple(atoms, tol: float = 0.8):
     pos = np.asarray(atoms.get_positions(), dtype=float)
@@ -1137,10 +1284,10 @@ with st.sidebar:
 
     reaction_mode = st.radio(
         "Reaction mode",
-        ["HER (ΔG_H)", "CO₂RR (ΔG_ads)", "OER competition (OOH/O/OH)", "VOCs (ΔE_proxy)"],
+        ["HER (ΔG_H)", "CO₂RR (ΔE descriptor)", "OER competition (OOH/O/OH)", "VOCs (ΔE_proxy)"],
         horizontal=False,
         help=(
-            "HER: H* adsorption free energy | CO₂RR: COOH*/CO*/HCOO*/OCHO* | "
+            "HER: H* adsorption free energy | CO₂RR: CO/formate/methanol/methane C1 intermediate presets | "
             "OER: OOH*/O*/OH* oxygen-intermediate CHE descriptors | "
             "VOCs: target-VOC adsorption and H*/OH* co-adsorption proximity proxies"
         ),
@@ -1179,6 +1326,9 @@ with st.sidebar:
     co2rr_air_oxygen_ads = []
     co2rr_air_include_her = True
     co2rr_air_oer_relaxation_mode = "short_relax"
+    co2rr_pathway_key = str(st.session_state.get("co2rr_pathway", "competitive_c1"))
+    co2rr_include_her = bool(st.session_state.get("co2rr_include_her", True))
+    co2rr_potential_V = float(st.session_state.get("co2rr_potential_V", 0.0))
 
     if is_her:
         co2_ads = []
@@ -1288,10 +1438,58 @@ with st.sidebar:
             )
     else:
         voc_relaxation_policy = "normal_relax"
+        _pathway_keys = [k for k in CO2RR_PATHWAY_ORDER]
+        _prev_pathway = st.session_state.get("_co2rr_pathway_prev", None)
+        co2rr_pathway_key = st.selectbox(
+            "CO₂RR product-targeted preset",
+            _pathway_keys,
+            index=_pathway_keys.index(st.session_state.get("co2rr_pathway", "competitive_c1")) if st.session_state.get("co2rr_pathway", "competitive_c1") in _pathway_keys else 0,
+            format_func=lambda k: get_co2rr_preset(k).get("label", str(k)),
+            key="co2rr_pathway",
+            help=(
+                "Competitive C1 evaluates shared intermediates once and compares CO, formate, "
+                "formaldehyde, methanol, and methane thermodynamic pathways. Neutral CH2O is "
+                "treated as HCHO(g), not forced onto the surface as CH2O*. Product presets "
+                "remain available for smaller diagnostic runs."
+            ),
+        )
+        _co2rr_preset = get_co2rr_preset(co2rr_pathway_key)
+        _co2rr_default_states = list(_co2rr_preset.get("states", ["COOH*", "CO*"]))
+        _co2rr_options = all_co2rr_states()
+        _current_co2rr_states = list(st.session_state.get("co2rr_ads", []))
+        if (
+            _prev_pathway != co2rr_pathway_key
+            or not _current_co2rr_states
+            or any(str(x) not in set(_co2rr_options) for x in _current_co2rr_states)
+        ):
+            st.session_state["_co2rr_pathway_prev"] = co2rr_pathway_key
+            st.session_state["co2rr_ads"] = list(_co2rr_default_states)
         co2_ads = st.multiselect(
             "CO₂RR intermediates",
-            ["COOH*", "CO*", "HCOO*", "OCHO*"],
-            default=["COOH*", "CO*", "HCOO*", "OCHO*"],
+            _co2rr_options,
+            default=[s for s in st.session_state.get("co2rr_ads", _co2rr_default_states) if s in _co2rr_options],
+            format_func=co2rr_state_label,
+            key="co2rr_ads",
+        )
+        st.caption(str(_co2rr_preset.get("description", "")))
+        st.caption(CO2RR_WARNING)
+        co2rr_potential_V = float(st.number_input(
+            "CO₂RR analysis potential (V vs RHE)",
+            min_value=-2.50,
+            max_value=1.00,
+            value=float(st.session_state.get("co2rr_potential_V", 0.0)),
+            step=0.05,
+            key="co2rr_potential_V",
+            help=(
+                "Updates ΔG(U)=ΔG(0)+n·U for reduction PCET edges. "
+                "The limiting potential itself is calculated from the U=0 edge energies."
+            ),
+        ))
+        co2rr_include_her = st.checkbox(
+            "Include HER competition guardrail (H*)",
+            value=bool(st.session_state.get("co2rr_include_her", True)),
+            key="co2rr_include_her",
+            help="Runs the existing single-site HER guardrail separately from the carbon-intermediate preset.",
         )
         orr_ads = []
         co2rr_air_enabled = st.checkbox(
@@ -1300,8 +1498,7 @@ with st.sidebar:
             key="co2rr_air_enabled",
             help=(
                 "CO₂RR-only add-on. Runs the existing OER oxygen-intermediate engine in a separate "
-                "output folder and combines those rows with the CO₂RR HER guardrail for ORR/HER risk. "
-                "HER, OER, and VOC modes are not modified."
+                "output folder and combines those rows with the CO₂RR HER guardrail for ORR/HER risk."
             ),
         )
         if co2rr_air_enabled:
@@ -1314,7 +1511,7 @@ with st.sidebar:
             )
             co2rr_air_include_her = st.checkbox(
                 "Include HER guardrail in CO₂RR-air summary",
-                value=True,
+                value=bool(co2rr_include_her),
                 key="co2rr_air_include_her",
             )
             co2rr_air_oer_relaxation_mode = st.selectbox(
@@ -1324,6 +1521,7 @@ with st.sidebar:
                 key="co2rr_air_oer_relaxation_mode",
                 help="Applied only to the auxiliary oxygen-intermediate run launched from CO₂RR mode.",
             )
+
 
 
     if not is_oer:
@@ -1463,6 +1661,7 @@ else:
         2: "2-3. Expand XY supercell",
         3: "2-4. Reduce slab thickness",
         4: "2-5. Review prepared slab",
+        5: "2-6. Surface engineering",
     }
     stage_short_labels = {
         0: "2-1",
@@ -1470,8 +1669,9 @@ else:
         2: "2-3",
         3: "2-4",
         4: "2-5",
+        5: "2-6",
     }
-    visible_stage_ids = [0, 1, 2, 3, 4] if surface_route == "Slabify from bulk" else [1, 2, 3, 4]
+    visible_stage_ids = [0, 1, 2, 3, 4, 5] if surface_route == "Slabify from bulk" else [1, 2, 3, 4, 5]
     max_revisit_stage = max(visible_stage_ids[0], min(int(surface_setup_stage), max(visible_stage_ids)))
 
     st.caption(f"Surface-setup wizard: **{stage_labels.get(surface_setup_stage, '2-1. Select slab')}**")
@@ -1915,6 +2115,7 @@ else:
         status_lines.append(f"Vacuum reviewed: **{'yes' if surface_setup_stage >= 2 else 'no'}**")
         status_lines.append(f"XY supercell reviewed: **{'yes' if surface_setup_stage >= 3 else 'no'}**")
         status_lines.append(f"Slab reduction reviewed: **{'yes' if surface_setup_stage >= 4 else 'no'}**")
+        status_lines.append(f"Surface engineering reviewed: **{'yes' if surface_setup_stage >= 5 else 'no'}**")
         st.caption(" | ".join(status_lines))
 
         if surface_setup_stage == 1:
@@ -2182,9 +2383,9 @@ else:
                         st.rerun()
 
 
-        else:
+        elif surface_setup_stage == 4:
             st.markdown("#### 2-5. Review prepared slab")
-            st.success("Surface setup is complete. You can proceed to Step 3.")
+            st.success("The parent slab is prepared. Surface engineering is optional.")
             st.write(f"- Atoms: **{len(prepared)}**")
             st.write(f"- Vacuum_z: **{float(getattr(rep, 'vacuum_z', 0.0)):.2f} Å**")
             if mtype == "oxide":
@@ -2193,11 +2394,653 @@ else:
                 st.caption(str(surf_meta_review.get('slab_symmetry_basis', '')))
             cdone1, cdone2 = st.columns(2)
             with cdone1:
-                if st.button("Proceed to Step 3", key="btn_step2_done"):
-                    st.info("Move to Step 3 below.")
+                if st.button("Continue to surface engineering →", key="btn_step2_to_engineering"):
+                    st.session_state["surface_engineering_base_atoms"] = prepared.copy()
+                    st.session_state["surface_engineering_base_signature"] = structure_content_signature(prepared)
+                    st.session_state["surface_engineering_applied_signature"] = None
+                    st.session_state["surface_engineering_candidates"] = []
+                    st.session_state["surface_engineering_selected_index"] = 0
+                    st.session_state["surface_engineering_candidate_select"] = 0
+                    st.session_state["surface_engineering_manual_atom_index"] = None
+                    st.session_state["surface_engineering_manual_site_index"] = None
+                    st.session_state["surface_setup_stage"] = 5
+                    st.rerun()
             with cdone2:
                 if st.button("← Back to slab reduction", key="btn_back_stage4"):
                     st.session_state["surface_setup_stage"] = 3
+                    st.rerun()
+
+        else:
+            st.markdown("#### 2-6. Surface engineering")
+            st.caption(
+                "Generate deterministic single-substitution, single-vacancy, or single-adatom candidates "
+                "from the prepared parent slab. This stage performs structural generation and geometry checks only; "
+                "it does not claim synthesis feasibility or thermodynamic stability."
+            )
+
+            current_sig = structure_content_signature(prepared)
+            base_atoms = st.session_state.get("surface_engineering_base_atoms")
+            base_sig = st.session_state.get("surface_engineering_base_signature")
+            applied_sig = st.session_state.get("surface_engineering_applied_signature")
+            if base_atoms is None or (current_sig not in {base_sig, applied_sig}):
+                st.session_state["surface_engineering_base_atoms"] = prepared.copy()
+                st.session_state["surface_engineering_base_signature"] = current_sig
+                st.session_state["surface_engineering_applied_signature"] = None
+                st.session_state["surface_engineering_candidates"] = []
+                st.session_state["surface_engineering_selected_index"] = 0
+                st.session_state["surface_engineering_candidate_select"] = 0
+                base_atoms = prepared.copy()
+                base_sig = current_sig
+            else:
+                base_atoms = base_atoms.copy()
+
+            base_analysis = analyze_parent_slab(base_atoms)
+            base_symbols = sorted(set(base_atoms.get_chemical_symbols()))
+            st.write(
+                f"- Parent: **{base_atoms.get_chemical_formula()}**, "
+                f"**{len(base_atoms)} atoms**, "
+                f"**{len(base_analysis.get('layers', []))} z-layers**"
+            )
+            if applied_sig and current_sig == applied_sig:
+                st.info("An engineered candidate is currently applied. New candidates are still generated from the preserved parent slab.")
+
+            operation = st.radio(
+                "Structure operation",
+                ["None", "Single substitution", "Single vacancy", "Single adatom"],
+                horizontal=True,
+                key="surface_engineering_operation",
+            )
+            operation_prev = st.session_state.get("_surface_engineering_operation_prev")
+            if operation_prev != operation:
+                st.session_state["_surface_engineering_operation_prev"] = operation
+                st.session_state["surface_engineering_candidates"] = []
+                st.session_state["surface_engineering_selected_index"] = 0
+                st.session_state["surface_engineering_candidate_select"] = 0
+                st.session_state["surface_engineering_manual_atom_index"] = None
+                st.session_state["surface_engineering_manual_site_index"] = None
+
+            selection_policy = None
+            if operation != "None":
+                selection_policy = st.radio(
+                    "Position selection",
+                    ["Automatic distinct candidates", "Manual position"],
+                    horizontal=True,
+                    key="surface_engineering_selection_policy",
+                    help=(
+                        "Automatic mode keeps one representative from each local-environment orbit. "
+                        "Manual mode lets you click an exact parent atom or adsorption-site marker."
+                    ),
+                )
+                policy_prev = st.session_state.get("_surface_engineering_selection_policy_prev")
+                if policy_prev != selection_policy:
+                    st.session_state["_surface_engineering_selection_policy_prev"] = selection_policy
+                    st.session_state["surface_engineering_candidates"] = []
+                    st.session_state["surface_engineering_selected_index"] = 0
+                    st.session_state["surface_engineering_candidate_select"] = 0
+                    st.session_state["surface_engineering_manual_atom_index"] = None
+                    st.session_state["surface_engineering_manual_site_index"] = None
+
+            candidates = st.session_state.get("surface_engineering_candidates", []) or []
+            generation_error = None
+
+            if operation == "Single substitution":
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    host = st.selectbox("Host element", base_symbols, key="eng_sub_host")
+                with c2:
+                    dopant_options = [s for s in chemical_symbols[1:] if s and s != host]
+                    preferred_dopant = "Ag" if str(host) != "Ag" else "Cu"
+                    dopant_default = dopant_options.index(preferred_dopant) if preferred_dopant in dopant_options else 0
+                    dopant = st.selectbox(
+                        "Dopant element",
+                        dopant_options,
+                        index=dopant_default,
+                        key="eng_sub_dopant",
+                    )
+                with c3:
+                    depth = st.selectbox(
+                        "Depth",
+                        ["surface", "subsurface", "surface+subsurface"],
+                        key="eng_sub_depth",
+                    )
+
+                material_class = infer_structure_material_class(base_atoms)
+                geometry_diag = substitution_geometry_diagnostics(
+                    base_atoms,
+                    host=str(host),
+                    dopant=str(dopant),
+                )
+                host_oxidation_state = None
+                dopant_oxidation_state = None
+                shared_ligand_weight = 0.50
+
+                with st.expander("Local geometry initialization", expanded=True):
+                    if material_class == "oxide":
+                        suggestions = suggested_substitution_oxidation_states(
+                            base_atoms,
+                            host=str(host),
+                            dopant=str(dopant),
+                            host_role=str(geometry_diag.get("host_role", "cation")),
+                            dopant_role=str(geometry_diag.get("dopant_role", "cation")),
+                        )
+                        st.write("Model: **oxide coordination-polyhedron initialization**")
+                        st.caption(
+                            "Only the directly coordinated opposite-sublattice atoms are adjusted. "
+                            "For cation substitution, first-shell anion ligands move; shared ligands are damped. "
+                            "For anion substitution, neighboring cations move more conservatively."
+                        )
+                        st.write(
+                            f"Host role: **{geometry_diag.get('host_role', 'unknown')}** · "
+                            f"Dopant role: **{geometry_diag.get('dopant_role', 'unknown')}**"
+                        )
+                        if bool(geometry_diag.get("cross_sublattice", False)):
+                            st.error(
+                                "Cross-sublattice substitution was selected. Automatic distance adjustment "
+                                "will be disabled for this candidate and the host lattice positions retained."
+                            )
+
+                        inferred = dict(suggestions.get("inference", {}) or {})
+                        if bool(inferred.get("ambiguous", False)):
+                            st.warning(
+                                "Oxidation-state inference is ambiguous for this composition. "
+                                "Review the selected oxidation states manually."
+                            )
+                        elif inferred.get("assignments"):
+                            st.caption(
+                                "Best-effort charge-neutral assignment: "
+                                + ", ".join(
+                                    f"{el}{int(ox):+d}"
+                                    for el, ox in sorted(inferred.get("assignments", {}).items())
+                                )
+                            )
+
+                        host_options = list(suggestions.get("host_options", []) or oxidation_state_options(str(host)))
+                        dopant_options_ox = list(suggestions.get("dopant_options", []) or oxidation_state_options(str(dopant)))
+                        suggested_host = suggestions.get("host_oxidation_state")
+                        suggested_dopant = suggestions.get("dopant_oxidation_state")
+                        if suggested_host not in host_options and suggested_host is not None:
+                            host_options = [int(suggested_host)] + host_options
+                        if suggested_dopant not in dopant_options_ox and suggested_dopant is not None:
+                            dopant_options_ox = [int(suggested_dopant)] + dopant_options_ox
+
+                        ox1, ox2 = st.columns(2)
+                        with ox1:
+                            host_default = host_options.index(int(suggested_host)) if suggested_host in host_options else 0
+                            host_oxidation_state = st.selectbox(
+                                "Host oxidation state",
+                                host_options,
+                                index=host_default,
+                                format_func=lambda x: f"{int(x):+d}",
+                                key="eng_sub_host_oxidation",
+                            )
+                        with ox2:
+                            dopant_default_ox = (
+                                dopant_options_ox.index(int(suggested_dopant))
+                                if suggested_dopant in dopant_options_ox else 0
+                            )
+                            dopant_oxidation_state = st.selectbox(
+                                "Dopant oxidation state",
+                                dopant_options_ox,
+                                index=dopant_default_ox,
+                                format_func=lambda x: f"{int(x):+d}",
+                                key="eng_sub_dopant_oxidation",
+                            )
+
+                        if int(host_oxidation_state) != int(dopant_oxidation_state):
+                            st.warning(
+                                f"Charge mismatch: {host}{int(host_oxidation_state):+d} → "
+                                f"{dopant}{int(dopant_oxidation_state):+d}. "
+                                "This generator does not automatically add vacancies, co-dopants, or polarons."
+                            )
+
+                        local_adjustment = st.checkbox(
+                            "Apply oxide polyhedron initialization",
+                            value=True,
+                            key="eng_sub_local_adjustment",
+                            help="This is a starting-geometry adjustment, not an energy relaxation.",
+                        )
+                        g1, g2, g3 = st.columns(3)
+                        with g1:
+                            adjustment_strength = st.slider(
+                                "Polyhedron adjustment strength",
+                                min_value=0.0,
+                                max_value=0.60,
+                                value=0.25,
+                                step=0.05,
+                                key="eng_sub_adjustment_strength",
+                                disabled=not local_adjustment,
+                            )
+                        with g2:
+                            shared_ligand_weight = st.slider(
+                                "Shared-ligand weight",
+                                min_value=0.10,
+                                max_value=1.00,
+                                value=0.50,
+                                step=0.05,
+                                key="eng_sub_shared_ligand_weight",
+                                disabled=not local_adjustment,
+                            )
+                        with g3:
+                            max_local_displacement_A = st.number_input(
+                                "Max displacement / ligand (Å)",
+                                min_value=0.02,
+                                max_value=0.30,
+                                value=0.12,
+                                step=0.02,
+                                key="eng_sub_max_local_displacement",
+                                disabled=not local_adjustment,
+                            )
+                        adjustment_shells = 1
+                        st.caption(
+                            "Default: first coordination polyhedron only, 25% of the ionic-radius difference, "
+                            "shared-ligand damping 0.50, maximum displacement 0.12 Å."
+                        )
+                    else:
+                        radius_diag = substitution_radius_diagnostics(str(host), str(dopant))
+                        st.write("Model: **metallic local-neighbor initialization**")
+                        st.caption(
+                            "The dopant remains at the host lattice site. First- and second-shell metal atoms "
+                            "are shifted using bounded covalent-radius ratios."
+                        )
+                        signed_pct = 100.0 * float(radius_diag["signed_radius_mismatch_fraction"])
+                        direction = (
+                            "local expansion" if signed_pct > 0
+                            else ("local contraction" if signed_pct < 0 else "no radius-driven change")
+                        )
+                        st.write(
+                            f"Host radius: **{float(radius_diag['host_radius_A']):.2f} Å** · "
+                            f"Dopant radius: **{float(radius_diag['dopant_radius_A']):.2f} Å** · "
+                            f"Signed mismatch: **{signed_pct:+.1f}%** ({direction})"
+                        )
+                        local_adjustment = st.checkbox(
+                            "Apply metallic radius-guided initialization",
+                            value=True,
+                            key="eng_sub_local_adjustment",
+                        )
+                        g1, g2, g3 = st.columns(3)
+                        with g1:
+                            adjustment_strength = st.slider(
+                                "Adjustment strength",
+                                min_value=0.0,
+                                max_value=1.0,
+                                value=0.50,
+                                step=0.05,
+                                key="eng_sub_adjustment_strength",
+                                disabled=not local_adjustment,
+                            )
+                        with g2:
+                            adjustment_shells = st.selectbox(
+                                "Adjusted neighbor shells",
+                                [1, 2],
+                                index=1,
+                                key="eng_sub_adjustment_shells",
+                                disabled=not local_adjustment,
+                            )
+                        with g3:
+                            max_local_displacement_A = st.number_input(
+                                "Max displacement / atom (Å)",
+                                min_value=0.05,
+                                max_value=0.50,
+                                value=0.20,
+                                step=0.05,
+                                key="eng_sub_max_local_displacement",
+                                disabled=not local_adjustment,
+                            )
+                        st.caption(
+                            "Default: 50% of the radius-predicted change, two shells, "
+                            "maximum 0.20 Å displacement per neighboring atom."
+                        )
+
+                if selection_policy == "Manual position":
+                    eligible = eligible_atom_indices(
+                        base_analysis,
+                        element=str(host),
+                        depth=str(depth),
+                    )
+                    selected_atom = render_atom_picker(
+                        base_atoms,
+                        base_analysis,
+                        selectable_indices=eligible,
+                        selected_index=st.session_state.get("surface_engineering_manual_atom_index"),
+                        key=f"eng_sub_picker_{base_sig}_{host}_{depth}",
+                        title=f"Click the {host} atom to replace with {dopant}",
+                    )
+                    st.session_state["surface_engineering_manual_atom_index"] = selected_atom
+                    if selected_atom is not None:
+                        env = base_analysis["environment_by_index"][int(selected_atom)]
+                        st.info(
+                            f"Selected parent atom #{selected_atom}: {host}, "
+                            f"{env.depth_class}, layer {env.layer_id}, CN={env.coordination_number}."
+                        )
+                    if st.button(
+                        "Generate substitution at selected atom",
+                        key="btn_eng_generate_sub_manual",
+                        disabled=(selected_atom is None),
+                    ):
+                        try:
+                            candidate = build_substitution_candidate_at_index(
+                                base_atoms,
+                                host=str(host),
+                                dopant=str(dopant),
+                                target_index=int(selected_atom),
+                                depth=str(depth),
+                                apply_local_adjustment=bool(local_adjustment),
+                                adjustment_strength=float(adjustment_strength),
+                                adjustment_shells=int(adjustment_shells),
+                                max_local_displacement_A=float(max_local_displacement_A),
+                                protect_bottom_layers=1,
+                                host_oxidation_state=host_oxidation_state,
+                                dopant_oxidation_state=dopant_oxidation_state,
+                                shared_ligand_weight=float(shared_ligand_weight),
+                            )
+                            candidates = [candidate]
+                            st.session_state["surface_engineering_candidates"] = candidates
+                            st.session_state["surface_engineering_selected_index"] = 0
+                            st.session_state["surface_engineering_candidate_select"] = 0
+                        except Exception as exc:
+                            generation_error = str(exc)
+                elif st.button("Generate substitution candidates", key="btn_eng_generate_sub"):
+                    try:
+                        candidates = enumerate_substitution_candidates(
+                            base_atoms,
+                            host=str(host),
+                            dopant=str(dopant),
+                            depth=str(depth),
+                            max_candidates=20,
+                            apply_local_adjustment=bool(local_adjustment),
+                            adjustment_strength=float(adjustment_strength),
+                            adjustment_shells=int(adjustment_shells),
+                            max_local_displacement_A=float(max_local_displacement_A),
+                            protect_bottom_layers=1,
+                            host_oxidation_state=host_oxidation_state,
+                            dopant_oxidation_state=dopant_oxidation_state,
+                            shared_ligand_weight=float(shared_ligand_weight),
+                        )
+                        st.session_state["surface_engineering_candidates"] = candidates
+                        st.session_state["surface_engineering_selected_index"] = 0
+                        st.session_state["surface_engineering_candidate_select"] = 0
+                    except Exception as exc:
+                        generation_error = str(exc)
+
+            elif operation == "Single vacancy":
+                c1, c2 = st.columns(2)
+                with c1:
+                    vacancy_element = st.selectbox("Removed element", base_symbols, key="eng_vac_element")
+                with c2:
+                    vacancy_depth = st.selectbox(
+                        "Depth",
+                        ["surface", "subsurface", "surface+subsurface"],
+                        key="eng_vac_depth",
+                    )
+
+                if selection_policy == "Manual position":
+                    eligible = eligible_atom_indices(
+                        base_analysis,
+                        element=str(vacancy_element),
+                        depth=str(vacancy_depth),
+                    )
+                    selected_atom = render_atom_picker(
+                        base_atoms,
+                        base_analysis,
+                        selectable_indices=eligible,
+                        selected_index=st.session_state.get("surface_engineering_manual_atom_index"),
+                        key=f"eng_vac_picker_{base_sig}_{vacancy_element}_{vacancy_depth}",
+                        title=f"Click the {vacancy_element} atom to remove",
+                    )
+                    st.session_state["surface_engineering_manual_atom_index"] = selected_atom
+                    if selected_atom is not None:
+                        env = base_analysis["environment_by_index"][int(selected_atom)]
+                        st.info(
+                            f"Selected parent atom #{selected_atom}: {vacancy_element}, "
+                            f"{env.depth_class}, layer {env.layer_id}, CN={env.coordination_number}."
+                        )
+                    if st.button(
+                        "Generate vacancy at selected atom",
+                        key="btn_eng_generate_vac_manual",
+                        disabled=(selected_atom is None),
+                    ):
+                        try:
+                            candidate = build_vacancy_candidate_at_index(
+                                base_atoms,
+                                element=str(vacancy_element),
+                                target_index=int(selected_atom),
+                                depth=str(vacancy_depth),
+                            )
+                            candidates = [candidate]
+                            st.session_state["surface_engineering_candidates"] = candidates
+                            st.session_state["surface_engineering_selected_index"] = 0
+                            st.session_state["surface_engineering_candidate_select"] = 0
+                        except Exception as exc:
+                            generation_error = str(exc)
+                elif st.button("Generate vacancy candidates", key="btn_eng_generate_vac"):
+                    try:
+                        candidates = enumerate_vacancy_candidates(
+                            base_atoms,
+                            element=str(vacancy_element),
+                            depth=str(vacancy_depth),
+                            max_candidates=20,
+                        )
+                        st.session_state["surface_engineering_candidates"] = candidates
+                        st.session_state["surface_engineering_selected_index"] = 0
+                        st.session_state["surface_engineering_candidate_select"] = 0
+                    except Exception as exc:
+                        generation_error = str(exc)
+
+            elif operation == "Single adatom":
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    adatom_options = chemical_symbols[1:]
+                    adatom_default = adatom_options.index("Cu") if "Cu" in adatom_options else 0
+                    adatom = st.selectbox(
+                        "Adatom element",
+                        adatom_options,
+                        index=adatom_default,
+                        key="eng_ad_element",
+                    )
+                with c2:
+                    site_kinds = st.multiselect(
+                        "Initial site classes",
+                        ["ontop", "bridge", "hollow"],
+                        default=["ontop", "bridge", "hollow"],
+                        key="eng_ad_site_kinds",
+                    )
+                with c3:
+                    distance_scale = st.number_input(
+                        "Initial distance scale",
+                        min_value=0.80,
+                        max_value=1.30,
+                        value=1.00,
+                        step=0.05,
+                        key="eng_ad_distance_scale",
+                    )
+
+                if selection_policy == "Manual position":
+                    try:
+                        manual_sites = detect_selectable_adatom_sites(
+                            base_atoms,
+                            site_kinds=tuple(site_kinds),
+                            max_sites_per_kind=200,
+                        )
+                    except Exception as exc:
+                        manual_sites = []
+                        generation_error = str(exc)
+                    selected_site_index = render_adatom_site_picker(
+                        base_atoms,
+                        manual_sites,
+                        selected_site_index=st.session_state.get("surface_engineering_manual_site_index"),
+                        key=f"eng_ad_picker_{base_sig}_{'_'.join(site_kinds)}",
+                    )
+                    st.session_state["surface_engineering_manual_site_index"] = selected_site_index
+                    if selected_site_index is not None and manual_sites:
+                        site = manual_sites[int(selected_site_index)]
+                        kind = "hollow" if str(site.kind).lower() in {"fcc", "hcp"} else str(site.kind)
+                        st.info(
+                            f"Selected site {selected_site_index}: {kind}, "
+                            f"support parent atoms={tuple(int(i) for i in site.surface_indices)}."
+                        )
+                    if st.button(
+                        "Generate adatom at selected site",
+                        key="btn_eng_generate_ad_manual",
+                        disabled=(selected_site_index is None or not manual_sites),
+                    ):
+                        try:
+                            site = manual_sites[int(selected_site_index)]
+                            candidate = build_adatom_candidate_at_site(
+                                base_atoms,
+                                adatom=str(adatom),
+                                site=site,
+                                distance_scale=float(distance_scale),
+                                site_index=int(selected_site_index),
+                            )
+                            candidates = [candidate]
+                            st.session_state["surface_engineering_candidates"] = candidates
+                            st.session_state["surface_engineering_selected_index"] = 0
+                            st.session_state["surface_engineering_candidate_select"] = 0
+                        except Exception as exc:
+                            generation_error = str(exc)
+                elif st.button("Generate adatom candidates", key="btn_eng_generate_ad"):
+                    try:
+                        candidates = enumerate_adatom_candidates(
+                            base_atoms,
+                            adatom=str(adatom),
+                            site_kinds=tuple(site_kinds),
+                            distance_scale=float(distance_scale),
+                            max_candidates=20,
+                        )
+                        st.session_state["surface_engineering_candidates"] = candidates
+                        st.session_state["surface_engineering_selected_index"] = 0
+                        st.session_state["surface_engineering_candidate_select"] = 0
+                    except Exception as exc:
+                        generation_error = str(exc)
+
+            else:
+                st.info("No structural modification selected. The prepared parent slab remains active.")
+
+
+            if generation_error:
+                st.error(f"Candidate generation failed: {generation_error}")
+
+            candidates = st.session_state.get("surface_engineering_candidates", []) or []
+            if candidates:
+                summary_df = pd.DataFrame(candidate_summary_records(candidates))
+                st.markdown("##### Generated candidates")
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                selected_index = st.selectbox(
+                    "Candidate preview",
+                    options=list(range(len(candidates))),
+                    index=min(
+                        int(st.session_state.get("surface_engineering_selected_index", 0)),
+                        max(len(candidates) - 1, 0),
+                    ),
+                    format_func=lambda i: candidates[int(i)].label,
+                    key="surface_engineering_candidate_select",
+                )
+                st.session_state["surface_engineering_selected_index"] = int(selected_index)
+                selected = candidates[int(selected_index)]
+
+                p1, p2 = st.columns([1.2, 0.8])
+                with p1:
+                    show_atoms_3d(
+                        selected.atoms,
+                        height=390,
+                        width=720,
+                        tag=f"surface_engineering_{selected.candidate_id}",
+                    )
+                with p2:
+                    st.write(f"- Candidate ID: `{selected.candidate_id}`")
+                    st.write(f"- Validation: **{selected.validation.get('status', 'unknown')}**")
+                    st.write(f"- Formula: **{selected.atoms.get_chemical_formula()}**")
+                    st.write(
+                        f"- Minimum distance: **{_safe_float(selected.validation.get('minimum_distance_A')):.3f} Å**"
+                    )
+                    local_meta = dict(selected.recipe.parameters.get("local_geometry_adjustment", {}) or {})
+                    if selected.recipe.operation == "single_substitution" and local_meta:
+                        st.write(
+                            f"- Material/init model: **{local_meta.get('material_class', 'unknown')} / "
+                            f"{local_meta.get('method', 'unknown')}**"
+                        )
+                        mismatch = local_meta.get("signed_radius_mismatch_fraction")
+                        if mismatch is not None:
+                            st.write(f"- Radius mismatch: **{100.0 * float(mismatch):+.1f}%**")
+                        if local_meta.get("host_oxidation_state") is not None:
+                            st.write(
+                                f"- Oxidation states: **host {float(local_meta.get('host_oxidation_state')):+g} → "
+                                f"dopant {float(local_meta.get('dopant_oxidation_state')):+g}** · "
+                                f"coordination: **{int(local_meta.get('coordination_number', 0) or 0)}**"
+                            )
+                        st.write(
+                            f"- Moved first-shell atoms: **{int(local_meta.get('n_moved_atoms', 0) or 0)}** · "
+                            f"max displacement: **{_safe_float(local_meta.get('max_applied_displacement_A'), 0.0):.3f} Å**"
+                        )
+                        d_before = local_meta.get("mean_first_shell_distance_before_A")
+                        d_after = local_meta.get("mean_first_shell_distance_after_A")
+                        if d_before is not None and d_after is not None:
+                            st.write(
+                                f"- Mean first-shell distance: **{float(d_before):.3f} → {float(d_after):.3f} Å**"
+                            )
+                        if local_meta.get("initialization_warning"):
+                            st.warning(str(local_meta.get("initialization_warning")))
+                    for err in selected.validation.get("errors", []) or []:
+                        st.error(str(err))
+                    for warn in selected.validation.get("warnings", []) or []:
+                        st.warning(str(warn))
+
+                zip_bytes = export_engineered_candidates_zip(candidates)
+                a1, a2, a3 = st.columns(3)
+                with a1:
+                    if st.button(
+                        "Apply selected candidate",
+                        key="btn_eng_apply_selected",
+                        disabled=(selected.validation.get("status") == "reject"),
+                    ):
+                        _push_prepared_update(
+                            selected.atoms.copy(),
+                            "surface_engineering",
+                            {
+                                "candidate_id": selected.candidate_id,
+                                "label": selected.label,
+                                "recipe": selected.recipe.as_dict(),
+                                "validation": selected.validation,
+                            },
+                        )
+                        st.session_state["surface_engineering_applied_signature"] = structure_content_signature(selected.atoms)
+                        st.session_state["surface_engineering_applied_candidate_id"] = selected.candidate_id
+                        st.success(f"Applied {selected.label}.")
+                        st.rerun()
+                with a2:
+                    st.download_button(
+                        "Download candidate ZIP",
+                        data=zip_bytes,
+                        file_name="SAGE_surface_engineering_candidates.zip",
+                        mime="application/zip",
+                        key="btn_eng_download_zip",
+                    )
+                with a3:
+                    if st.button("Clear candidates", key="btn_eng_clear_candidates"):
+                        st.session_state["surface_engineering_candidates"] = []
+                        st.session_state["surface_engineering_selected_index"] = 0
+                        st.rerun()
+
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("Reset to parent slab", key="btn_eng_reset_parent"):
+                    parent_copy = st.session_state.get("surface_engineering_base_atoms")
+                    if parent_copy is not None:
+                        _push_prepared_update(
+                            parent_copy.copy(),
+                            "surface_engineering_reset",
+                            {"source": "preserved_parent_slab"},
+                        )
+                        st.session_state["surface_engineering_applied_signature"] = structure_content_signature(parent_copy)
+                        st.session_state["surface_engineering_applied_candidate_id"] = None
+                        st.rerun()
+            with b2:
+                if st.button("Surface engineering reviewed", key="btn_eng_reviewed"):
+                    st.success("Step 2 is complete. Continue to Step 3 below.")
+            with b3:
+                if st.button("← Back to slab review", key="btn_back_stage5"):
+                    st.session_state["surface_setup_stage"] = 4
                     st.rerun()
 
         if bulk_like and surface_route == "Use current structure":
@@ -2217,8 +3060,11 @@ else:
     _ensure_prepared_uptodate()
     atoms_for_sites = st.session_state.get("atoms_prepared")
 
-    if int(st.session_state.get("surface_setup_stage", 0)) < 4:
-        st.warning("Step 2 wizard is not fully reviewed yet. Recommended order: slab selection → vacuum → XY supercell → slab reduction.")
+    if int(st.session_state.get("surface_setup_stage", 0)) < 5:
+        st.warning(
+            "Step 2 wizard is not fully reviewed yet. Recommended order: slab selection → vacuum → "
+            "XY supercell → slab reduction → surface engineering review."
+        )
 
     # --- Surfactant-class scenario (structural conditioning) ---
     # Placed here (Step 3) because this feature changes the *structure* used for site enumeration / adsorption,
@@ -2413,35 +3259,50 @@ else:
                     preview_ads_options = co2_ads if co2_ads else ["COOH*", "CO*"]
                 preview_ads = st.selectbox("Preview adsorbate", preview_ads_options, index=0, key="preview_ads_geom")
 
+                preview_sites = list(rep_sites)
+                if not (is_her or is_oxygen or is_voc):
+                    preview_sites = [
+                        s for s in rep_sites
+                        if co2rr_site_allowed(preview_ads, getattr(s, "kind", "ontop"))
+                    ]
+
                 slabs_ads = []
-                if is_her:
+                if not preview_sites:
+                    st.warning(
+                        f"No compatible geometry site is available for {preview_ads}. "
+                        "Bidentate HCOO* requires an explicit bridge/cation-pair site."
+                    )
+                elif is_her:
                     if mtype == "metal":
-                        slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, rep_sites, symbol="H", dz=0.0, mode="default")
+                        slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, preview_sites, symbol="H", dz=0.0, mode="default")
                     else:
-                        rep_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_eff, rep_sites, dz=1.0, extra_z=0.0)
-                        slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, rep_sites, symbol="H", dz=0.0, mode="default")
+                        preview_sites = _project_oxide_her_sites_to_otop(atoms_for_sites_eff, preview_sites, dz=1.0, extra_z=0.0)
+                        slabs_ads = generate_slab_ads_series(atoms_for_sites_eff, preview_sites, symbol="H", dz=0.0, mode="default")
                     export_ads_label = "H"
                 else:
                     export_ads_label = preview_ads.replace("*", "")
-                    for s in rep_sites:
+                    for s in preview_sites:
                         slabs_ads.append(build_adsorbate_preview_slab(atoms_for_sites_eff, s, preview_ads, dz=1.8, ref_dir="ref_gas"))
 
-                idx = st.selectbox("Select site to view", list(range(len(rep_sites))), index=0, key="geom_view_idx")
-                show_atoms_3d(slabs_ads[idx], height=420, width=900, tag=f"geom_seed_{idx}")
+                if preview_sites and slabs_ads:
+                    site_labels = [f"{getattr(s, 'kind', 'site')}_{i}" for i, s in enumerate(preview_sites)]
+                    selected_label = st.selectbox("Select site to view", site_labels, index=0, key="geom_view_site_label")
+                    idx = site_labels.index(selected_label)
+                    show_atoms_3d(slabs_ads[idx], height=420, width=900, tag=f"geom_seed_{idx}")
 
-                if st.button("Export preview CIFs (zip)", key="btn_export_previews"):
-                    zip_buf = BytesIO()
-                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for i, (s, ads_slab) in enumerate(zip(rep_sites, slabs_ads)):
-                            zf.writestr(f"{s.kind}_{i}_{export_ads_label}.cif", atoms_to_cif_bytes(ads_slab, symprec=0.1))
-                    zip_buf.seek(0)
-                    st.download_button(
-                        "Download preview_sites.zip",
-                        zip_buf,
-                        "preview_sites.zip",
-                        "application/zip",
-                        key="dl_preview_zip",
-                    )
+                    if st.button("Export preview CIFs (zip)", key="btn_export_previews"):
+                        zip_buf = BytesIO()
+                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for i, (s, ads_slab) in enumerate(zip(preview_sites, slabs_ads)):
+                                zf.writestr(f"{s.kind}_{i}_{export_ads_label}.cif", atoms_to_cif_bytes(ads_slab, symprec=0.1))
+                        zip_buf.seek(0)
+                        st.download_button(
+                            "Download preview_sites.zip",
+                            zip_buf,
+                            "preview_sites.zip",
+                            "application/zip",
+                            key="dl_preview_zip",
+                        )
         except Exception as e:
             st.error(f"Auto detection failed: {e}")
 
@@ -2844,7 +3705,8 @@ else:
 
     if (not is_her):
         st.caption(
-            "Note: U/pH correction is applied only for HER. CO₂RR is reported as descriptor ΔG_ads. "
+            "Note: U/pH correction is applied only for HER. CO₂RR reports reaction-referenced electronic-energy "
+            "descriptors (ΔE_ads_user) without ZPE, entropy, solvation, or potential corrections. "
             "OER writes a step-wise oxygen-intermediate summary. VOC mode reports UMA/OCP ΔE_proxy and "
             "co-adsorption proximity proxies, not electrochemical ΔG."
         )
@@ -2942,10 +3804,10 @@ else:
 
         if is_her and (mtype == "oxide"):
             setup_stage = int(st.session_state.get("surface_setup_stage", 0))
-            if setup_stage < 4:
+            if setup_stage < 5:
                 st.error(
                     "Oxide HER D1/D2 calculation requires a reviewed prepared slab. "
-                    "Complete Step 2 through vacuum, XY-size review, and slab-reduction/review before running. "
+                    "Complete Step 2 through vacuum, XY-size review, slab reduction, and the optional surface-engineering review before running. "
                     "This does not force slabify or XY expansion; uploaded Miller-index slabs can be kept at the current XY size after review."
                 )
                 st.stop()
@@ -2998,6 +3860,12 @@ else:
         oxide_her_calc_audit = None
         co2rr_air_summary = None
         co2rr_air_summary_csv = None
+        voc_pathway_summary = None
+        voc_pathway_summary_csv = None
+        voc_pathway_summary_json = None
+        co2rr_pathway_summary = None
+        co2rr_pathway_summary_csv = None
+        co2rr_pathway_summary_json = None
         co2rr_air_oxygen_csv = None
         co2rr_air_oxygen_meta = None
         if is_her and (mtype == "oxide"):
@@ -3104,6 +3972,7 @@ else:
             elif is_voc:
                 # ── VOC proxy branch ─────────────────────────────────────
                 _voc_key = str(st.session_state.get("voc_target", voc_key or "acetaldehyde"))
+                _voc_route = str(st.session_state.get("voc_route", get_voc_preset(_voc_key).get("default_route", "reduction")))
                 _voc_states = tuple(st.session_state.get("voc_states", voc_states or []))
                 if not _voc_states:
                     _voc_states = tuple(get_voc_preset(_voc_key).get("default_states", []))
@@ -3115,6 +3984,7 @@ else:
                         relax_mode=relax_mode,
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         target_voc=_voc_key,
+                        voc_route=_voc_route,
                         descriptor_states=_voc_states,
                         voc_relaxation_policy="normal_relax",
                         oxide_voc_site_policy=str(st.session_state.get("oxide_voc_site_policy", oxide_voc_site_policy)),
@@ -3126,6 +3996,7 @@ else:
                         relax_mode=relax_mode,
                         user_ads_sites=final_user_sites if final_user_sites else None,
                         target_voc=_voc_key,
+                        voc_route=_voc_route,
                         descriptor_states=_voc_states,
                         voc_relaxation_policy="normal_relax",
                         oxide_voc_site_policy=str(st.session_state.get("oxide_voc_site_policy", oxide_voc_site_policy)),
@@ -3137,7 +4008,7 @@ else:
                 adspecies = tuple(co2_ads)
 
                 _co2rr_air_on = bool(co2rr_air_enabled)
-                _co2rr_air_her_guard = bool(_co2rr_air_on and co2rr_air_include_her)
+                _co2rr_air_her_guard = bool(co2rr_include_her or (_co2rr_air_on and co2rr_air_include_her))
 
                 if mtype == "metal":
                     csv_path, meta = run_metal_co2rr_che(
@@ -3194,9 +4065,31 @@ else:
                         co2rr_air_oxygen_meta = {"error": str(_e), "mode": "CO2RR_AIR_OXYGEN_AUX"}
                         st.warning(f"CO₂RR-air auxiliary oxygen run failed: {_e}")
 
-        st.success("Calculation Complete!")
+        df, _result_csv_diag = _read_result_csv_safely(
+            csv_path,
+            context="primary calculation result",
+        )
+        if df is None:
+            _render_empty_result_diagnostic(_result_csv_diag, meta=meta)
+            st.stop()
+        if isinstance(df, pd.DataFrame) and df.empty:
+            _render_empty_result_diagnostic(_result_csv_diag, meta=meta)
+            st.stop()
 
-        df = pd.read_csv(csv_path)
+        st.success("Calculation Complete!")
+        if (
+            isinstance(meta, dict)
+            and int(meta.get("CO2RR_PLACEMENT_FAILURE_COUNT", 0) or 0) > 0
+        ):
+            _placement_failure_count = int(
+                meta.get("CO2RR_PLACEMENT_FAILURE_COUNT", 0) or 0
+            )
+            st.warning(
+                f"Skipped {_placement_failure_count} geometrically inaccessible "
+                "CO₂RR adsorbate/site seed(s). The remaining sites, binding "
+                "variants, and product branches were calculated normally."
+            )
+
         # annotate surfactant scenario into the result table
         if isinstance(df, pd.DataFrame) and (not df.empty):
             df["surfactant_class"] = str(surfactant_class)
@@ -3263,6 +4156,50 @@ else:
             df_rel, df_unrel = df_keep, df_reject
             migration_summary = summarize_site_transitions(df)
 
+            if is_voc:
+                try:
+                    _summary_voc_key = str(st.session_state.get("voc_target", "acetaldehyde"))
+                    _summary_route_key = str(st.session_state.get("voc_route", get_voc_preset(_summary_voc_key).get("default_route", "reduction")))
+                    voc_pathway_summary = build_voc_pathway_summary(
+                        df,
+                        voc_key=_summary_voc_key,
+                        route_key=_summary_route_key,
+                    )
+                    voc_pathway_summary_csv, voc_pathway_summary_json = write_voc_pathway_summary(
+                        voc_pathway_summary,
+                        Path(csv_path).resolve().parent,
+                    )
+                except Exception as _e:
+                    voc_pathway_summary = None
+                    voc_pathway_summary_csv = None
+                    voc_pathway_summary_json = None
+                    st.warning(f"VOC pathway summary could not be generated: {_e}")
+
+            if (not is_oxygen) and (not is_voc):
+                try:
+                    _summary_co2rr_key = str(st.session_state.get("co2rr_pathway", "competitive_c1"))
+                    _summary_co2rr_states = list(st.session_state.get("co2rr_ads", co2_ads or []))
+                    co2rr_pathway_summary = build_co2rr_pathway_summary(
+                        df,
+                        pathway_key=_summary_co2rr_key,
+                        states=_summary_co2rr_states,
+                        product_state_energies=(
+                            meta.get("CO2RR_PRODUCT_STATE_ENERGIES", {})
+                            if isinstance(meta, dict)
+                            else {}
+                        ),
+                        potential_V=float(st.session_state.get("co2rr_potential_V", 0.0)),
+                    )
+                    co2rr_pathway_summary_csv, co2rr_pathway_summary_json = write_co2rr_pathway_summary(
+                        co2rr_pathway_summary,
+                        Path(csv_path).resolve().parent,
+                    )
+                except Exception as _e:
+                    co2rr_pathway_summary = None
+                    co2rr_pathway_summary_csv = None
+                    co2rr_pathway_summary_json = None
+                    st.warning(f"CO₂RR state-energy summary could not be generated: {_e}")
+
             # CO2RR-air summary is a CO2RR-only post-processing add-on.
             # It consumes the already-produced CO2RR rows, an optional auxiliary
             # oxygen-intermediate CSV, and optional CO2RR HER guardrail metadata.
@@ -3308,6 +4245,15 @@ else:
                 meta["OXIDE_HER_PRE_RUN_AUDIT"] = oxide_her_calc_audit
             if migration_summary is not None:
                 meta["MIGRATION_SUMMARY"] = migration_summary
+            if voc_pathway_summary is not None:
+                meta["VOC_PATHWAY_SUMMARY"] = dict(voc_pathway_summary)
+                meta["VOC_PATHWAY_SUMMARY_CSV"] = str(voc_pathway_summary_csv) if voc_pathway_summary_csv is not None else None
+                meta["VOC_PATHWAY_SUMMARY_JSON"] = str(voc_pathway_summary_json) if voc_pathway_summary_json is not None else None
+            if co2rr_pathway_summary is not None:
+                meta["CO2RR_PATHWAY_SUMMARY"] = dict(co2rr_pathway_summary)
+                meta["CO2RR_PATHWAY_SUMMARY_CSV"] = str(co2rr_pathway_summary_csv) if co2rr_pathway_summary_csv is not None else None
+                meta["CO2RR_PATHWAY_SUMMARY_JSON"] = str(co2rr_pathway_summary_json) if co2rr_pathway_summary_json is not None else None
+                meta["CO2RR_PATHWAY_KEY"] = str(co2rr_pathway_key)
             if co2rr_air_summary is not None:
                 meta["CO2RR_AIR_SUMMARY"] = dict(co2rr_air_summary)
                 meta["CO2RR_AIR_SUMMARY_CSV"] = str(co2rr_air_summary_csv) if co2rr_air_summary_csv is not None else None
@@ -3330,6 +4276,9 @@ else:
             "df_rel": df_rel,
             "df_unrel": df_unrel,
             "df_diag": df_diag if bool(is_voc) else pd.DataFrame(),
+            "voc_pathway_summary": voc_pathway_summary if bool(is_voc) else None,
+            "co2rr_pathway_summary": co2rr_pathway_summary if ((not is_her) and (not is_oer) and (not is_voc)) else None,
+            "co2rr_pathway_key": str(co2rr_pathway_key),
             "U_input": float(U_input),
             "pH_input": float(pH_input),
         }
@@ -3395,6 +4344,8 @@ if last_run is not None:
     df_unrel = last_run.get("df_unrel")
     df_diag = last_run.get("df_diag") if bool(last_run.get("is_voc")) else pd.DataFrame()
     meta = last_run.get("meta") or {}
+    voc_pathway_summary = last_run.get("voc_pathway_summary") or (meta.get("VOC_PATHWAY_SUMMARY") if isinstance(meta, dict) else None)
+    co2rr_pathway_summary = last_run.get("co2rr_pathway_summary") or (meta.get("CO2RR_PATHWAY_SUMMARY") if isinstance(meta, dict) else None)
     mode_label = last_run.get("mode_label", "HER" if last_run.get("is_her") else ("VOC" if last_run.get("is_voc") else "CO2RR"))
     U_disp = float(last_run.get("U_input", 0.0))
     pH_disp = float(last_run.get("pH_input", 0.0))
@@ -3450,6 +4401,17 @@ if last_run is not None:
 
         if bool(last_run.get("is_oer")):
             df_dedup = _oer_site_adsorbate_compact(df_keep) if isinstance(df_keep, pd.DataFrame) else pd.DataFrame()
+        elif bool(last_run.get("is_voc")):
+            try:
+                _render_voc_key = str((meta or {}).get("target_voc", "acetaldehyde"))
+                _render_route_key = str((meta or {}).get("voc_route", "reduction"))
+                df_dedup = select_voc_state_minima(
+                    df_keep,
+                    voc_key=_render_voc_key,
+                    route_key=_render_route_key,
+                )
+            except Exception:
+                df_dedup = pd.DataFrame()
         else:
             df_dedup = co2rr_dedupe_candidates(df_keep) if isinstance(df_keep, pd.DataFrame) else pd.DataFrame()
 
@@ -3461,7 +4423,7 @@ if last_run is not None:
             c2.metric("Candidates", int(len(df_keep)) if isinstance(df_keep, pd.DataFrame) else 0)
             c3.metric("Diagnostic", int(len(df_diag)) if isinstance(df_diag, pd.DataFrame) else 0)
             c4.metric("Rejected", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
-            c5.metric("Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
+            c5.metric("State minima", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
         else:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total runs", int(len(df)) if isinstance(df, pd.DataFrame) else 0)
@@ -3469,11 +4431,133 @@ if last_run is not None:
             c3.metric("Rejected (QA-invalid)", int(len(df_reject)) if isinstance(df_reject, pd.DataFrame) else 0)
             c4.metric("Compact rows" if bool(last_run.get("is_oer")) else "Unique minima (dedup)", int(len(df_dedup)) if isinstance(df_dedup, pd.DataFrame) else 0)
 
+        if bool(last_run.get("is_voc")) and isinstance(voc_pathway_summary, dict):
+            st.markdown("### VOC state energy map")
+            st.caption(str(voc_pathway_summary.get("warning", "")))
+            render_voc_pathway(voc_pathway_summary)
+            with st.expander("State-energy details", expanded=False):
+                render_pathway_support_table(voc_pathway_summary)
+
+            _pathway_frame = pathway_summary_to_frame(voc_pathway_summary)
+            _dlp1, _dlp2 = st.columns(2)
+            with _dlp1:
+                st.download_button(
+                    "Download VOC state-energy map CSV",
+                    _pathway_frame.to_csv(index=False).encode("utf-8"),
+                    "voc_state_energy_map.csv",
+                    "text/csv",
+                    key="dl_voc_state_energy_map_csv",
+                )
+            with _dlp2:
+                st.download_button(
+                    "Download VOC state-energy map JSON",
+                    json.dumps(voc_pathway_summary, ensure_ascii=False, indent=2).encode("utf-8"),
+                    "voc_state_energy_map.json",
+                    "application/json",
+                    key="dl_voc_state_energy_map_json",
+                )
+
+        if (not bool(last_run.get("is_oer"))) and (not bool(last_run.get("is_voc"))) and isinstance(co2rr_pathway_summary, dict):
+            st.markdown("### CO₂RR thermodynamic product favorability")
+            st.caption(str(co2rr_pathway_summary.get("warning", "")))
+            st.caption(str(co2rr_pathway_summary.get("ranking_basis", "")))
+            _co2rr_product_df = co2rr_product_summary_to_frame(co2rr_pathway_summary)
+            _co2rr_edge_df = co2rr_edge_summary_to_frame(co2rr_pathway_summary)
+            _co2rr_map_df = co2rr_pathway_summary_to_frame(co2rr_pathway_summary)
+            if isinstance(_co2rr_product_df, pd.DataFrame) and not _co2rr_product_df.empty:
+                _priority_cols = [
+                    "rank", "product", "site_key", "site_consistency",
+                    "endpoint_complete", "path_complete", "ranking_eligible",
+                    "overall_PDS", "overall_PDS_delta_G_0_eV",
+                    "post_CO_PDS", "post_CO_PDS_delta_G_0_eV",
+                    "post_CO_adsorbed_core_PDS",
+                    "post_CO_adsorbed_core_PDS_delta_G_0_eV",
+                    "branch_start_state", "branch_screening_scope",
+                    "branch_screening_bottleneck",
+                    "branch_screening_bottleneck_eV",
+                    "branch_screening_bottleneck_type",
+                    "branch_screening_PDS", "branch_screening_PDS_delta_G_0_eV",
+                    "branch_PDS", "branch_PDS_delta_G_0_eV",
+                    "branch_adsorbed_core_PDS",
+                    "branch_adsorbed_core_PDS_delta_G_0_eV",
+                    "missing_states", "confidence",
+                ]
+                _ordered_cols = [
+                    col for col in _priority_cols if col in _co2rr_product_df.columns
+                ] + [
+                    col for col in _co2rr_product_df.columns if col not in _priority_cols
+                ]
+                st.dataframe(
+                    _co2rr_product_df[_ordered_cols], use_container_width=True
+                )
+                _methanol_rows = (
+                    _co2rr_product_df.loc[
+                        _co2rr_product_df["product_key"].astype(str).eq("methanol")
+                    ]
+                    if "product_key" in _co2rr_product_df.columns
+                    else pd.DataFrame()
+                )
+                if (
+                    not _methanol_rows.empty
+                    and "endpoint_complete" in _methanol_rows.columns
+                    and not bool(_methanol_rows["endpoint_complete"].iloc[0])
+                ):
+                    st.warning(
+                        "CH3OH endpoint is incomplete: add CH3OH to "
+                        "ref_gas/thermo_CO2RR.json or provide ref_gas/CH3OH_box.cif. "
+                        "Until then, only the site-consistent adsorbed branch up to CH2OH* "
+                        "is reported; methanol is not included in the final product ranking."
+                    )
+            else:
+                st.info(
+                    "No site-consistent product pathway is available. Check missing intermediates, "
+                    "per-site coverage, and explicit product gas references in the state/edge tables."
+                )
+            with st.expander("CO₂RR elementary edge ΔG and PDS support", expanded=False):
+                if isinstance(_co2rr_edge_df, pd.DataFrame):
+                    st.dataframe(_co2rr_edge_df, use_container_width=True)
+            with st.expander("CO₂RR cumulative state energies", expanded=False):
+                if isinstance(_co2rr_map_df, pd.DataFrame):
+                    st.dataframe(_co2rr_map_df, use_container_width=True)
+            _cmap1, _cmap2, _cmap3, _cmap4 = st.columns(4)
+            with _cmap1:
+                st.download_button(
+                    "Product table CSV",
+                    _co2rr_product_df.to_csv(index=False).encode("utf-8"),
+                    "co2rr_product_favorability.csv",
+                    "text/csv",
+                    key="dl_co2rr_product_favorability_csv",
+                )
+            with _cmap2:
+                st.download_button(
+                    "Edge ΔG CSV",
+                    _co2rr_edge_df.to_csv(index=False).encode("utf-8"),
+                    "co2rr_edge_free_energies.csv",
+                    "text/csv",
+                    key="dl_co2rr_edge_free_energies_csv",
+                )
+            with _cmap3:
+                st.download_button(
+                    "State map CSV",
+                    _co2rr_map_df.to_csv(index=False).encode("utf-8"),
+                    "co2rr_state_energy_map.csv",
+                    "text/csv",
+                    key="dl_co2rr_state_energy_map_csv",
+                )
+            with _cmap4:
+                st.download_button(
+                    "Network JSON",
+                    json.dumps(co2rr_pathway_summary, ensure_ascii=False, indent=2).encode("utf-8"),
+                    "co2rr_reaction_network.json",
+                    "application/json",
+                    key="dl_co2rr_reaction_network_json",
+                )
+
         if bool(last_run.get("is_oer")):
             st.markdown("### OER site-level candidate rows")
             st.caption("One lowest-energy height is retained per selected oer_cation site and intermediate. Use the OER step summary for η_OER interpretation.")
         else:
-            st.markdown("### VOC proxy candidates" if bool(last_run.get("is_voc")) else "### Candidates (Deduplicated by relaxed minimum)")
+            st.markdown("### VOC state minima" if bool(last_run.get("is_voc")) else ("### CO₂RR relaxed minima" if not bool(last_run.get("is_oer")) else "### Candidates"))
         if isinstance(df_dedup, pd.DataFrame):
             st.dataframe(build_compact_table(df_dedup, mode_label), use_container_width=True)
 
@@ -3585,7 +4669,7 @@ if last_run is not None:
                 if mig_paths:
                     st.dataframe(pd.DataFrame(mig_paths), use_container_width=True)
                 elif isinstance(df, pd.DataFrame) and ("migration_path" in df.columns):
-                    cols = [c for c in ["adsorbate", "site_label", "requested_site", "initial_geom_site", "relaxed_site", "placement_mismatch", "migrated_actual", "migration_destination", "migration_path", "actual_migration_path", "site_transition_type", "ΔG_ads (eV)", "ΔE_ads_user (eV)", "ads_lateral_disp(Å)", "qa", "migrated"] if c in df.columns]
+                    cols = [c for c in ["adsorbate", "site_label", "requested_site", "initial_geom_site", "relaxed_site", "placement_mismatch", "migrated_actual", "migration_destination", "migration_path", "actual_migration_path", "site_transition_type", "ΔE_ads_user (eV)", "ΔG_ads (eV)", "ads_lateral_disp(Å)", "qa", "migrated"] if c in df.columns]
                     st.dataframe(df[cols], use_container_width=True)
 
         cdl1, cdl2 = st.columns(2)
@@ -3950,7 +5034,7 @@ if last_run is not None:
                 extra_order = [
                     "migrated", "reliability", "qa", "ΔG_H(U,pH) (eV)", "ΔG_H (eV)",
                     "ΔG_H_CHE (eV)", "ΔG_H_local (eV)", "local_thermo_corr (eV)",
-                    "ΔG_ads (eV)", "ΔE_H_user (eV)", "ΔE_ads_user (eV)",
+                    "ΔE_ads_user (eV)", "ΔG_ads (eV)", "ΔE_H_user (eV)",
                     "oer_diagnostic_mode", "oer_diagnostic_active", "oer_ads_relax_steps_used", "oer_ads_relax_fmax_used",
                     "oxygen_bound_to_cation", "oxygen_anchor_target_cation_dist(Å)", "oxygen_anchor_anion_dist(Å)",
                     "valid_for_oer_summary", "oer_state_class", "oer_state_note",
