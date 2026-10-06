@@ -120,10 +120,10 @@ with `pip install .` uses the same six versions from `pyproject.toml`.
 Keep the pymatgen and Materials Project dependency set together when upgrading.
 
 SAGE uses Cartesian z to identify slab layers, vacuum, and adsorption heights.
-The tested pymatgen 2025.10.7 setup keeps the surface normal along z for the
-Ni(111) and rutile RuO2(110) regression cases. With pymatgen 2026.9.24 and
-pymatgen-core 2026.10.2, a change in primitive-cell reduction produced tilted
-surface normals for the same inputs, changing SAGE's z-based surface analysis.
+Keep pymatgen 2025.10.7 to preserve the verified slab-generation behavior.
+With pymatgen 2026.9.24 and pymatgen-core 2026.10.2, a change in primitive-cell
+reduction produced tilted surface normals in the checked structures, changing
+SAGE's z-based surface analysis.
 The MP/emmet/validation versions are pinned alongside pymatgen to avoid
 reintroducing the separate newer `pymatgen-core` package through dependencies.
 
