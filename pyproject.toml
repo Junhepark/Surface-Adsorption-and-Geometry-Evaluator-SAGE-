@@ -41,7 +41,7 @@ dependencies = [
 
     # Atomistic simulation
     "ase>=3.22",
-    "pymatgen>=2023.0",
+    "pymatgen==2025.10.7",
 
     # ML potentials
     "chgnet>=0.3",
@@ -51,7 +51,11 @@ dependencies = [
     "py3Dmol>=2.0",
 
     # Materials Project API
-    "mp-api>=0.33",
+    "mp-api==0.45.13",
+    "emmet-core==0.85.1",
+    "pymatgen-io-validation==0.1.2",
+    "msgpack==1.1.2",
+    "smart-open==7.5.0",
 
     # Model access
     "huggingface_hub",

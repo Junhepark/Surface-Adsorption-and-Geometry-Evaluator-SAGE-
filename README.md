@@ -113,6 +113,39 @@ cd Surface-Adsorption-and-Geometry-Evaluator-SAGE-
 pip install -r requirements.txt
 ```
 
+### Slab-generation dependency versions
+
+`requirements.txt` applies `sage_geometry_constraints.txt`; package installation
+with `pip install .` uses the same six versions from `pyproject.toml`.
+Keep the pymatgen and Materials Project dependency set together when upgrading.
+
+SAGE uses Cartesian z to identify slab layers, vacuum, and adsorption heights.
+The tested pymatgen 2025.10.7 setup keeps the surface normal along z for the
+Ni(111) and rutile RuO2(110) regression cases. With pymatgen 2026.9.24 and
+pymatgen-core 2026.10.2, a change in primitive-cell reduction produced tilted
+surface normals for the same inputs, changing SAGE's z-based surface analysis.
+The MP/emmet/validation versions are pinned alongside pymatgen to avoid
+reintroducing the separate newer `pymatgen-core` package through dependencies.
+
+For an existing environment that already contains that separate
+`pymatgen-core` package, remove both overlapping packages before reinstalling:
+
+```bash
+python -m pip uninstall -y pymatgen pymatgen-core
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+Use the constraint file for subsequent dependency upgrades as well, for example:
+
+```bash
+python -m pip install -c sage_geometry_constraints.txt --upgrade fairchem-core
+```
+
+These pins cover geometry and structure loading. They do not select UMA weights
+or task heads, freeze the full runtime, or establish adsorption-energy accuracy.
+Changing the model or relaxation settings still requires separate validation.
+
 ### Optional model setup for CHE evaluation
 
 The CHE evaluation stage uses Meta's UMA model as the default energy calculator.
