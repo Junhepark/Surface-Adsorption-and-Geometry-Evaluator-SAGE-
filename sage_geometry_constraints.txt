@@ -1,0 +1,8 @@
+# Verified slab geometry and Materials Project dependency set.
+# Keep these versions together; UMA/PyTorch versions are managed separately.
+pymatgen==2025.10.7
+pymatgen-io-validation==0.1.2
+emmet-core==0.85.1
+mp-api==0.45.13
+msgpack==1.1.2
+smart-open==7.5.0

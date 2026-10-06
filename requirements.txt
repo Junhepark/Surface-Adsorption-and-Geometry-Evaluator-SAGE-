@@ -1,3 +1,6 @@
+# Preserve the tested slab-generation and MP dependency set.
+-c sage_geometry_constraints.txt
+
 # Core
 streamlit>=1.28
 numpy>=1.24
@@ -17,6 +20,11 @@ py3Dmol>=2.0
 
 # Materials Project API
 mp-api>=0.33
+emmet-core
+pymatgen-io-validation
+# Required by the pinned MP/emmet stack.
+msgpack
+smart-open
 
 # Optional: LLM interpretation
 # openai>=1.0
